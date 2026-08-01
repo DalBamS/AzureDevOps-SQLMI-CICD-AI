@@ -45,7 +45,7 @@ foreach ($entry in $SqlcmdVariables.GetEnumerator()) {
     if ([string]::IsNullOrWhiteSpace($value) -or $value -match '^\$\([^)]+\)$') {
         throw "SQLCMD variable '$name' is empty or unresolved."
     }
-    if ($value -notmatch '^[A-Za-z0-9_.@# -]+$') {
+    if (-not (Test-SqlCmdValue -Value $value)) {
         throw "SQLCMD variable '$name' contains unsupported characters."
     }
     $normalizedVariables[$name] = $value
@@ -80,14 +80,14 @@ foreach ($script in $scripts) {
         -ExternalVariables $scriptVariables `
         -DisallowSetVariableDirectives `
         -RequireExactExternalVariables
-    if ($resolution.SanitizedText -notmatch '(?is)\bIF\b.*\bEXISTS\b') {
-        throw "Instance script '$($script.Name)' must guard create/update behavior with an existence check."
+    if (-not (Test-SqlInstanceGuardCoverage -Text $resolution.SanitizedText)) {
+        throw "Instance script '$($script.Name)' must keep every mutation inside an existence guard."
     }
-    if (
-        $resolution.SanitizedText -match
-            '(?is)\bDROP\s+(?:LOGIN|CREDENTIAL)\b|\bsp_delete_job\b'
-    ) {
+    if (Test-SqlDestructiveInstanceStatement -Text $resolution.SanitizedText) {
         throw "Instance script '$($script.Name)' contains a prohibited destructive operation."
+    }
+    if (-not (Test-SqlDynamicExecution -Text $resolution.SanitizedText)) {
+        throw "Instance script '$($script.Name)' contains dynamic execution that cannot be reviewed safely."
     }
     $scriptResolutions[$script.FullName] = $resolution
 }

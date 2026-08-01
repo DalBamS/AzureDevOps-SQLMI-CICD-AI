@@ -193,10 +193,13 @@ role membership을 배포 비교에서 제외합니다. 이 보안 오브젝트�
 advisory 단계입니다.
 
 `EXEC`/`EXECUTE`와 `sp_executesql`의 첫 SQL 표현식이 문자열 literal과 `+` 연결만으로
-구성되면 상수로 계산한 뒤 같은 직접 DDL rule을 다시 적용합니다. 상수 동적 `SELECT`는
+구성되면 상수로 계산합니다. 문자열·주석·quoted identifier 밖의 token에 `CREATE`, `ALTER`,
+`DROP`, `TRUNCATE`가 하나라도 있으면 오브젝트 종류나 statement 순서와 무관하게 동적 DDL로
+차단합니다. 상수 동적 `SELECT`와 parameterized DML은
 허용하지만 동적 DDL은 오류입니다. 변수, 함수, `FORMAT`, `REPLACE` 등 정적으로 결과를
 증명할 수 없는 동적 표현식은 fail closed 오류로 차단합니다. `EXEC dbo.StoredProcedure
-@p=...` 형태의 정적 stored procedure 호출은 허용합니다.
+@p=...` 형태의 정적 stored procedure 호출은 허용합니다. batch 첫 호출에서 `EXEC`를 생략한
+`sp_executesql`, `sp_rename`, `sp_delete_job`도 같은 canonical procedure 검사에 포함합니다.
 
 `sp_executesql`과 `sp_rename`은 bare, bracket, double-quote, 생략된 multipart component를
 포함한 최대 4-part qualified identifier를 같은 canonical procedure 이름으로 해석합니다.
@@ -212,7 +215,9 @@ unknown command는 fail closed입니다. 허용 directive를 제거하고 실제
 변수 확장이 끝난 물리 행도 lexical state로 다시 검사하므로 치환값이 합성한 line-leading
 `:r`, `:quit`, `:on error ignore`, `!!` 등은 sanitized hash 계산 전에 차단됩니다.
 미선언·잘못된 이름, 중복·잘못된 directive, 중첩 치환과 quote·semicolon·제어 문자가 포함된
-값도 fail closed입니다. DacFx의
+값도 fail closed입니다. 값은 영문자·숫자·공백과 `_ . @ # : / \ = -`만 허용하며 apostrophe,
+double quote, closing bracket, backtick, `--`, `/*`, `*/`, 중첩 `$(`은 허용하지 않습니다.
+DacFx의
 `DatabaseName`, `DefaultFilePrefix`, `DefaultDataPath`, `DefaultLogPath`,
 `__IsSqlCmdEnabled`는 같은 규칙으로 처리합니다. escaped `` `$(``만 literal로 보존합니다.
 정책 보고서는 canonical variable map과 sanitized SQL hash를 기록하고 exact Script와 정책
@@ -220,6 +225,15 @@ unknown command는 fail closed입니다. 허용 directive를 제거하고 실제
 결과를 `Invoke-Sqlcmd -Query -DisableCommands -DisableVariables`로 메모리에서 실행하므로
 검증 후 mutable 임시 파일 교체와 2차 SQLCMD 해석이 발생하지 않습니다. executor는 정책 보고서의
 sanitized SQL hash를 입력받아 실행 직전 재변환 hash와 일치하는지도 확인합니다.
+
+인스턴스 오브젝트도 같은 module의 comment/string/quoted identifier aware token stream을
+사용합니다. `-- Idempotency:` 설명과 별개로 실행 가능한 `IF EXISTS` 또는 `IF NOT EXISTS`
+guard가 있어야 하고 모든 `CREATE`/`ALTER`/DML/`EXEC` mutation token이 해당
+`BEGIN...END` 또는 연결된 `ELSE` block 범위 안에 있어야 합니다. 문법 경계의 모호성을 없애기 위해
+instance guard body와 `ELSE` body는 `BEGIN...END` block만 지원합니다. 관련 없는 guard와 주석·문자열 속
+guard는 인정하지 않습니다. 직접 `DROP`/`TRUNCATE`,
+`sp_delete_job`, `sp_rename`, constant dynamic DDL과 정적으로 증명할 수 없는 dynamic
+execution은 실행 전에 차단합니다.
 
 승인자는 대기 중인 `Deploy*` stage를 승인하기 전에 완료된 `Plan*` stage의 artifact를 검토합니다. 초기 도입 기간에는 Dev 자동 배포만 허용하고 Test/Prod에서 `deploy.sql`을 DBA가 승인하도록 운영합니다. `DropObjectsNotInSource=False`로 인해 제거가 자동 반영되지 않으므로, 승인된 제거는 별도 expand/contract 절차와 명시적 스크립트로 처리합니다.
 

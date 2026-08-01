@@ -414,9 +414,191 @@ try {
     Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
     @(
         '-- Idempotency: fixture precondition'
-        'IF EXISTS (SELECT 1) PRINT N''`$(NotAVariable)'';'
+        'IF EXISTS (SELECT 1)'
+        'BEGIN'
+        '    PRINT N''`$(NotAVariable)'';'
+        'END;'
     ) | Set-Content `
         -Path (Join-Path $instanceFixturePath '001-escaped-reference.sql') `
+        -Encoding utf8
+    & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
+        -ServerName 'sqlmi.example.test' `
+        -AccessToken 'fixture-token' `
+        -ScriptPath $instanceFixturePath `
+        -SqlcmdVariables @{} `
+        -WhatIf
+    foreach ($case in @(
+        @{
+            Name = 'comment-only-guard'
+            Sql = @'
+-- Idempotency: fixture precondition
+-- IF EXISTS (SELECT 1) PRINT N'not executable';
+SELECT 1;
+'@
+        },
+        @{
+            Name = 'string-only-guard'
+            Sql = @'
+-- Idempotency: fixture precondition
+PRINT N'IF NOT EXISTS (SELECT 1)';
+'@
+        },
+        @{
+            Name = 'comment-split-drop-login'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1) DROP/**/LOGIN [fixture_login];
+'@
+        },
+        @{
+            Name = 'drop-server-role'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1) DROP SERVER ROLE [fixture_role];
+'@
+        },
+        @{
+            Name = 'drop-credential'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1) DROP CREDENTIAL [fixture_credential];
+'@
+        },
+        @{
+            Name = 'constant-dynamic-drop'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1) EXEC(N'DR' + N'OP LOGIN [fixture_login];');
+'@
+        },
+        @{
+            Name = 'sp-executesql-dynamic-drop'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1) EXEC sys.sp_executesql N'DR' + N'OP CREDENTIAL [fixture_credential];';
+'@
+        },
+        @{
+            Name = 'variable-dynamic-drop'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    DECLARE @sql nvarchar(max) = N'DR' + N'OP LOGIN [fixture_login];';
+    EXEC(@sql);
+END;
+'@
+        },
+        @{
+            Name = 'static-delete-job'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1) EXEC [msdb].[dbo].[sp_delete_job] @job_name = N'fixture';
+'@
+        },
+        @{
+            Name = 'direct-truncate'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1) TRUNCATE TABLE [dbo].[Fixture];
+'@
+        },
+        @{
+            Name = 'unrelated-guard'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1 WHERE 1 = 0) PRINT N'not related';
+CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
+'@
+        },
+        @{
+            Name = 'bare-sp-executesql-dynamic-drop'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1) PRINT N'guard';
+GO
+sp_executesql N'DROP LOGIN [fixture_login];';
+'@
+        },
+        @{
+            Name = 'bare-delete-job'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1) PRINT N'guard';
+GO
+[msdb].[dbo].[sp_delete_job] @job_name = N'fixture';
+'@
+        },
+        @{
+            Name = 'guard-crosses-go'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1) PRINT N'guard'
+GO
+CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
+'@
+        },
+        @{
+            Name = 'bare-add-job-outside-guard'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1) PRINT N'guard';
+GO
+[msdb].[dbo].[sp_add_job] @job_name = N'fixture';
+'@
+        },
+        @{
+            Name = 'guard-crosses-statement-without-semicolon'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1 WHERE 1 = 0)
+    PRINT N'not related'
+CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
+'@
+        },
+        @{
+            Name = 'begin-transaction-case-end-confusion'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    BEGIN TRANSACTION;
+END
+CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
+SELECT CASE WHEN 1 = 1 THEN 1 END;
+'@
+        }
+    )) {
+        Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
+        Set-Content `
+            -Path (Join-Path $instanceFixturePath "001-$($case.Name).sql") `
+            -Value $case.Sql `
+            -Encoding utf8
+        Assert-Throws {
+            & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
+                -ServerName 'sqlmi.example.test' `
+                -AccessToken 'fixture-token' `
+                -ScriptPath $instanceFixturePath `
+                -SqlcmdVariables @{} `
+                -WhatIf
+        } "Instance safety case '$($case.Name)' must fail closed."
+    }
+    Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
+    @'
+-- Idempotency: comments do not replace the executable guard.
+/* IF EXISTS (SELECT 1) DROP LOGIN [comment_only]; */
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.server_principals
+    WHERE [name] = N'fixture_login'
+)
+BEGIN
+    PRINT N'DROP LOGIN in a string is not executable.';
+    SELECT 1 AS [DROP], 2 AS "TRUNCATE";
+    EXEC(N'SELECT 1 AS [CREATE];');
+END;
+'@ | Set-Content `
+        -Path (Join-Path $instanceFixturePath '001-valid-comments.sql') `
         -Encoding utf8
     & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
         -ServerName 'sqlmi.example.test' `
@@ -464,7 +646,16 @@ try {
         @{ Name = 'dynamic-create-modifier-comments'; Sql = "EXEC(N'CREATE /* review */ UNIQUE`nNONCLUSTERED /* gap */ INDEX [IX_T] ON [dbo].[T]([Id]);');" },
         @{ Name = 'dynamic-create-unknown-modifier'; Sql = "EXEC(N'CREATE UNIQUE HASH INDEX [IX_T] ON [dbo].[T]([Id]);');" },
         @{ Name = 'dynamic-create-xml-index'; Sql = "EXEC(N'CREATE XML INDEX [IX_T] ON [dbo].[T]([Payload]);');" },
-        @{ Name = 'dynamic-create-spatial-index'; Sql = "EXEC(N'CREATE SPATIAL INDEX [IX_T] ON [dbo].[T]([Shape]);');" }
+        @{ Name = 'dynamic-create-spatial-index'; Sql = "EXEC(N'CREATE SPATIAL INDEX [IX_T] ON [dbo].[T]([Shape]);');" },
+        @{ Name = 'dynamic-create-partition-function'; Sql = "EXEC(N'CREATE PARTITION FUNCTION [PF](int) AS RANGE LEFT FOR VALUES (1);');" },
+        @{ Name = 'dynamic-drop-certificate'; Sql = "EXEC(N'DROP CERTIFICATE [FixtureCertificate];');" },
+        @{ Name = 'dynamic-create-statistics'; Sql = "EXEC(N'CREATE STATISTICS [ST_T] ON [dbo].[T]([Id]);');" },
+        @{ Name = 'dynamic-alter-authorization'; Sql = "EXEC(N'ALTER AUTHORIZATION ON DATABASE::[AppDb] TO [dbo];');" },
+        @{ Name = 'dynamic-leading-set-use'; Sql = "EXEC(N'/* setup */ SET NOCOUNT ON; USE [AppDb]; CREATE STATISTICS [ST_T] ON [dbo].[T]([Id]);');" },
+        @{ Name = 'dynamic-second-statement-ddl'; Sql = "EXEC(N'SELECT 1; DROP CERTIFICATE [FixtureCertificate];');" },
+        @{ Name = 'dynamic-cte-then-ddl'; Sql = "EXEC(N';WITH [c] AS (SELECT 1 AS [Id]) SELECT [Id] FROM [c]; CREATE STATISTICS [ST_T] ON [dbo].[T]([Id]);');" },
+        @{ Name = 'bare-sp-executesql'; Sql = "sp_executesql N'DROP TABLE [dbo].[Danger];';" },
+        @{ Name = 'bare-quoted-sp-executesql'; Sql = "[sys].[sp_executesql] N'CREATE STATISTICS [ST_T] ON [dbo].[T]([Id]);';" }
     )
     foreach ($case in $dynamicPolicyCases) {
         $casePath = Join-Path $temporaryPath "$($case.Name).sql"
@@ -487,7 +678,11 @@ try {
         @{ Name = 'static-return-procedure'; Sql = 'EXEC @rc = dbo.StoredProcedure @p = 1;' },
         @{ Name = 'constant-select'; Sql = "EXEC(N'SELECT 1;');" },
         @{ Name = 'constant-select-ddl-text'; Sql = "EXEC(N'SELECT N''CREATE UNIQUE INDEX [IX_T] ON [dbo].[T]([Id])'';');" },
+        @{ Name = 'constant-select-ddl-identifier'; Sql = "EXEC(N'SELECT 1 AS [DROP], 2 AS `"CREATE`";');" },
         @{ Name = 'named-constant-select'; Sql = "EXEC sys.sp_executesql @stmt = N'SELECT 1;';" },
+        @{ Name = 'constant-parameterized-update'; Sql = "EXEC sys.sp_executesql N'UPDATE [dbo].[T] SET [Value] = @Value WHERE [Id] = @Id;', N'@Value int, @Id int', @Value=2, @Id=1;" },
+        @{ Name = 'constant-leading-set-select'; Sql = "EXEC(N'SET NOCOUNT ON; USE [AppDb]; SELECT 1;');" },
+        @{ Name = 'bare-sp-executesql-select'; Sql = "sp_executesql N'SELECT 1;';" },
         @{ Name = 'nested-comment'; Sql = '/* outer /* nested */ EXEC(N''DROP TABLE dbo.Hidden''); */ SELECT 1;' },
         @{ Name = 'bracket-apostrophe'; Sql = 'CREATE TABLE [dbo].[O''Brien] ([Id] int NOT NULL);' },
         @{ Name = 'quoted-user-procedure'; Sql = 'EXEC "dbo"."sp_executesql_safe" @p = 1;' },
@@ -526,6 +721,12 @@ PRINT N'`$(NotAVariable)';
         @{ Name = 'sqlcmd-malformed'; Sql = ":setvar Name unquoted`nSELECT 1;" },
         @{ Name = 'sqlcmd-nested-value'; Sql = ":setvar Name `"`$(Other)`"`nSELECT N'`$(Name)';" },
         @{ Name = 'sqlcmd-semicolon-value'; Sql = ":setvar Name `"value;DROP`"`nSELECT N'`$(Name)';" },
+        @{ Name = 'sqlcmd-apostrophe-breakout'; Sql = ":setvar Name `"x' DELETE FROM dbo.T--`"`nSELECT N'`$(Name)';" },
+        @{ Name = 'sqlcmd-bracket-breakout'; Sql = ":setvar Name `"x] DROP TABLE dbo.T`"`nSELECT N'`$(Name)';" },
+        @{ Name = 'sqlcmd-line-comment-value'; Sql = ":setvar Name `"x--comment`"`nSELECT N'`$(Name)';" },
+        @{ Name = 'sqlcmd-block-comment-open'; Sql = ":setvar Name `"x/*comment`"`nSELECT N'`$(Name)';" },
+        @{ Name = 'sqlcmd-block-comment-close'; Sql = ":setvar Name `"x*/comment`"`nSELECT N'`$(Name)';" },
+        @{ Name = 'sqlcmd-double-quote-breakout'; Sql = ":setvar Name `"x`" DROP TABLE dbo.T`"`nSELECT N'`$(Name)';" },
         @{ Name = 'sqlcmd-after-line-comment-block-opener'; Sql = "-- /*`n!! whoami`n*/`nSELECT 1;" },
         @{ Name = 'sqlcmd-after-line-comment-quote'; Sql = "-- '`n:quit`nSELECT 1;" },
         @{ Name = 'sqlcmd-after-line-comment-bracket'; Sql = "-- [`n:exit`nSELECT 1;" },
@@ -588,7 +789,17 @@ PRINT N'`$(NotAVariable)';
     foreach ($case in @(
         @{ Name = 'sqlcmd-command-in-string'; Sql = "PRINT N':quit';" },
         @{ Name = 'sqlcmd-command-in-multiline-string'; Sql = "PRINT N'first`n:quit`nlast';" },
-        @{ Name = 'sqlcmd-command-in-comment'; Sql = "/*`n:quit`n*/`nSELECT 1;" }
+        @{ Name = 'sqlcmd-command-in-comment'; Sql = "/*`n:quit`n*/`nSELECT 1;" },
+        @{
+            Name = 'sqlcmd-safe-dacfx-values'
+            Sql = @'
+:setvar DatabaseName "App-Db 01"
+:setvar DefaultFilePrefix "App_Db-01"
+:setvar DefaultDataPath "C:\Program Files\Microsoft SQL Server\Data\"
+:setvar DefaultLogPath "/var/opt/mssql/data/"
+SELECT N'$(DatabaseName)', N'$(DefaultFilePrefix)', N'$(DefaultDataPath)', N'$(DefaultLogPath)';
+'@
+        }
     )) {
         $casePath = Join-Path $temporaryPath "$($case.Name).sql"
         Set-Content -Path $casePath -Value $case.Sql -Encoding utf8
@@ -596,6 +807,47 @@ PRINT N'`$(NotAVariable)';
             -ScriptPath $casePath `
             -ReportPath (Join-Path $temporaryPath "$($case.Name).md")
     }
+    $sqlCmdSensitiveValue = "phase8-x' DELETE FROM dbo.T--"
+    $sqlCmdSensitivePath = Join-Path $temporaryPath 'sqlcmd-sensitive-value.sql'
+    Set-Content `
+        -Path $sqlCmdSensitivePath `
+        -Value ":setvar Name `"$sqlCmdSensitiveValue`"`nSELECT N'`$(Name)';" `
+        -Encoding utf8
+    $sqlCmdSensitiveError = ''
+    try {
+        & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+            -ScriptPath $sqlCmdSensitivePath `
+            -ReportPath (Join-Path $temporaryPath 'sqlcmd-sensitive-value.md')
+    }
+    catch {
+        $sqlCmdSensitiveError = $_.Exception.Message
+    }
+    Assert-True `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($sqlCmdSensitiveError) -and
+            $sqlCmdSensitiveError -notmatch [regex]::Escape($sqlCmdSensitiveValue)
+        ) `
+        -Message 'Rejected SQLCMD values must fail without echoing raw content.'
+    $deploymentGateText = Get-Content `
+        -Path (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+        -Raw
+    $sqlCmdCommonText = Get-Content `
+        -Path (Join-Path $PSScriptRoot 'SqlCmd.Common.psm1') `
+        -Raw
+    $instanceDeploymentText = Get-Content `
+        -Path (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
+        -Raw
+    Assert-True `
+        -Condition (
+            $deploymentGateText -notmatch 'function\s+ConvertTo-SqlToken' -and
+            $deploymentGateText -notmatch 'function\s+ConvertTo-CodeOnly' -and
+            $deploymentGateText -match 'SqlCmd\.Common\\Test-ConstantDynamicDdl' -and
+            $sqlCmdCommonText -match 'function\s+Test-SqlDynamicExecution' -and
+            $instanceDeploymentText -match 'Test-SqlInstanceGuardCoverage' -and
+            $instanceDeploymentText -match 'Test-SqlDestructiveInstanceStatement' -and
+            $instanceDeploymentText -match 'Test-SqlDynamicExecution'
+        ) `
+        -Message 'Deployment and instance safety must share the common SQL lexer and token helpers.'
     $lexicalRecoveryBypassPath = Join-Path $temporaryPath 'postdeploy-lexical-confusion.sql'
     (
         Get-TestDeploymentScript -DatabaseName CanaryDb -PostDeploymentOnly

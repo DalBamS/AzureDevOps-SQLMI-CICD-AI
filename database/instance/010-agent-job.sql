@@ -11,7 +11,11 @@ SELECT @JobId = [job_id]
 FROM [msdb].[dbo].[sysjobs]
 WHERE [name] = @JobName;
 
-IF @JobId IS NULL
+IF NOT EXISTS (
+    SELECT 1
+    FROM [msdb].[dbo].[sysjobs]
+    WHERE [name] = @JobName
+)
 BEGIN
     EXEC [msdb].[dbo].[sp_add_job]
         @job_name = @JobName,
@@ -34,7 +38,12 @@ FROM [msdb].[dbo].[sysjobsteps]
 WHERE [job_id] = @JobId
   AND [step_name] = N'Health check';
 
-IF @StepId IS NOT NULL
+IF EXISTS (
+    SELECT 1
+    FROM [msdb].[dbo].[sysjobsteps]
+    WHERE [job_id] = @JobId
+      AND [step_name] = N'Health check'
+)
 BEGIN
     EXEC [msdb].[dbo].[sp_update_jobstep]
         @job_id = @JobId,

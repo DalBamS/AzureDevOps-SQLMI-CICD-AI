@@ -23,642 +23,67 @@ if (-not (Test-Path $AllowlistPath -PathType Leaf)) {
     throw "Deployment allowlist not found: $AllowlistPath"
 }
 
-function ConvertTo-SqlLexicalView {
+function Add-TokenizedAlterFinding {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
-        [switch]$MaskString
+        [Parameter(Mandatory)][int]$StartLine,
+        [Parameter(Mandatory)][object[]]$Rules,
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$Findings
     )
 
-    $result = [Text.StringBuilder]::new($Text.Length)
-    for ($index = 0; $index -lt $Text.Length; $index++) {
+    $codeOnly = SqlCmd.Common\ConvertTo-CodeOnly -Text $Text
+    $tokens = @(SqlCmd.Common\ConvertTo-SqlToken -Text $codeOnly)
+    for ($index = 0; $index + 1 -lt $tokens.Count; $index++) {
         if (
-            $Text[$index] -eq '-' -and
-            $index + 1 -lt $Text.Length -and
-            $Text[$index + 1] -eq '-'
+            $tokens[$index].Kind -ne 'Word' -or
+            $tokens[$index].Value -ne 'ALTER' -or
+            $tokens[$index + 1].Kind -ne 'Word' -or
+            $tokens[$index + 1].Value -ne 'TABLE'
         ) {
-            while ($index -lt $Text.Length -and $Text[$index] -notin "`r", "`n") {
-                [void]$result.Append(' ')
-                $index++
-            }
-            if ($index -lt $Text.Length) {
-                [void]$result.Append($Text[$index])
-            }
             continue
         }
-        if (
-            $Text[$index] -eq '/' -and
-            $index + 1 -lt $Text.Length -and
-            $Text[$index + 1] -eq '*'
-        ) {
-            $depth = 1
-            [void]$result.Append('  ')
-            $index += 2
-            while ($index -lt $Text.Length -and $depth -gt 0) {
-                if (
-                    $Text[$index] -eq '/' -and
-                    $index + 1 -lt $Text.Length -and
-                    $Text[$index + 1] -eq '*'
-                ) {
-                    $depth++
-                    [void]$result.Append('  ')
-                    $index += 2
-                    continue
-                }
-                if (
-                    $Text[$index] -eq '*' -and
-                    $index + 1 -lt $Text.Length -and
-                    $Text[$index + 1] -eq '/'
-                ) {
-                    $depth--
-                    [void]$result.Append('  ')
-                    $index += 2
-                    continue
-                }
-                [void]$result.Append($(if ($Text[$index] -in "`r", "`n") { $Text[$index] } else { ' ' }))
-                $index++
-            }
-            if ($depth -ne 0) {
-                throw 'Deployment script contains an unterminated block comment.'
-            }
-            $index--
-            continue
-        }
-        if ($Text[$index] -eq '[') {
-            [void]$result.Append('[')
-            $index++
-            $closed = $false
-            while ($index -lt $Text.Length) {
-                [void]$result.Append($(if ($MaskString -and $Text[$index] -ne ']') { ' ' } else { $Text[$index] }))
-                if ($Text[$index] -ne ']') {
-                    $index++
-                    continue
-                }
-                if ($index + 1 -lt $Text.Length -and $Text[$index + 1] -eq ']') {
-                    [void]$result.Append($(if ($MaskString) { ' ' } else { ']' }))
-                    $index += 2
-                    continue
-                }
-                $closed = $true
-                break
-            }
-            if (-not $closed) {
-                throw 'Deployment script contains an unterminated bracket-quoted identifier.'
-            }
-            continue
-        }
-        if ($Text[$index] -eq '"') {
-            [void]$result.Append('"')
-            $index++
-            $closed = $false
-            while ($index -lt $Text.Length) {
-                [void]$result.Append($(if ($MaskString -and $Text[$index] -ne '"') { ' ' } else { $Text[$index] }))
-                if ($Text[$index] -ne '"') {
-                    $index++
-                    continue
-                }
-                if ($index + 1 -lt $Text.Length -and $Text[$index + 1] -eq '"') {
-                    [void]$result.Append($(if ($MaskString) { ' ' } else { '"' }))
-                    $index += 2
-                    continue
-                }
-                $closed = $true
-                break
-            }
-            if (-not $closed) {
-                throw 'Deployment script contains an unterminated quoted identifier.'
-            }
-            continue
-        }
-        if ($Text[$index] -eq "'") {
-            [void]$result.Append($(if ($MaskString) { ' ' } else { "'" }))
-            $index++
-            $closed = $false
-            while ($index -lt $Text.Length) {
-                if ($Text[$index] -ne "'") {
-                    [void]$result.Append($(if ($MaskString -and $Text[$index] -notin "`r", "`n") { ' ' } else { $Text[$index] }))
-                    $index++
-                    continue
-                }
-                if ($index + 1 -lt $Text.Length -and $Text[$index + 1] -eq "'") {
-                    [void]$result.Append($(if ($MaskString) { '  ' } else { "''" }))
-                    $index += 2
-                    continue
-                }
-                [void]$result.Append($(if ($MaskString) { ' ' } else { "'" }))
-                $closed = $true
-                break
-            }
-            if (-not $closed) {
-                throw 'Deployment script contains an unterminated string literal.'
-            }
-            continue
-        }
-        [void]$result.Append($Text[$index])
-    }
-    return $result.ToString()
-}
-
-function ConvertTo-CodeOnly {
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
-
-    return ConvertTo-SqlLexicalView -Text $Text -MaskString
-}
-
-function ConvertTo-CommentFreeSql {
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
-
-    return ConvertTo-SqlLexicalView -Text $Text
-}
-
-function Get-SqlStatement {
-    param(
-        [Parameter(Mandatory)][string]$Text,
-        [Parameter(Mandatory)][int]$StartIndex
-    )
-
-    for ($index = $StartIndex; $index -lt $Text.Length; $index++) {
-        if ($Text[$index] -eq "'") {
-            $index++
-            while ($index -lt $Text.Length) {
-                if ($Text[$index] -ne "'") {
-                    $index++
-                    continue
-                }
-                if ($index + 1 -lt $Text.Length -and $Text[$index + 1] -eq "'") {
-                    $index += 2
-                    continue
-                }
-                break
-            }
-            continue
-        }
-        if ($Text[$index] -in '[', '"') {
-            $closing = if ($Text[$index] -eq '[') { ']' } else { '"' }
-            $index++
-            while ($index -lt $Text.Length) {
-                if ($Text[$index] -ne $closing) {
-                    $index++
-                    continue
-                }
-                if ($index + 1 -lt $Text.Length -and $Text[$index + 1] -eq $closing) {
-                    $index += 2
-                    continue
-                }
-                break
-            }
-            continue
-        }
-        if ($Text[$index] -eq ';') {
-            return $Text.Substring($StartIndex, $index - $StartIndex + 1)
-        }
-    }
-    return $Text.Substring($StartIndex)
-}
-
-function Read-SqlIdentifierPath {
-        param(
-            [Parameter(Mandatory)][string]$Text,
-            [Parameter(Mandatory)][int]$StartIndex
-        )
-
-        $cursor = $StartIndex
-        $parts = [System.Collections.Generic.List[string]]::new()
-        $expectComponent = $true
-        $consumedSyntax = $false
-        $hasBoundaryWhitespace = $false
-        while ($true) {
-            $whitespaceStart = $cursor
-            while ($cursor -lt $Text.Length -and [char]::IsWhiteSpace($Text[$cursor])) {
-                $cursor++
-            }
-            $hadWhitespace = $cursor -gt $whitespaceStart
-            if ($cursor -ge $Text.Length) {
-                break
-            }
-            if ($expectComponent -and $Text[$cursor] -eq '.') {
-                $parts.Add('')
-                $consumedSyntax = $true
-                $cursor++
-                if ($parts.Count -ge 4) {
-                    return [pscustomobject]@{
-                        Success = $false
-                        Malformed = $true
-                        Parts = @()
-                        EndIndex = $cursor
-                    }
-                }
-                continue
-            }
-            if (-not $expectComponent) {
-                if ($Text[$cursor] -ne '.') {
-                    $hasBoundaryWhitespace = $hadWhitespace
-                    break
-                }
-                $cursor++
-                $expectComponent = $true
-                $consumedSyntax = $true
-                continue
-            }
-
-            $value = $null
-            if ($Text[$cursor] -eq '[') {
-                $cursor++
-                $builder = [Text.StringBuilder]::new()
-                $closed = $false
-                while ($cursor -lt $Text.Length) {
-                    if ($Text[$cursor] -ne ']') {
-                        [void]$builder.Append($Text[$cursor])
-                        $cursor++
-                        continue
-                    }
-                    if ($cursor + 1 -lt $Text.Length -and $Text[$cursor + 1] -eq ']') {
-                        [void]$builder.Append(']')
-                        $cursor += 2
-                        continue
-                    }
-                    $cursor++
-                    $closed = $true
-                    break
-                }
-                if (-not $closed) {
-                    return [pscustomobject]@{
-                        Success = $false
-                        Malformed = $true
-                        Parts = @()
-                        EndIndex = $cursor
-                    }
-                }
-                $value = $builder.ToString()
-            }
-            elseif ($Text[$cursor] -eq '"') {
-                $cursor++
-                $builder = [Text.StringBuilder]::new()
-                $closed = $false
-                while ($cursor -lt $Text.Length) {
-                    if ($Text[$cursor] -ne '"') {
-                        [void]$builder.Append($Text[$cursor])
-                        $cursor++
-                        continue
-                    }
-                    if ($cursor + 1 -lt $Text.Length -and $Text[$cursor + 1] -eq '"') {
-                        [void]$builder.Append('"')
-                        $cursor += 2
-                        continue
-                    }
-                    $cursor++
-                    $closed = $true
-                    break
-                }
-                if (-not $closed) {
-                    return [pscustomobject]@{
-                        Success = $false
-                        Malformed = $true
-                        Parts = @()
-                        EndIndex = $cursor
-                    }
-                }
-                $value = $builder.ToString()
-            }
-            else {
-                $identifier = [regex]::Match(
-                    $Text.Substring($cursor),
-                    '^[A-Za-z_][A-Za-z0-9_@$#]*'
-                )
-                if (-not $identifier.Success) {
-                    break
-                }
-                $value = $identifier.Value
-                $cursor += $identifier.Length
-            }
-            $parts.Add($value)
-            $consumedSyntax = $true
-            $expectComponent = $false
-            if ($parts.Count -ge 4) {
-                $lookAhead = $cursor
-                while ($lookAhead -lt $Text.Length -and [char]::IsWhiteSpace($Text[$lookAhead])) {
-                    $lookAhead++
-                }
-                if ($lookAhead -lt $Text.Length -and $Text[$lookAhead] -eq '.') {
-                    return [pscustomobject]@{
-                        Success = $false
-                        Malformed = $true
-                        Parts = @()
-                        EndIndex = $lookAhead
-                    }
-                }
-            }
-        }
-        $malformed = (
-            $consumedSyntax -and
-            (
-                $expectComponent -or
-                $parts.Count -eq 0 -or
-                [string]::IsNullOrEmpty($parts[-1])
-            )
-        )
-        if (-not $malformed -and $parts.Count -gt 0 -and $cursor -lt $Text.Length) {
-            $malformed = (
-                -not $hasBoundaryWhitespace -and
-                -not [char]::IsWhiteSpace($Text[$cursor]) -and
-                $Text[$cursor] -ne ';'
-            )
-        }
-        return [pscustomobject]@{
-            Success = $parts.Count -gt 0 -and -not $malformed
-            Malformed = $malformed
-            Parts = $parts.ToArray()
-            EndIndex = $cursor
-        }
-    }
-
-    function ConvertTo-SqlToken {
-        param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
-
-        $tokens = [System.Collections.Generic.List[object]]::new()
-        $index = 0
-        while ($index -lt $Text.Length) {
-            if ([char]::IsWhiteSpace($Text[$index])) {
-                $index++
-                continue
-            }
-            if ($Text[$index] -in '[', '"') {
-                $start = $index
-                $closing = if ($Text[$index] -eq '[') { ']' } else { '"' }
-                $index++
-                while ($index -lt $Text.Length) {
-                    if ($Text[$index] -ne $closing) {
-                        $index++
-                        continue
-                    }
-                    if ($index + 1 -lt $Text.Length -and $Text[$index + 1] -eq $closing) {
-                        $index += 2
-                        continue
-                    }
-                    $index++
-                    break
-                }
-                $tokens.Add([pscustomobject]@{
-                    Kind = 'Identifier'
-                    Value = $Text.Substring($start, $index - $start)
-                    Index = $start
-                    Length = $index - $start
-                })
-                continue
-            }
-            if ($Text[$index] -match '[A-Za-z_@$#]') {
-                $match = [regex]::Match($Text.Substring($index), '^[A-Za-z_@$#][A-Za-z0-9_@$#]*')
-                $tokens.Add([pscustomobject]@{
-                    Kind = 'Word'
-                    Value = $match.Value.ToUpperInvariant()
-                    Index = $index
-                    Length = $match.Length
-                })
-                $index += $match.Length
-                continue
-            }
-            $tokens.Add([pscustomobject]@{
-                Kind = 'Symbol'
-                Value = [string]$Text[$index]
-                Index = $index
-                Length = 1
-            })
-            $index++
-        }
-        return $tokens.ToArray()
-    }
-
-    function Add-TokenizedAlterFinding {
-        param(
-            [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
-            [Parameter(Mandatory)][int]$StartLine,
-            [Parameter(Mandatory)][object[]]$Rules,
-            [Parameter(Mandatory)]
-            [AllowEmptyCollection()]
-            [System.Collections.Generic.List[object]]$Findings
-        )
-
-        $codeOnly = ConvertTo-CodeOnly -Text $Text
-        $tokens = @(ConvertTo-SqlToken -Text $codeOnly)
-        for ($index = 0; $index + 1 -lt $tokens.Count; $index++) {
-            if (
-                $tokens[$index].Kind -ne 'Word' -or
-                $tokens[$index].Value -ne 'ALTER' -or
-                $tokens[$index + 1].Kind -ne 'Word' -or
-                $tokens[$index + 1].Value -ne 'TABLE'
-            ) {
-                continue
-            }
-            $statementEnd = $Text.Length
-            $actionRule = $null
-            for ($cursor = $index + 2; $cursor -lt $tokens.Count; $cursor++) {
-                if ($tokens[$cursor].Kind -eq 'Symbol' -and $tokens[$cursor].Value -eq ';') {
-                    $statementEnd = $tokens[$cursor].Index + 1
-                    break
-                }
-                if (
-                    $cursor + 1 -lt $tokens.Count -and
-                    $tokens[$cursor].Kind -eq 'Word' -and
-                    $tokens[$cursor + 1].Kind -eq 'Word'
-                ) {
-                    $pair = "$($tokens[$cursor].Value) $($tokens[$cursor + 1].Value)"
-                    if ($pair -eq 'ALTER TABLE') {
-                        $statementEnd = $tokens[$cursor].Index
-                        break
-                    }
-                    $ruleId = switch ($pair) {
-                        'DROP COLUMN' { 'DEPLOY002' }
-                        'DROP CONSTRAINT' { 'DEPLOY004' }
-                        'ALTER COLUMN' { 'DEPLOY006' }
-                        default { $null }
-                    }
-                    if ($ruleId) {
-                        $actionRule = $Rules | Where-Object Id -eq $ruleId | Select-Object -First 1
-                        break
-                    }
-                }
-            }
-            if ($actionRule) {
-                $length = [Math]::Max(0, $statementEnd - $tokens[$index].Index)
-                $Findings.Add([pscustomobject]@{
-                    Rule = $actionRule.Id
-                    Severity = $actionRule.Severity
-                    Line = Get-LineNumber -Text $Text -Index $tokens[$index].Index -StartLine $StartLine
-                    Message = $actionRule.Message
-                    Statement = (($Text.Substring($tokens[$index].Index, $length)) -replace '\s+', ' ').Trim()
-                    AllowedBy = $null
-                })
-            }
-        }
-    }
-
-function Test-ConstantDynamicDdl {
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
-
-    $tokens = @(ConvertTo-SqlToken -Text (ConvertTo-CodeOnly -Text $Text))
-    $objectTypes = @(
-        'TABLE',
-        'VIEW',
-        'PROCEDURE',
-        'PROC',
-        'FUNCTION',
-        'INDEX',
-        'SCHEMA',
-        'TRIGGER',
-        'TYPE',
-        'SEQUENCE',
-        'SYNONYM',
-        'DATABASE',
-        'ROLE',
-        'USER',
-        'LOGIN'
-    )
-    for ($index = 0; $index -lt $tokens.Count; $index++) {
-        if ($tokens[$index].Kind -ne 'Word') {
-            continue
-        }
-        $verb = $tokens[$index].Value
-        if ($verb -eq 'TRUNCATE') {
-            if (
-                $index + 1 -lt $tokens.Count -and
-                $tokens[$index + 1].Kind -eq 'Word' -and
-                $tokens[$index + 1].Value -eq 'TABLE'
-            ) {
-                return $true
-            }
-            continue
-        }
-        if ($verb -in @('ALTER', 'DROP')) {
-            if (
-                $index + 1 -lt $tokens.Count -and
-                $tokens[$index + 1].Kind -eq 'Word' -and
-                $tokens[$index + 1].Value -in $objectTypes
-            ) {
-                return $true
-            }
-            continue
-        }
-        if ($verb -ne 'CREATE') {
-            continue
-        }
-
-        $cursor = $index + 1
-        if (
-            $cursor + 1 -lt $tokens.Count -and
-            $tokens[$cursor].Kind -eq 'Word' -and
-            $tokens[$cursor].Value -eq 'OR' -and
-            $tokens[$cursor + 1].Kind -eq 'Word' -and
-            $tokens[$cursor + 1].Value -eq 'ALTER'
-        ) {
-            $cursor += 2
-        }
-        if (
-            $cursor -lt $tokens.Count -and
-            $tokens[$cursor].Kind -eq 'Word' -and
-            $tokens[$cursor].Value -in $objectTypes
-        ) {
-            return $true
-        }
-
-        $sawIndexModifier = $false
-        while ($cursor -lt $tokens.Count) {
+        $statementEnd = $Text.Length
+        $actionRule = $null
+        for ($cursor = $index + 2; $cursor -lt $tokens.Count; $cursor++) {
             if ($tokens[$cursor].Kind -eq 'Symbol' -and $tokens[$cursor].Value -eq ';') {
+                $statementEnd = $tokens[$cursor].Index + 1
                 break
-            }
-            if ($tokens[$cursor].Kind -ne 'Word') {
-                break
-            }
-            if ($tokens[$cursor].Value -eq 'INDEX') {
-                return $sawIndexModifier
             }
             if (
-                $tokens[$cursor].Value -in @(
-                    'UNIQUE',
-                    'CLUSTERED',
-                    'NONCLUSTERED',
-                    'COLUMNSTORE'
-                )
+                $cursor + 1 -lt $tokens.Count -and
+                $tokens[$cursor].Kind -eq 'Word' -and
+                $tokens[$cursor + 1].Kind -eq 'Word'
             ) {
-                $sawIndexModifier = $true
-                $cursor++
-                continue
-            }
-            while (
-                $cursor -lt $tokens.Count -and
-                -not (
-                    $tokens[$cursor].Kind -eq 'Symbol' -and
-                    $tokens[$cursor].Value -eq ';'
-                )
-            ) {
-                if (
-                    $tokens[$cursor].Kind -eq 'Word' -and
-                    $tokens[$cursor].Value -eq 'INDEX'
-                ) {
-                    return $true
+                $pair = "$($tokens[$cursor].Value) $($tokens[$cursor + 1].Value)"
+                if ($pair -eq 'ALTER TABLE') {
+                    $statementEnd = $tokens[$cursor].Index
+                    break
                 }
-                $cursor++
+                $ruleId = switch ($pair) {
+                    'DROP COLUMN' { 'DEPLOY002' }
+                    'DROP CONSTRAINT' { 'DEPLOY004' }
+                    'ALTER COLUMN' { 'DEPLOY006' }
+                    default { $null }
+                }
+                if ($ruleId) {
+                    $actionRule = $Rules | Where-Object Id -eq $ruleId | Select-Object -First 1
+                    break
+                }
             }
-            break
         }
-    }
-    return $false
-}
-
-function ConvertFrom-ConstantSqlExpression {
-    param(
-        [Parameter(Mandatory)][string]$Text,
-        [Parameter(Mandatory)][int]$StartIndex
-    )
-
-    $cursor = $StartIndex
-    $value = [Text.StringBuilder]::new()
-    $literalCount = 0
-    while ($true) {
-        while ($cursor -lt $Text.Length -and [char]::IsWhiteSpace($Text[$cursor])) {
-            $cursor++
+        if ($actionRule) {
+            $length = [Math]::Max(0, $statementEnd - $tokens[$index].Index)
+            $Findings.Add([pscustomobject]@{
+                Rule = $actionRule.Id
+                Severity = $actionRule.Severity
+                Line = Get-LineNumber -Text $Text -Index $tokens[$index].Index -StartLine $StartLine
+                Message = $actionRule.Message
+                Statement = (($Text.Substring($tokens[$index].Index, $length)) -replace '\s+', ' ').Trim()
+                AllowedBy = $null
+            })
         }
-        if (
-            $cursor + 1 -lt $Text.Length -and
-            ($Text[$cursor] -eq 'N' -or $Text[$cursor] -eq 'n') -and
-            $Text[$cursor + 1] -eq "'"
-        ) {
-            $cursor++
-        }
-        if ($cursor -ge $Text.Length -or $Text[$cursor] -ne "'") {
-            return [pscustomobject]@{ Success = $false; Value = ''; EndIndex = $cursor }
-        }
-        $cursor++
-        $closed = $false
-        while ($cursor -lt $Text.Length) {
-            if ($Text[$cursor] -ne "'") {
-                [void]$value.Append($Text[$cursor])
-                $cursor++
-                continue
-            }
-            if ($cursor + 1 -lt $Text.Length -and $Text[$cursor + 1] -eq "'") {
-                [void]$value.Append("'")
-                $cursor += 2
-                continue
-            }
-            $cursor++
-            $closed = $true
-            break
-        }
-        if (-not $closed) {
-            return [pscustomobject]@{ Success = $false; Value = ''; EndIndex = $cursor }
-        }
-        $literalCount++
-        while ($cursor -lt $Text.Length -and [char]::IsWhiteSpace($Text[$cursor])) {
-            $cursor++
-        }
-        if ($cursor -ge $Text.Length -or $Text[$cursor] -ne '+') {
-            break
-        }
-        $cursor++
-    }
-    return [pscustomobject]@{
-        Success = $literalCount -gt 0
-        Value = $value.ToString()
-        EndIndex = $cursor
     }
 }
 
@@ -752,10 +177,28 @@ function Add-DynamicExecutionFinding {
         return
     }
 
-    $codeOnly = ConvertTo-CodeOnly -Text $Text
-    $commentFree = ConvertTo-CommentFreeSql -Text $Text
+    foreach (
+        $bareInvocation in
+        @(SqlCmd.Common\Get-SqlBareProcedureInvocation -Text $Text)
+    ) {
+        Add-DynamicExecutionFinding `
+            -Text "EXEC $($bareInvocation.Statement)" `
+            -StartLine (
+                Get-LineNumber `
+                    -Text $Text `
+                    -Index $bareInvocation.Index `
+                    -StartLine $StartLine
+            ) `
+            -Depth ($Depth + 1) `
+            -Rules $Rules `
+            -Findings $Findings
+    }
+    $codeOnly = SqlCmd.Common\ConvertTo-CodeOnly -Text $Text
+    $commentFree = SqlCmd.Common\ConvertTo-CommentFreeSql -Text $Text
     foreach ($executeMatch in [regex]::Matches($codeOnly, '(?is)\bEXEC(?:UTE)?\b')) {
-        $statement = Get-SqlStatement -Text $commentFree -StartIndex $executeMatch.Index
+        $statement = SqlCmd.Common\Get-SqlStatement `
+            -Text $commentFree `
+            -StartIndex $executeMatch.Index
         $findingLine = if ($Depth -eq 0) {
             Get-LineNumber -Text $Text -Index $executeMatch.Index -StartLine $StartLine
         }
@@ -795,7 +238,9 @@ function Add-DynamicExecutionFinding {
             EndIndex = $cursor
         }
         if (-not $parenthesized -and -not $startsWithLiteral -and -not $startsWithVariable) {
-            $procedure = Read-SqlIdentifierPath -Text $statement -StartIndex $cursor
+            $procedure = SqlCmd.Common\Read-SqlIdentifierPath `
+                -Text $statement `
+                -StartIndex $cursor
             if (-not $procedure.Success) {
                 $Findings.Add([pscustomobject]@{
                     Rule = 'DEPLOY009'
@@ -849,7 +294,9 @@ function Add-DynamicExecutionFinding {
             continue
         }
 
-        $expression = ConvertFrom-ConstantSqlExpression -Text $statement -StartIndex $cursor
+        $expression = SqlCmd.Common\ConvertFrom-ConstantSqlExpression `
+            -Text $statement `
+            -StartIndex $cursor
         if (-not $expression.Success) {
             $Findings.Add([pscustomobject]@{
                 Rule = 'DEPLOY008'
@@ -881,7 +328,7 @@ function Add-DynamicExecutionFinding {
         }
 
         $dynamicSql = $expression.Value
-        $dynamicCodeOnly = ConvertTo-CodeOnly -Text $dynamicSql
+        $dynamicCodeOnly = SqlCmd.Common\ConvertTo-CodeOnly -Text $dynamicSql
         foreach ($rule in $Rules) {
             if (-not $rule.Pattern) {
                 continue
@@ -905,7 +352,7 @@ function Add-DynamicExecutionFinding {
             -StartLine $findingLine `
             -Rules $Rules `
             -Findings $Findings
-        if (Test-ConstantDynamicDdl -Text $dynamicSql) {
+        if (SqlCmd.Common\Test-ConstantDynamicDdl -Text $dynamicSql) {
             $Findings.Add([pscustomobject]@{
                 Rule = 'DEPLOY008'
                 Severity = 'error'
@@ -995,7 +442,7 @@ if ($batchLines.Count -gt 0) {
 
 $findings = [System.Collections.Generic.List[object]]::new()
 foreach ($batch in $batches) {
-    $codeOnly = ConvertTo-CodeOnly -Text $batch.Text
+    $codeOnly = SqlCmd.Common\ConvertTo-CodeOnly -Text $batch.Text
     foreach ($rule in $rules) {
         if (-not $rule.Pattern) {
             continue
