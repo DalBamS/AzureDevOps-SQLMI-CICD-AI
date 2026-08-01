@@ -211,6 +211,15 @@ JSON Schema를 사용해 Azure OpenAI Responses API를 호출합니다.
 - 배포 계획: 환경별로 생성된 `deploy.sql` 검토
 - 결과: JSON artifact와 Azure Pipelines 실행 요약용 Markdown
 
+입력이 `MaxInputCharacters`(기본 120000)를 넘으면 SQL의 독립 줄 `GO`를 우선 경계로
+나누어 순차 호출합니다. 단일 배치가 더 크면 줄 단위 무손실 창을 사용하며, 한 줄도 제한을
+넘을 때만 고정 문자 창으로 나눕니다. 어떠한 fallback도 원문을 생략하거나 변경하지
+않습니다. 청크별 결과는 기존 `risk`, `summary`, `blockingFindings`, `advisories` 계약을
+유지해 병합합니다. risk는 `low < medium < high`의 최댓값이고 finding은 모든 필드가
+같을 때 최초 등장만 유지합니다. `-ValidateOnlyResponsePath`에는 여러 청크이면 청크
+수와 같은 JSON 응답 배열을, 기존 단일 응답 검증이면 객체 하나를 전달해 네트워크 없이
+이 동작을 검증할 수 있습니다.
+
 2026년 8월 기준 기본 권장 모델은 `gpt-5.6-sol`입니다. 비용을 낮춘 PR 대량 검토에는
 `gpt-5.4-mini`를 사용할 수 있습니다. 모델 제공 지역과 할당량은 Foundry에서 확인하고,
 모델 배포 이름은 예를 들어 `sql-review`로 지정합니다.
@@ -244,13 +253,34 @@ PR 코멘트가 필요하면 Azure DevOps의 GitHub 서비스 연결을 지정�
 5. 사람 승인
 6. SQL MI publish
 
-AI 결과는 초기에는 advisory로만 게시하며 LLM 호출 실패도 `SucceededWithIssues`로 표시합니다.
-충분한 정밀도와 오탐 기준을 확보한 후 `-FailOnBlockingFindings`를 사용해
-`blockingFindings`가 있을 때만 배포를 차단합니다. SQL 본문에 운영 데이터나 connection
-string을 포함하지 않으며, 승인된 Azure OpenAI 리소스만 사용합니다.
+AI 결과는 기본적으로 advisory로만 게시하며 LLM 호출 실패도 `SucceededWithIssues`로
+표시합니다. `-FailOnBlockingFindings` 승격은 다음 조건을 **모두** 만족할 때만 승인합니다.
+
+1. advisory 운영 기간이 연속 30일 이상이고 성공한 리뷰 실행이 100회 이상이다.
+2. 사람이 판정한 변경 표본이 200건 이상이며 그중 실제 blocking 사례가 30건 이상이다.
+3. blocking recall이 95% 이상이고 전체 변경 기준 blocking false-positive rate가 2% 이하이다.
+4. Dev/Test/Prod 각 환경에서 false-positive rate가 5% 이하이고 최근 20회 연속으로
+   확인되지 않은 blocking false positive가 없다.
+
+승격 후 실제 고위험 변경 누락 1건, 7일 내 blocking 오탐 2건, 최근 20회 false-positive
+rate 5% 초과 중 하나가 발생하면 즉시 advisory로 rollback합니다. 모델, 프롬프트, JSON
+schema 또는 청크 알고리즘이 바뀌어도 위 표본을 다시 수집할 때까지 advisory로 되돌립니다.
+SQL 본문에 운영 데이터나 connection string을 포함하지 않으며 승인된 Azure OpenAI
+리소스만 사용합니다.
 
 ## 8. 운영 점검
 
+- `pipelines/drift-report.yml`을 별도 Azure Pipeline으로 등록합니다. cron은 매일
+  **02:00 UTC**이며 WIF `AzureCLI@2`, 고정 SqlPackage 170.4.83, 환경별 publish profile,
+  `sqlCommandTimeout`, variable group, private agent pool을 배포 파이프라인과 동일하게
+  사용합니다.
+- 각 환경은 `databaseNames` 첫 항목(없으면 `databaseName`)만 대표 DB로 조회합니다.
+  따라서 기본 비용은 환경당 DeployReport 1회입니다. 변경이 있으면 환경별 report
+  artifact를 게시하고 `SucceededWithIssues`, 변경이 없으면 성공입니다. 인증/네트워크/
+  SqlPackage/XML 오류는 실패하며 drift로 취급하지 않습니다.
+- drift 파이프라인은 `/Action:DeployReport`만 실행합니다. `/Action:Script`,
+  `/Action:Publish`, `Deploy-Databases.ps1`, `Deploy-InstanceObjects.ps1` 호출은
+  `eng/Test-Phase3.ps1` 정적 검사에서 금지합니다.
 - Azure DevOps artifact retention을 감사 기간에 맞게 설정합니다.
 - SQL MI의 감사 로그와 Azure DevOps deployment record를 동일 변경 티켓으로 연결합니다.
 - 운영 DB의 수동 DDL을 금지하고 정기적으로 DACPAC drift report를 생성합니다.

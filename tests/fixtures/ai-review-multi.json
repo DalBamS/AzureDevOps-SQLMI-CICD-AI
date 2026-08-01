@@ -1,0 +1,62 @@
+[
+  {
+    "risk": "low",
+    "summary": "First batch is low risk.",
+    "blockingFindings": [
+      {
+        "file": "database/App.Database/Tables/FeatureFlag.sql",
+        "line": 10,
+        "reason": "Shared blocking finding.",
+        "recommendation": "Review the table change."
+      }
+    ],
+    "advisories": [
+      {
+        "file": "database/App.Database/Tables/FeatureFlag.sql",
+        "line": 3,
+        "reason": "Shared advisory.",
+        "recommendation": "Confirm the data type."
+      }
+    ]
+  },
+  {
+    "risk": "high",
+    "summary": "Second batch has the maximum risk.",
+    "blockingFindings": [
+      {
+        "file": "database/App.Database/Tables/FeatureFlag.sql",
+        "line": 10,
+        "reason": "Shared blocking finding.",
+        "recommendation": "Review the table change."
+      }
+    ],
+    "advisories": [
+      {
+        "file": "database/App.Database/StoredProcedures/usp_SetFeatureFlag.sql",
+        "line": 13,
+        "reason": "Transaction behavior needs review.",
+        "recommendation": "Confirm rollback behavior."
+      }
+    ]
+  },
+  {
+    "risk": "medium",
+    "summary": "Third batch is medium risk.",
+    "blockingFindings": [
+      {
+        "file": "database/App.Database/StoredProcedures/usp_SetFeatureFlag.sql",
+        "line": 24,
+        "reason": "Distinct blocking finding.",
+        "recommendation": "Validate concurrent inserts."
+      }
+    ],
+    "advisories": [
+      {
+        "file": "database/App.Database/Tables/FeatureFlag.sql",
+        "line": 3,
+        "reason": "Shared advisory.",
+        "recommendation": "Confirm the data type."
+      }
+    ]
+  }
+]

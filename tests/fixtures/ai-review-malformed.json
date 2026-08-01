@@ -1,0 +1,5 @@
+{
+  "risk": "medium",
+  "summary": "This fixture intentionally omits advisories.",
+  "blockingFindings": []
+}

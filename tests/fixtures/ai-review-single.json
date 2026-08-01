@@ -1,0 +1,6 @@
+{
+  "risk": "low",
+  "summary": "The SQL syntax contains no credential literal.",
+  "blockingFindings": [],
+  "advisories": []
+}
