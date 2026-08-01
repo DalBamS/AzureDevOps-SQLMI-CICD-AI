@@ -1,0 +1,41 @@
+[
+  {
+    "risk": "low",
+    "summary": "First diff chunk.",
+    "blockingFindings": [
+      {
+        "file": "database/App.Database/Tables/Chunked.sql",
+        "line": 2,
+        "reason": "First diff finding.",
+        "recommendation": "Review the first hunk."
+      }
+    ],
+    "advisories": []
+  },
+  {
+    "risk": "medium",
+    "summary": "Second diff chunk.",
+    "blockingFindings": [
+      {
+        "file": "database/App.Database/Tables/Chunked.sql",
+        "line": 4,
+        "reason": "Second diff finding.",
+        "recommendation": "Review the second hunk."
+      }
+    ],
+    "advisories": []
+  },
+  {
+    "risk": "high",
+    "summary": "Third diff chunk.",
+    "blockingFindings": [
+      {
+        "file": "database/App.Database/Tables/Chunked.sql",
+        "line": 6,
+        "reason": "Third diff finding.",
+        "recommendation": "Review the third hunk."
+      }
+    ],
+    "advisories": []
+  }
+]

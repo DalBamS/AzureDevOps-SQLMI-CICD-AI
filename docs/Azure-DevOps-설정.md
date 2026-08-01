@@ -197,7 +197,9 @@ advisory 단계입니다.
 승인 이후 배포 직전에 각 DB의 DeployReport를 다시 생성합니다. 대표 전용 Plan은 작업
 집합을 대표 보고서와 비교하고, 전수 Plan은 각 DB별 승인 보고서와 비교합니다. 대상 DB에
 새 드리프트가 생기면 해당 DB를 배포하지 않습니다. 첫 DB는 카나리로 publish 후 smoke
-test까지 통과해야 나머지를 최대 `maxParallel`로 배포합니다.
+test까지 통과해야 나머지를 최대 `maxParallel`로 배포합니다. 장시간 rollout에서 토큰
+만료를 피하도록 각 DB의 DeployReport, Publish, smoke test 직전에
+`eng/Get-AzureSqlAccessToken.ps1`로 Azure SQL access token을 새로 가져옵니다.
 각 DB 실패는 모두 수집되며 성공/실패 요약과 실패 DB 목록을 Azure DevOps summary에
 게시합니다. 이미 목표 상태인 DB는 재시도에서 publish를 생략하고 smoke를 재실행합니다.
 
@@ -218,8 +220,11 @@ JSON Schema를 사용해 Azure OpenAI Responses API를 호출합니다.
 입력이 `MaxInputCharacters`(기본 120000)를 넘으면 SQL의 독립 줄 `GO`를 우선 경계로
 나누어 순차 호출합니다. 단일 배치가 더 크면 줄 단위 무손실 창을 사용하며, 한 줄도 제한을
 넘을 때만 고정 문자 창으로 나눕니다. 어떠한 fallback도 원문을 생략하거나 변경하지
-않습니다. 청크별 결과는 기존 `risk`, `summary`, `blockingFindings`, `advisories` 계약을
-유지해 병합합니다. risk는 `low < medium < high`의 최댓값이고 finding은 모든 필드가
+않습니다. 각 요청에는 원본 경로와 원본 시작 줄을 넣고 모델이 반환한 청크 상대 줄을
+원본 전역 줄로 변환합니다. Git diff는 파일과 hunk별 새 파일 줄 매핑을 사용합니다.
+청크별 결과는 기존 `risk`, `summary`,
+`blockingFindings`, `advisories` 계약을 유지해 병합합니다. risk는
+`low < medium < high`의 최댓값이고 finding은 모든 필드가
 같을 때 최초 등장만 유지합니다. `-ValidateOnlyResponsePath`에는 여러 청크이면 청크
 수와 같은 JSON 응답 배열을, 기존 단일 응답 검증이면 객체 하나를 전달해 네트워크 없이
 이 동작을 검증할 수 있습니다.

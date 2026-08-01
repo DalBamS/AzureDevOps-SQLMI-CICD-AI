@@ -76,14 +76,27 @@ New-Item -ItemType Directory -Force -Path $ReviewPath | Out-Null
 
 $scriptPath = Join-Path $ReviewPath 'deploy.sql'
 $approvedReportPath = Join-Path $ReviewPath 'deploy-report.xml'
-Invoke-SqlPackageAction -Action Script -TargetDatabase $representative -OutputPath $scriptPath
-& $policyScript `
-    -ScriptPath $scriptPath `
-    -ReportPath (Join-Path $ReviewPath 'deployment-script-policy.md')
+$policyReportPath = Join-Path $ReviewPath 'deployment-script-policy.md'
+$targetMetadataPath = Join-Path $ReviewPath 'target-databases.json'
+$allReportsPath = Join-Path $ReviewPath 'all-database-reports'
+foreach ($generatedFile in @(
+    $scriptPath,
+    $approvedReportPath,
+    $policyReportPath,
+    $targetMetadataPath
+)) {
+    Remove-Item -Path $generatedFile -Force -ErrorAction SilentlyContinue
+}
+Remove-Item -Path $allReportsPath -Recurse -Force -ErrorAction SilentlyContinue
+
 Invoke-SqlPackageAction `
     -Action DeployReport `
     -TargetDatabase $representative `
     -OutputPath $approvedReportPath
+Invoke-SqlPackageAction -Action Script -TargetDatabase $representative -OutputPath $scriptPath
+& $policyScript `
+    -ScriptPath $scriptPath `
+    -ReportPath $policyReportPath
 
 $targetMetadata = [ordered]@{
     environment = $EnvironmentName
@@ -94,11 +107,10 @@ $targetMetadata = [ordered]@{
 }
 $targetMetadata |
     ConvertTo-Json -Depth 4 |
-    Set-Content -Path (Join-Path $ReviewPath 'target-databases.json') -Encoding utf8
+    Set-Content -Path $targetMetadataPath -Encoding utf8
 
 $drifted = [System.Collections.Generic.List[string]]::new()
 if ($ValidateAllDatabasePlans) {
-    $allReportsPath = Join-Path $ReviewPath 'all-database-reports'
     New-Item -ItemType Directory -Force -Path $allReportsPath | Out-Null
     Copy-Item `
         -Path $approvedReportPath `

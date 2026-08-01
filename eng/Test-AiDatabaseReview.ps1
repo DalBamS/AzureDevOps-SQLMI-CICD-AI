@@ -38,13 +38,15 @@ function Assert-Throws {
 }
 
 try {
-    $batchPadding = (1..8 | ForEach-Object { "+-- deterministic diff padding $_ 0123456789012345678901234567890123456789`n" }) -join ''
+    $batchPadding = @(
+        1..12 | ForEach-Object {
+            "+-- deterministic diff padding $_ 0123456789012345678901234567890123456789"
+        }
+    )
     $chunkedInput = @(
-        "+SELECT 1 AS [BatchOne];`n$batchPadding"
-        '+GO'
-        "+SELECT 2 AS [BatchTwo];`n$batchPadding"
-        '+GO'
-        "+SELECT 3 AS [BatchThree];`n$batchPadding"
+        (@("+SELECT 1 AS [BatchOne];") + $batchPadding + '+GO') -join "`n"
+        (@("+SELECT 2 AS [BatchTwo];") + $batchPadding + '+GO') -join "`n"
+        (@("+SELECT 3 AS [BatchThree];") + $batchPadding) -join "`n"
     ) -join "`n"
     $chunkedInputPath = Join-Path $temporaryPath 'chunked.sql'
     $chunkedOutputPath = Join-Path $temporaryPath 'chunked.json'
@@ -58,11 +60,44 @@ try {
 
     $merged = Get-Content -Path $chunkedOutputPath -Raw | ConvertFrom-Json
     Assert-Equal $merged.risk 'high' 'Merged risk must use the defined low/medium/high maximum.'
-    Assert-Equal @($merged.blockingFindings).Count 2 'Blocking findings must be de-duplicated.'
-    Assert-Equal @($merged.advisories).Count 2 'Advisories must be de-duplicated.'
-    Assert-Equal $merged.blockingFindings[0].reason 'Shared blocking finding.' 'Finding order must be stable.'
-    Assert-Equal $merged.blockingFindings[1].reason 'Distinct blocking finding.' 'Finding order must preserve first occurrence.'
+    Assert-Equal @($merged.blockingFindings).Count 3 'Every chunk finding must be retained.'
+    Assert-Equal @($merged.advisories).Count 3 'Every chunk advisory must be retained.'
+    Assert-Equal $merged.blockingFindings[0].file 'chunked.sql' 'The first chunk must retain its source path.'
+    Assert-Equal $merged.blockingFindings[1].file 'chunked.sql' 'The second chunk must retain its source path.'
+    Assert-Equal $merged.blockingFindings[2].file 'chunked.sql' 'The third chunk must retain its source path.'
+    Assert-Equal $merged.blockingFindings[0].line 2 'The first chunk line must remain unchanged.'
+    Assert-Equal $merged.blockingFindings[1].line 18 'The second chunk line must be converted to its original global line.'
+    Assert-Equal $merged.blockingFindings[2].line 34 'The third chunk line must be converted to its original global line.'
+    Assert-Equal $merged.blockingFindings[0].reason 'First chunk finding.' 'Finding order must be stable.'
+    Assert-Equal $merged.blockingFindings[2].reason 'Third chunk finding.' 'Finding order must preserve chunk order.'
     Assert-Equal @($merged.PSObject.Properties).Count 4 'The merged response must preserve the four-field result contract.'
+
+    $diffPath = Join-Path $temporaryPath 'chunked.diff'
+    $diffOutputPath = Join-Path $temporaryPath 'chunked-diff.json'
+    $diffLines = [System.Collections.Generic.List[string]]::new()
+    $diffLines.Add('diff --git a/database/App.Database/Tables/Chunked.sql b/database/App.Database/Tables/Chunked.sql')
+    $diffLines.Add('--- a/database/App.Database/Tables/Chunked.sql')
+    $diffLines.Add('+++ b/database/App.Database/Tables/Chunked.sql')
+    foreach ($hunkStart in @(101, 201, 301)) {
+        $diffLines.Add("@@ -0,0 +$hunkStart,14 @@")
+        $batchNumber = (($hunkStart - 1) / 100)
+        $diffLines.Add("+SELECT $batchNumber AS [Batch$batchNumber];")
+        foreach ($paddingLine in $batchPadding) {
+            $diffLines.Add($paddingLine)
+        }
+        $diffLines.Add('+GO')
+    }
+    Set-Content -Path $diffPath -Value $diffLines -Encoding utf8
+    & $reviewScript `
+        -ReviewInputPath $diffPath `
+        -MaxInputCharacters 1000 `
+        -ValidateOnlyResponsePath (Join-Path $fixtures 'ai-review-diff-multi.json') `
+        -OutputPath $diffOutputPath
+    $diffReview = Get-Content -Path $diffOutputPath -Raw | ConvertFrom-Json
+    Assert-Equal $diffReview.blockingFindings[0].file 'database/App.Database/Tables/Chunked.sql' 'Diff findings must retain the affected repository path.'
+    Assert-Equal $diffReview.blockingFindings[0].line 101 'The first diff hunk must map to its new-file line.'
+    Assert-Equal $diffReview.blockingFindings[1].line 203 'The second diff hunk must map local lines to new-file lines.'
+    Assert-Equal $diffReview.blockingFindings[2].line 305 'The third diff hunk must map local lines to new-file lines.'
 
     Assert-Throws {
         & $reviewScript `

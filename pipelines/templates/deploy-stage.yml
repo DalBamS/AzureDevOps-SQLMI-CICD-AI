@@ -175,6 +175,11 @@ stages:
                 - download: current
                   artifact: database
 
+                - pwsh: |
+                    $reviewDownloadPath = "$(Pipeline.Workspace)/deployment-review-${{ parameters.environmentName }}"
+                    Remove-Item -Path $reviewDownloadPath -Recurse -Force -ErrorAction SilentlyContinue
+                  displayName: Clear previous deployment review download
+
                 - download: current
                   artifact: deployment-review-${{ parameters.environmentName }}
 
@@ -238,14 +243,6 @@ stages:
                       if ($IsWindows) {
                         $sqlPackage += ".exe"
                       }
-                      $token = (az account get-access-token `
-                        --resource "https://database.windows.net/" `
-                        --query accessToken `
-                        --output tsv).Trim()
-                      if (-not $token) {
-                        throw "Unable to acquire an Azure SQL access token."
-                      }
-
                       $summaryPath = Join-Path "$(Agent.TempDirectory)" "deploy-summary-${{ parameters.environmentName }}.md"
                       try {
                         ./eng/Deploy-Databases.ps1 `
@@ -257,7 +254,7 @@ stages:
                           -PublishProfilePath "${{ parameters.publishProfile }}" `
                           -SqlPackagePath $sqlPackage `
                           -ApprovedReportPath "$(Pipeline.Workspace)/deployment-review-${{ parameters.environmentName }}/deploy-report.xml" `
-                          -AccessToken $token `
+                          -AccessTokenProviderPath "./eng/Get-AzureSqlAccessToken.ps1" `
                           -CommandTimeout ${{ parameters.sqlCommandTimeout }} `
                           -MaxParallel ${{ parameters.maxParallel }} `
                           -ReportDirectory "$(Agent.TempDirectory)/database-deploy-reports" `

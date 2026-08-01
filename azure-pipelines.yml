@@ -120,8 +120,10 @@ stages:
               ./eng/Build.ps1 `
                 -DacVersion "1.0.$(Build.BuildId).0" `
                 -Strictness "${{ parameters.buildStrictness }}" `
-                -ValidatedSuppressTSqlWarnings "${{ parameters.validatedSuppressTSqlWarnings }}"
+                -ValidatedSuppressTSqlWarnings $env:VALIDATED_SUPPRESS_TSQL_WARNINGS
             displayName: Build SQL project
+            env:
+              VALIDATED_SUPPRESS_TSQL_WARNINGS: ${{ parameters.validatedSuppressTSqlWarnings }}
 
           - pwsh: ./eng/Test-SqlPolicy.ps1
             displayName: Run deterministic SQL policy

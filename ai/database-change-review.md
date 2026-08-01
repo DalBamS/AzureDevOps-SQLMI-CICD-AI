@@ -40,7 +40,8 @@ Return valid JSON only:
 }
 ```
 
-Use repository-relative paths and the line number in the supplied diff or deployment script.
+Use the source path supplied with each chunk. Return a line number relative to that chunk,
+starting at 1; the caller converts it to the original source line before merging.
 Return empty arrays when there are no findings. Do not wrap the JSON in Markdown.
 
 AI output is advisory. A deterministic build, policy check, integration test, and human production approval remain mandatory.

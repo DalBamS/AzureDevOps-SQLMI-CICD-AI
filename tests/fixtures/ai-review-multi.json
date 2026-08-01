@@ -4,17 +4,17 @@
     "summary": "First batch is low risk.",
     "blockingFindings": [
       {
-        "file": "database/App.Database/Tables/FeatureFlag.sql",
-        "line": 10,
-        "reason": "Shared blocking finding.",
+        "file": "chunked.sql",
+        "line": 2,
+        "reason": "First chunk finding.",
         "recommendation": "Review the table change."
       }
     ],
     "advisories": [
       {
-        "file": "database/App.Database/Tables/FeatureFlag.sql",
+        "file": "chunked.sql",
         "line": 3,
-        "reason": "Shared advisory.",
+        "reason": "First chunk advisory.",
         "recommendation": "Confirm the data type."
       }
     ]
@@ -24,17 +24,17 @@
     "summary": "Second batch has the maximum risk.",
     "blockingFindings": [
       {
-        "file": "database/App.Database/Tables/FeatureFlag.sql",
-        "line": 10,
-        "reason": "Shared blocking finding.",
+        "file": "chunked.sql",
+        "line": 4,
+        "reason": "Second chunk finding.",
         "recommendation": "Review the table change."
       }
     ],
     "advisories": [
       {
-        "file": "database/App.Database/StoredProcedures/usp_SetFeatureFlag.sql",
-        "line": 13,
-        "reason": "Transaction behavior needs review.",
+        "file": "chunked.sql",
+        "line": 5,
+        "reason": "Second chunk advisory.",
         "recommendation": "Confirm rollback behavior."
       }
     ]
@@ -44,17 +44,17 @@
     "summary": "Third batch is medium risk.",
     "blockingFindings": [
       {
-        "file": "database/App.Database/StoredProcedures/usp_SetFeatureFlag.sql",
-        "line": 24,
-        "reason": "Distinct blocking finding.",
+        "file": "chunked.sql",
+        "line": 6,
+        "reason": "Third chunk finding.",
         "recommendation": "Validate concurrent inserts."
       }
     ],
     "advisories": [
       {
-        "file": "database/App.Database/Tables/FeatureFlag.sql",
-        "line": 3,
-        "reason": "Shared advisory.",
+        "file": "chunked.sql",
+        "line": 7,
+        "reason": "Third chunk advisory.",
         "recommendation": "Confirm the data type."
       }
     ]
