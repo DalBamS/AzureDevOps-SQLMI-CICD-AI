@@ -806,10 +806,30 @@ function Get-SqlBatch {
         }
         $goMatch = [regex]::Match(
             $line,
-            '^[\t ]*GO(?:[\t ]+[0-9]+)?[\t ]*(?:--[^\r\n]*)?$',
+            '^[\t ]*GO(?:[\t ]+(?<Count>[0-9]+))?[\t ]*(?:--[^\r\n]*)?$',
             [Text.RegularExpressions.RegexOptions]::IgnoreCase
         )
-        $isGoSeparator = $state -eq 'Code' -and $goMatch.Success
+        $isGoCandidate = (
+            $state -eq 'Code' -and
+            [regex]::IsMatch(
+                $line,
+                '^[\t ]*GO(?=$|[\t ])',
+                [Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )
+        )
+        if ($isGoCandidate -and -not $goMatch.Success) {
+            throw "SQL contains an invalid GO batch separator on physical line $lineNumber."
+        }
+        if ($isGoCandidate -and $goMatch.Groups['Count'].Success) {
+            $count = 0
+            if (-not [int]::TryParse($goMatch.Groups['Count'].Value, [ref]$count)) {
+                throw (
+                    'SQL GO batch count must be a nonnegative Int32 value on physical ' +
+                    "line $lineNumber."
+                )
+            }
+        }
+        $isGoSeparator = $isGoCandidate
         if ($isGoSeparator) {
             if (($batchLines -join "`n").Trim().Length -gt 0) {
                 $batches.Add([pscustomobject]@{
@@ -1122,6 +1142,17 @@ function Test-SqlReadOnlySelectTokenStream {
                 break
             }
             if ($token.Kind -eq 'Word' -and $token.Value -in $blockedWords) {
+                return $false
+            }
+            if (
+                $token.Kind -eq 'Word' -and
+                $token.Value -eq 'NEXT' -and
+                $cursor + 2 -lt $Tokens.Count -and
+                $Tokens[$cursor + 1].Kind -eq 'Word' -and
+                $Tokens[$cursor + 1].Value -eq 'VALUE' -and
+                $Tokens[$cursor + 2].Kind -eq 'Word' -and
+                $Tokens[$cursor + 2].Value -eq 'FOR'
+            ) {
                 return $false
             }
             if (

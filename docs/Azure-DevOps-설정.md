@@ -194,8 +194,9 @@ advisory 단계입니다.
 
 GO separator는 공용 lexer가 code context에서 물리 행 전체가 `GO` 또는 `GO <count>`인
 경우에만 인식합니다. `<count>`는 `0`, `00`, `01`을 포함한 nonnegative decimal digit
-sequence이며 분석에서는 모두 한 batch boundary로 취급합니다. 뒤에는 `--` line comment만
-둘 수 있습니다. multiline string, nested block comment, bracket identifier,
+sequence이면서 Int32 범위(`0..2147483647`)여야 하며 분석에서는 모두 한 batch boundary로
+취급합니다. overflow, sign, decimal, 다른 suffix는 실행 전에 실패합니다. 뒤에는 `--` line
+comment만 둘 수 있습니다. multiline string, nested block comment, bracket identifier,
 double-quoted identifier 안의 단독 `GO`와 line comment 안의 `GO`는 separator가 아닙니다.
 
 `EXEC`/`EXECUTE`와 `sp_executesql`의 첫 SQL 표현식이 문자열 literal과 `+` 연결만으로
@@ -249,7 +250,8 @@ fail closed입니다.
 `USE`, 제한된 `DECLARE`, read-only `SELECT`, `IF [NOT] EXISTS` block, `CREATE LOGIN`과
 상관된 Agent procedure만 허용합니다. `DISABLE/ENABLE TRIGGER`, `DBCC`, `BACKUP/RESTORE`,
 `KILL`/`SHUTDOWN`, `BULK INSERT` 등 미분류 administrative statement는 실행 전에
-차단합니다. constant dynamic SQL은 `INTO`가 없는 명시적 read-only `SELECT`만 허용합니다.
+차단합니다. constant dynamic SQL은 `INTO`와 sequence를 진행시키는 `NEXT VALUE FOR`가 없는
+명시적 read-only `SELECT`만 허용합니다.
 
 직접 `DROP`/`TRUNCATE`, `SELECT ... INTO`, `GRANT`, `DENY`, `REVOKE`와 그 constant dynamic
 variant를 차단합니다. canonical final procedure 이름이 `sp_delete*`, `sp_drop*`,

@@ -115,6 +115,56 @@ try {
         throw 'SQL Server did not become ready within 120 seconds.'
     }
 
+    foreach ($case in @(
+        @{ Count = '0'; ExpectedExecutionCount = 1 },
+        @{ Count = '01'; ExpectedExecutionCount = 1 },
+        @{ Count = '2147483647'; ExpectedExecutionCount = 2147483647 }
+    )) {
+        $batchParser = [Microsoft.SqlTools.ServiceLayer.BatchParser.BatchParserWrapper]::new()
+        try {
+            $conditions = [Microsoft.SqlTools.ServiceLayer.BatchParser.ExecutionEngineCode.ExecutionEngineConditions]::new()
+            $conditions.IsSqlCmd = $true
+            $conditions.BatchSeparator = 'GO'
+            $parsedBatches = @(
+                $batchParser.GetBatches(
+                    "SELECT 1;`nGO $($case.Count)`nSELECT 2;",
+                    $conditions
+                )
+            )
+            if (
+                $parsedBatches.Count -ne 2 -or
+                $parsedBatches[0].BatchExecutionCount -ne $case.ExpectedExecutionCount
+            ) {
+                throw "Managed parser returned unexpected GO $($case.Count) batch metadata."
+            }
+        }
+        finally {
+            $batchParser.Dispose()
+        }
+    }
+    foreach ($count in @('2147483648', '999999999999999999999999999999999999')) {
+        $batchParser = [Microsoft.SqlTools.ServiceLayer.BatchParser.BatchParserWrapper]::new()
+        $overflowRejected = $false
+        try {
+            $conditions = [Microsoft.SqlTools.ServiceLayer.BatchParser.ExecutionEngineCode.ExecutionEngineConditions]::new()
+            $conditions.IsSqlCmd = $true
+            $conditions.BatchSeparator = 'GO'
+            [void]$batchParser.GetBatches(
+                "SELECT 1;`nGO $count`nSELECT 2;",
+                $conditions
+            )
+        }
+        catch {
+            $overflowRejected = $true
+        }
+        finally {
+            $batchParser.Dispose()
+        }
+        if (-not $overflowRejected) {
+            throw "Managed parser unexpectedly accepted overflowing GO count '$count'."
+        }
+    }
+
     $goProbeTable = "SqlMiGoProbe_$PID"
     $goProbeArguments = @{
         ServerInstance = "tcp:localhost,$HostPort"
@@ -163,7 +213,7 @@ SELECT [Label] FROM [tempdb].[dbo].[$goProbeTable] ORDER BY [Label];
         throw 'Invoke-Sqlcmd unexpectedly accepted a GO count with an alphabetic suffix.'
     }
     Invoke-Sqlcmd @goProbeArguments -Query "DROP TABLE [tempdb].[dbo].[$goProbeTable];"
-    Write-Host 'Invoke-Sqlcmd GO 0/00/01, whitespace/comment, and invalid-suffix probes passed.'
+    Write-Host 'Managed parser and Invoke-Sqlcmd GO count boundary probes passed.'
 
     & docker exec $containerId `
         $sqlcmdPath `

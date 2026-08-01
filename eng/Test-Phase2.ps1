@@ -1251,6 +1251,37 @@ BEGIN
         @Value = @JobId OUTPUT;
 END;
 '@
+        },
+        @{
+            Name = 'direct-next-value-for'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    SELECT NEXT /* lexical gap */ VALUE
+        FOR [dbo].[FixtureSequence] AS [SequenceValue];
+END;
+'@
+        },
+        @{
+            Name = 'dynamic-next-value-for'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC(N'SELECT NEXT /* lexical gap */ VALUE FOR [dbo].[FixtureSequence];');
+END;
+'@
+        },
+        @{
+            Name = 'dynamic-multiple-select-next-value'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC(N'SELECT 1; SELECT NEXT VALUE FOR "dbo"."FixtureSequence";');
+END;
+'@
         }
     )
     foreach ($case in $instanceSafetyCases) {
@@ -1363,7 +1394,7 @@ BEGIN
     END;
 END;
 PRINT N'SELECT 1 INTO dbo.Copy; GRANT DENY REVOKE';
-SELECT 1 AS [INTO], 2 AS [GRANT], 3 AS "REVOKE";
+SELECT 1 AS [INTO], 2 AS [GRANT], 3 AS "REVOKE", 4 AS [NEXT VALUE FOR];
 '@ | Set-Content `
         -Path (Join-Path $instanceFixturePath '001-nested-correlated.sql') `
         -Encoding utf8
@@ -1497,7 +1528,7 @@ PRINT N'`$(NotAVariable)';
         @{ Name = 'go-zero'; Line = 'GO 0' },
         @{ Name = 'go-double-zero'; Line = 'GO 00' },
         @{ Name = 'go-leading-zero'; Line = 'GO 01' },
-        @{ Name = 'go-large-count'; Line = 'GO 999999999999999999999999999999999999' },
+        @{ Name = 'go-int32-max'; Line = 'GO 2147483647' },
         @{ Name = 'go-mixed-case-whitespace'; Line = "`t gO`t00042 `t-- managed parser comment" }
     )
     foreach ($case in $acceptedGoSeparators) {
@@ -1524,27 +1555,37 @@ PRINT N'`$(NotAVariable)';
                 -ReportPath (Join-Path $temporaryPath "$($case.Name)-unsafe.md")
         } "Bare dynamic DDL after managed GO grammar case '$($case.Name)' must be analyzed."
     }
+    $attachedGoPath = Join-Path $temporaryPath 'go-attached-count.sql'
+    $attachedGoReport = Join-Path $temporaryPath 'go-attached-count.md'
+    "SELECT 1;`nGO1`nSELECT 2;" |
+        Set-Content -Path $attachedGoPath -Encoding utf8 -NoNewline
+    & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+        -ScriptPath $attachedGoPath `
+        -ReportPath $attachedGoReport
+    Assert-True `
+        -Condition (
+            (Get-Content -Path $attachedGoReport -Raw) -match
+                'GO-delimited batches: 1'
+        ) `
+        -Message 'GO1 is an ordinary SQL token, not a managed GO separator candidate.'
     foreach ($case in @(
+        @{ Name = 'go-int32-overflow'; Line = 'GO 2147483648' },
+        @{ Name = 'go-numeric-overflow'; Line = 'GO 999999999999999999999999999999999999' },
         @{ Name = 'go-negative'; Line = 'GO -1' },
         @{ Name = 'go-plus'; Line = 'GO +1' },
-        @{ Name = 'go-attached-count'; Line = 'GO1' },
+        @{ Name = 'go-decimal'; Line = 'GO 1.5' },
         @{ Name = 'go-alpha-suffix'; Line = 'GO 1x' },
         @{ Name = 'go-block-comment-suffix'; Line = 'GO 1 /* not a supported suffix */' },
         @{ Name = 'go-extra-token'; Line = 'GO 1 SELECT 2' }
     )) {
         $casePath = Join-Path $temporaryPath "$($case.Name).sql"
-        $reportPath = Join-Path $temporaryPath "$($case.Name).md"
         "SELECT 1;`n$($case.Line)`nSELECT 2;" |
             Set-Content -Path $casePath -Encoding utf8 -NoNewline
-        & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
-            -ScriptPath $casePath `
-            -ReportPath $reportPath
-        Assert-True `
-            -Condition (
-                (Get-Content -Path $reportPath -Raw) -match
-                    'GO-delimited batches: 1'
-            ) `
-            -Message "Invalid GO suffix case '$($case.Name)' must remain in one analysis batch."
+        Assert-Throws {
+            & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+                -ScriptPath $casePath `
+                -ReportPath (Join-Path $temporaryPath "$($case.Name).md")
+        } "Invalid GO count case '$($case.Name)' must fail before execution."
     }
     $dacFxMultilinePath = Join-Path $temporaryPath 'dacfx-multiline.sql'
     $dacFxMultilineReportPath = Join-Path $temporaryPath 'dacfx-multiline.md'
