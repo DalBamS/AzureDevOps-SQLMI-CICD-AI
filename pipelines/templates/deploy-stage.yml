@@ -16,6 +16,21 @@ parameters:
   - name: sqlCommandTimeout
     type: number
     default: 3600
+  - name: maxParallel
+    type: number
+    default: 4
+  - name: validateAllDatabasePlans
+    type: boolean
+    default: false
+  - name: databasePlanDriftPolicy
+    type: string
+    default: Warn
+    values:
+      - Warn
+      - Fail
+  - name: deployInstanceObjects
+    type: boolean
+    default: false
   - name: enableAiReview
     type: boolean
   - name: aiEndpoint
@@ -68,7 +83,7 @@ stages:
             displayName: Install pinned SqlPackage
 
           - task: AzureCLI@2
-            displayName: Generate deployment script and report
+            displayName: Generate representative deployment plan
             inputs:
               azureSubscription: ${{ parameters.azureServiceConnection }}
               scriptType: pscore
@@ -79,7 +94,6 @@ stages:
                 if ($IsWindows) {
                   $sqlPackage += ".exe"
                 }
-
                 $token = (az account get-access-token `
                   --resource "https://database.windows.net/" `
                   --query accessToken `
@@ -89,47 +103,33 @@ stages:
                 }
 
                 $reviewPath = Join-Path "$(Pipeline.Workspace)" "deployment-review/${{ parameters.environmentName }}"
-                New-Item -ItemType Directory -Force -Path $reviewPath | Out-Null
-                $dacpac = "$(Pipeline.Workspace)/database/App.Database.dacpac"
-                $publishProfile = Join-Path "$(Build.SourcesDirectory)" "${{ parameters.publishProfile }}"
-                $connection = "Server=tcp:$(sqlServer),$(sqlPort);Initial Catalog=$(databaseName);Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
-                $commandTimeout = 0
-                if (-not [int]::TryParse($env:sqlCommandTimeout, [ref]$commandTimeout) -or $commandTimeout -lt 1) {
-                  throw "sqlCommandTimeout must be a positive integer."
+                $summaryPath = Join-Path "$(Agent.TempDirectory)" "plan-summary-${{ parameters.environmentName }}.md"
+                try {
+                  ./eng/New-DatabaseDeploymentPlan.ps1 `
+                    -ServerName "$(sqlServer)" `
+                    -Port "$(sqlPort)" `
+                    -DatabaseName $env:databaseName `
+                    -DatabaseNames $env:databaseNames `
+                    -DacpacPath "$(Pipeline.Workspace)/database/App.Database.dacpac" `
+                    -PublishProfilePath "${{ parameters.publishProfile }}" `
+                    -SqlPackagePath $sqlPackage `
+                    -AccessToken $token `
+                    -ReviewPath $reviewPath `
+                    -CommandTimeout ${{ parameters.sqlCommandTimeout }} `
+                    -ValidateAllDatabasePlans:([bool]::Parse($env:validateAllDatabasePlans)) `
+                    -DatabasePlanDriftPolicy "${{ parameters.databasePlanDriftPolicy }}" `
+                    -SummaryPath $summaryPath `
+                    -EnvironmentName "${{ parameters.environmentName }}"
                 }
-                if (-not (Test-Path $publishProfile -PathType Leaf)) {
-                  throw "Publish profile not found: $publishProfile"
-                }
-
-                & $sqlPackage `
-                  /Action:Script `
-                  "/SourceFile:$dacpac" `
-                  "/TargetConnectionString:$connection" `
-                  "/AccessToken:$token" `
-                  "/OutputPath:$reviewPath/deploy.sql" `
-                  "/Profile:$publishProfile" `
-                  "/p:CommandTimeout=$commandTimeout"
-                if ($LASTEXITCODE -ne 0) {
-                  throw "Deployment script generation failed."
-                }
-
-                ./eng/Test-DeploymentScript.ps1 `
-                  -ScriptPath "$reviewPath/deploy.sql" `
-                  -ReportPath "$reviewPath/deployment-script-policy.md"
-
-                & $sqlPackage `
-                  /Action:DeployReport `
-                  "/SourceFile:$dacpac" `
-                  "/TargetConnectionString:$connection" `
-                  "/AccessToken:$token" `
-                  "/OutputPath:$reviewPath/deploy-report.xml" `
-                  "/Profile:$publishProfile" `
-                  "/p:CommandTimeout=$commandTimeout"
-                if ($LASTEXITCODE -ne 0) {
-                  throw "Deployment report generation failed."
+                finally {
+                  if (Test-Path $summaryPath) {
+                    Write-Host "##vso[task.uploadsummary]$summaryPath"
+                  }
                 }
             env:
-              sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
+              databaseName: $(databaseName)
+              databaseNames: $(databaseNames)
+              validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
 
           - task: AzureCLI@2
             displayName: Run advisory AI review of deployment SQL
@@ -162,7 +162,7 @@ stages:
       - group: ${{ parameters.variableGroup }}
     jobs:
       - deployment: DeployDacpac
-        displayName: Publish approved DACPAC
+        displayName: Canary and fan-out approved DACPAC
         environment: ${{ parameters.environmentName }}
         pool:
           name: ${{ parameters.agentPool }}
@@ -212,8 +212,22 @@ stages:
                     Import-Module SqlServer -RequiredVersion $requiredVersion -Force
                   displayName: Prepare pinned SQL test module
 
+                - pwsh: |
+                    ./eng/New-PitrMarker.ps1 `
+                      -DatabaseName $env:databaseName `
+                      -DatabaseNames $env:databaseNames `
+                      -ServerName "$(sqlServer)" `
+                      -EnvironmentName "${{ parameters.environmentName }}" `
+                      -OutputPath "$(Pipeline.Workspace)/deployment-review-pitr/${{ parameters.environmentName }}/pitr-marker.json" `
+                      -BuildId "$(Build.BuildId)" `
+                      -SourceVersion "$(Build.SourceVersion)"
+                  displayName: Capture pre-deployment UTC PITR marker
+                  env:
+                    databaseName: $(databaseName)
+                    databaseNames: $(databaseNames)
+
                 - task: AzureCLI@2
-                  displayName: Deploy and smoke test approved DACPAC
+                  displayName: Deploy canary, test, then fan out
                   inputs:
                     azureSubscription: ${{ parameters.azureServiceConnection }}
                     scriptType: pscore
@@ -224,7 +238,6 @@ stages:
                       if ($IsWindows) {
                         $sqlPackage += ".exe"
                       }
-
                       $token = (az account get-access-token `
                         --resource "https://database.windows.net/" `
                         --query accessToken `
@@ -233,50 +246,90 @@ stages:
                         throw "Unable to acquire an Azure SQL access token."
                       }
 
-                      $dacpac = "$(Pipeline.Workspace)/database/App.Database.dacpac"
-                      $publishProfile = Join-Path "$(Build.SourcesDirectory)" "${{ parameters.publishProfile }}"
-                      $connection = "Server=tcp:$(sqlServer),$(sqlPort);Initial Catalog=$(databaseName);Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
-                      $approvedReport = "$(Pipeline.Workspace)/deployment-review-${{ parameters.environmentName }}/deploy-report.xml"
-                      $currentReport = "$(Agent.TempDirectory)/current-deploy-report.xml"
-                      $commandTimeout = 0
-                      if (-not [int]::TryParse($env:sqlCommandTimeout, [ref]$commandTimeout) -or $commandTimeout -lt 1) {
-                        throw "sqlCommandTimeout must be a positive integer."
+                      $summaryPath = Join-Path "$(Agent.TempDirectory)" "deploy-summary-${{ parameters.environmentName }}.md"
+                      try {
+                        ./eng/Deploy-Databases.ps1 `
+                          -ServerName "$(sqlServer)" `
+                          -Port "$(sqlPort)" `
+                          -DatabaseName $env:databaseName `
+                          -DatabaseNames $env:databaseNames `
+                          -DacpacPath "$(Pipeline.Workspace)/database/App.Database.dacpac" `
+                          -PublishProfilePath "${{ parameters.publishProfile }}" `
+                          -SqlPackagePath $sqlPackage `
+                          -ApprovedReportPath "$(Pipeline.Workspace)/deployment-review-${{ parameters.environmentName }}/deploy-report.xml" `
+                          -AccessToken $token `
+                          -CommandTimeout ${{ parameters.sqlCommandTimeout }} `
+                          -MaxParallel ${{ parameters.maxParallel }} `
+                          -ReportDirectory "$(Agent.TempDirectory)/database-deploy-reports" `
+                          -SummaryPath $summaryPath `
+                          -EnvironmentName "${{ parameters.environmentName }}"
                       }
-                      if (-not (Test-Path $publishProfile -PathType Leaf)) {
-                        throw "Publish profile not found: $publishProfile"
+                      finally {
+                        if (Test-Path $summaryPath) {
+                          Write-Host "##vso[task.uploadsummary]$summaryPath"
+                        }
                       }
-
-                      & $sqlPackage `
-                        /Action:DeployReport `
-                        "/SourceFile:$dacpac" `
-                        "/TargetConnectionString:$connection" `
-                        "/AccessToken:$token" `
-                        "/OutputPath:$currentReport" `
-                        "/Profile:$publishProfile" `
-                        "/p:CommandTimeout=$commandTimeout"
-                      if ($LASTEXITCODE -ne 0) {
-                        throw "Current deployment report generation failed."
-                      }
-
-                      ./eng/Confirm-DeploymentPlan.ps1 `
-                        -ApprovedReportPath $approvedReport `
-                        -CurrentReportPath $currentReport
-
-                      & $sqlPackage `
-                        /Action:Publish `
-                        "/SourceFile:$dacpac" `
-                        "/TargetConnectionString:$connection" `
-                        "/AccessToken:$token" `
-                        "/Profile:$publishProfile" `
-                        "/p:CommandTimeout=$commandTimeout"
-                      if ($LASTEXITCODE -ne 0) {
-                        throw "DACPAC deployment failed."
-                      }
-
-                      ./eng/Test-DeployedDatabase.ps1 `
-                        -ServerName "$(sqlServer)" `
-                        -Port "$(sqlPort)" `
-                        -DatabaseName "$(databaseName)" `
-                        -AccessToken $token
                   env:
-                    sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
+                    databaseName: $(databaseName)
+                    databaseNames: $(databaseNames)
+
+                - publish: $(Pipeline.Workspace)/deployment-review-pitr/${{ parameters.environmentName }}
+                  artifact: deployment-review-${{ parameters.environmentName }}-pitr-marker
+                  displayName: Publish PITR marker
+                  condition: succeededOrFailed()
+
+      - job: DeployInstanceObjects
+        displayName: Deploy SQL MI instance objects
+        dependsOn: DeployDacpac
+        condition: and(succeeded(), eq('${{ parameters.deployInstanceObjects }}', 'True'))
+        pool:
+          name: ${{ parameters.agentPool }}
+        steps:
+          - checkout: self
+
+          - pwsh: |
+              $requiredVersion = [version]"$(sqlServerModuleVersion)"
+              $installed = Get-Module -ListAvailable -Name SqlServer |
+                Where-Object Version -eq $requiredVersion
+              if (-not $installed) {
+                Install-Module `
+                  -Name SqlServer `
+                  -RequiredVersion $requiredVersion `
+                  -Repository PSGallery `
+                  -Scope CurrentUser `
+                  -Force `
+                  -AllowClobber
+              }
+              Import-Module SqlServer -RequiredVersion $requiredVersion -Force
+            displayName: Prepare pinned SQL module
+
+          - task: AzureCLI@2
+            displayName: Execute idempotent instance object scripts
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $ErrorActionPreference = "Stop"
+                $token = (az account get-access-token `
+                  --resource "https://database.windows.net/" `
+                  --query accessToken `
+                  --output tsv).Trim()
+                if (-not $token) {
+                  throw "Unable to acquire an Azure SQL access token."
+                }
+
+                ./eng/Deploy-InstanceObjects.ps1 `
+                  -ServerName "$(sqlServer)" `
+                  -Port "$(sqlPort)" `
+                  -AccessToken $token `
+                  -SqlcmdVariables @{
+                    EntraLoginName = $env:instanceEntraLoginName
+                    AgentJobName = $env:instanceAgentJobName
+                    AgentJobOwner = $env:instanceAgentJobOwner
+                  } `
+                  -Confirm:$false
+            env:
+              instanceEntraLoginName: $(instanceEntraLoginName)
+              instanceAgentJobName: $(instanceAgentJobName)
+              instanceAgentJobOwner: $(instanceAgentJobOwner)

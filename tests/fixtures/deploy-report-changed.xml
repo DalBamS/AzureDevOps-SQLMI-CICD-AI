@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<DeploymentReport>
+  <Operations>
+    <Operation Name="Create">
+      <Item Type="Table" Value="[dbo].[Example]" />
+    </Operation>
+  </Operations>
+</DeploymentReport>

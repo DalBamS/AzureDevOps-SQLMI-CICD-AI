@@ -37,6 +37,37 @@ parameters:
     displayName: SqlPackage command timeout in seconds
     type: number
     default: 3600
+  - name: maxParallel
+    displayName: Maximum parallel database deployments after canary
+    type: number
+    default: 4
+  - name: validateAllDatabasePlans
+    displayName: Generate and compare a DeployReport for every target database
+    type: boolean
+    default: false
+  - name: databasePlanDriftPolicy
+    displayName: Policy when a target plan differs from the representative plan
+    type: string
+    default: Warn
+    values:
+      - Warn
+      - Fail
+  - name: deployInstanceObjects
+    displayName: Deploy idempotent SQL MI instance objects after database rollout
+    type: boolean
+    default: false
+  - name: buildStrictness
+    displayName: SQL project build strictness
+    type: string
+    default: Strict
+    values:
+      - Lenient
+      - Balanced
+      - Strict
+  - name: validatedSuppressTSqlWarnings
+    displayName: Validated T-SQL warning baseline for Balanced mode
+    type: string
+    default: ''
   - name: azureServiceConnection
     displayName: Azure workload identity service connection
     type: string
@@ -85,7 +116,11 @@ stages:
               packageType: sdk
               version: 10.x
 
-          - pwsh: ./eng/Build.ps1 -DacVersion "1.0.$(Build.BuildId).0"
+          - pwsh: |
+              ./eng/Build.ps1 `
+                -DacVersion "1.0.$(Build.BuildId).0" `
+                -Strictness "${{ parameters.buildStrictness }}" `
+                -ValidatedSuppressTSqlWarnings "${{ parameters.validatedSuppressTSqlWarnings }}"
             displayName: Build SQL project
 
           - pwsh: ./eng/Test-SqlPolicy.ps1
@@ -178,6 +213,10 @@ stages:
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
       publishProfile: pipelines/profiles/sqlmi-dev.publish.xml
       sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
+      maxParallel: ${{ parameters.maxParallel }}
+      validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
+      databasePlanDriftPolicy: ${{ parameters.databasePlanDriftPolicy }}
+      deployInstanceObjects: ${{ parameters.deployInstanceObjects }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}
@@ -194,6 +233,10 @@ stages:
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
       publishProfile: pipelines/profiles/sqlmi-test.publish.xml
       sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
+      maxParallel: ${{ parameters.maxParallel }}
+      validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
+      databasePlanDriftPolicy: ${{ parameters.databasePlanDriftPolicy }}
+      deployInstanceObjects: ${{ parameters.deployInstanceObjects }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}
@@ -210,6 +253,10 @@ stages:
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
       publishProfile: pipelines/profiles/sqlmi-prod.publish.xml
       sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
+      maxParallel: ${{ parameters.maxParallel }}
+      validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
+      databasePlanDriftPolicy: ${{ parameters.databasePlanDriftPolicy }}
+      deployInstanceObjects: ${{ parameters.deployInstanceObjects }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}

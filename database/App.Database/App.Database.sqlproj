@@ -11,15 +11,23 @@
     <!-- ModelCollation controls model comparison only; verify the target database collation separately. -->
     <ModelCollation>1033, CI</ModelCollation>
     <DefaultSchema>dbo</DefaultSchema>
+    <BuildStrictness Condition="'$(BuildStrictness)' == ''">Strict</BuildStrictness>
     <RunSqlCodeAnalysis>true</RunSqlCodeAnalysis>
-  </PropertyGroup>
-
-  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
-    <TreatTSqlWarningsAsErrors>true</TreatTSqlWarningsAsErrors>
+    <TreatTSqlWarningsAsErrors Condition="'$(BuildStrictness)' == 'Lenient'">false</TreatTSqlWarningsAsErrors>
+    <TreatTSqlWarningsAsErrors Condition="'$(BuildStrictness)' == 'Balanced'">true</TreatTSqlWarningsAsErrors>
+    <TreatTSqlWarningsAsErrors Condition="'$(BuildStrictness)' == 'Strict'">true</TreatTSqlWarningsAsErrors>
+    <SuppressTSqlWarnings Condition="'$(BuildStrictness)' == 'Balanced'">$(ValidatedSuppressTSqlWarnings)</SuppressTSqlWarnings>
+    <SuppressTSqlWarnings Condition="'$(BuildStrictness)' != 'Balanced'"></SuppressTSqlWarnings>
   </PropertyGroup>
 
   <ItemGroup>
     <Build Remove="Scripts\**\*.sql" />
     <PostDeploy Include="Scripts\PostDeployment.sql" />
   </ItemGroup>
+
+  <Target Name="ValidateBuildStrictness" BeforeTargets="Build">
+    <Error
+      Condition="'$(BuildStrictness)' != 'Lenient' and '$(BuildStrictness)' != 'Balanced' and '$(BuildStrictness)' != 'Strict'"
+      Text="BuildStrictness must be Lenient, Balanced, or Strict." />
+  </Target>
 </Project>

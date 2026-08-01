@@ -72,11 +72,22 @@ Test와 Prod에는 수동 Approval check가 구성되어 있습니다. 운영 �
 
 Library의 variable group은 다음 Demo 대상으로 구성합니다.
 
-| Variable group | `sqlServer` | `sqlPort` | `databaseName` |
-|---|---|---:|---|
-| `sqlmi-dev` | `<sql-mi-public-fqdn>` | 3342 | `AppDb_CicdDemo_Dev` |
-| `sqlmi-test` | 동일 | 3342 | `AppDb_CicdDemo_Stg` |
-| `sqlmi-prod` | 동일 | 3342 | `AppDb_CicdDemo_Live` |
+| Variable group | `sqlServer` | `sqlPort` | `databaseName` | `databaseNames` |
+|---|---|---:|---|---|
+| `sqlmi-dev` | `<sql-mi-public-fqdn>` | 3342 | `AppDb_CicdDemo_Dev` | 선택: `AppDb_Dev_01,AppDb_Dev_02` |
+| `sqlmi-test` | 동일 | 3342 | `AppDb_CicdDemo_Stg` | 선택: 쉼표 구분 목록 |
+| `sqlmi-prod` | 동일 | 3342 | `AppDb_CicdDemo_Live` | 선택: 쉼표 구분 목록 |
+
+`databaseNames`가 비어 있거나 정의되지 않으면 기존 `databaseName`을 사용합니다. 목록
+첫 항목은 대표 Plan 및 카나리 DB이므로 의도한 대표 샤드를 먼저 둡니다. 중복은 대소문자
+구분 없이 제거됩니다. 인스턴스 오브젝트를 활성화할 variable group에는 다음 비밀이 아닌
+값도 추가합니다.
+
+| 변수 | 의미 |
+|---|---|
+| `instanceEntraLoginName` | 생성할 Microsoft Entra login 이름 |
+| `instanceAgentJobName` | 생성/갱신할 SQL Agent job 이름 |
+| `instanceAgentJobOwner` | 이미 존재하는 job owner login |
 
 서비스 연결 이름은 variable group이 아니라 파이프라인의 compile-time `azureServiceConnection` parameter로 전달합니다. Azure Pipelines가 실행 전에 서비스 연결 권한을 검증하기 때문입니다.
 
@@ -91,7 +102,7 @@ Library의 variable group은 다음 Demo 대상으로 구성합니다.
 5. Test 승인 후 Stg DB를 배포하고 동일 테스트를 실행합니다.
 6. Prod 승인 후 Live DB를 배포하고 동일 테스트를 실행합니다.
 
-각 환경은 동일한 `database` DACPAC artifact를 사용합니다. 이전 환경이 실패하거나 승인되지 않으면 후속 환경으로 진행하지 않습니다. 실행 시 `sqlCommandTimeout` parameter를 생략하면 명시된 3600초를 사용합니다. 서비스 기본값에는 의존하지 않습니다.
+각 환경은 동일한 `database` DACPAC artifact를 사용합니다. 이전 환경이 실패하거나 승인되지 않으면 후속 환경으로 진행하지 않습니다. 실행 시 `sqlCommandTimeout` parameter를 생략하면 명시된 3600초를 사용합니다. 서비스 기본값에는 의존하지 않습니다. `maxParallel` 기본값은 4이며 카나리 성공 뒤의 DB에만 적용됩니다. `deployInstanceObjects` 기본값은 `false`입니다.
 
 Demo 데이터베이스 최초 구성:
 
@@ -133,6 +144,7 @@ Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제
 - `deploy.sql`: 실제 실행 예정 SQL
 - `deploy-report.xml`: DacFx 변경 계획
 - `deployment-script-policy.md`: 결정론적 위험 DDL 검사와 allowlist 결과
+- `target-databases.json`: 대표 DB, 전체 대상, 전수 검사 여부
 
 각 환경은 `pipelines/profiles/sqlmi-<environment>.publish.xml`을 사용합니다. 세 profile의
 내용은 완전히 동일하며 연결 정보는 포함하지 않습니다. `Script`, `DeployReport`,
@@ -173,9 +185,22 @@ advisory 단계입니다.
 
 승인자는 대기 중인 `Deploy*` stage를 승인하기 전에 완료된 `Plan*` stage의 artifact를 검토합니다. 초기 도입 기간에는 Dev 자동 배포만 허용하고 Test/Prod에서 `deploy.sql`을 DBA가 승인하도록 운영합니다. `DropObjectsNotInSource=False`로 인해 제거가 자동 반영되지 않으므로, 승인된 제거는 별도 expand/contract 절차와 명시적 스크립트로 처리합니다.
 
-승인 이후 배포 직전에 DeployReport를 다시 생성해 승인된 보고서와 비교합니다. 대상 DB에 드리프트가 생기면 배포를 중단하고 새 계획과 승인을 요구합니다.
-배포가 완료되면 `Test-DeployedDatabase.ps1`이 실제 대상 DB에서 스키마, 메타데이터,
-seed data, 저장 프로시저 동작을 검증합니다.
+기본 Plan은 대표 DB만 조회하며 비용/MI 부하 경고를 남깁니다.
+`validateAllDatabasePlans=true`이면 각 DB의 DeployReport를 생성해
+`all-database-reports`에 보존하고 대표 보고서와 비교합니다. 차이는
+`databasePlanDriftPolicy=Warn`이면 승인 경고, `Fail`이면 Plan 실패입니다.
+
+승인 이후 배포 직전에 각 DB의 DeployReport를 다시 생성합니다. 대표 전용 Plan은 작업
+집합을 대표 보고서와 비교하고, 전수 Plan은 각 DB별 승인 보고서와 비교합니다. 대상 DB에
+새 드리프트가 생기면 해당 DB를 배포하지 않습니다. 첫 DB는 카나리로 publish 후 smoke
+test까지 통과해야 나머지를 최대 `maxParallel`로 배포합니다.
+각 DB 실패는 모두 수집되며 성공/실패 요약과 실패 DB 목록을 Azure DevOps summary에
+게시합니다. 이미 목표 상태인 DB는 재시도에서 publish를 생략하고 smoke를 재실행합니다.
+
+실제 SqlPackage 실행 직전 UTC 시각은
+`deployment-review-<environment>-pitr-marker/pitr-marker.json`에 게시됩니다. timeout,
+부분 성공, smoke 실패, 승인 후 drift와 COPY_ONLY backup 절차는
+[SQL MI 배포 롤백 런북](롤백-런북.md)을 따릅니다.
 
 ## 7. AI 품질 게이트
 
@@ -235,3 +260,12 @@ string을 포함하지 않으며, 승인된 Azure OpenAI 리소스만 사용합�
 - 대상 database collation은 `ModelCollation`과 별개이며 profile의
   `ScriptDatabaseOptions=False`로 변경되지 않으므로 환경 생성 및 배포 전 별도 검사합니다.
 - 실패 시 동일 DACPAC 재시도 또는 사전 승인된 롤백 스크립트를 사용합니다. BACPAC import를 일반적인 롤백 수단으로 사용하지 않습니다.
+
+## 9. 빌드 엄격도 도입
+
+파이프라인 `buildStrictness` 기본값은 `Strict`입니다. 레거시 소스 도입 시에만
+Lenient로 warning을 수집하고, 연속 10회 CI에서 분류 완료/미분류 0개를 확인합니다.
+baseline 변동이 연속 3회 0개이면 검증된 warning 번호만
+`validatedSuppressTSqlWarnings`에 쉼표 목록으로 전달해 Balanced로 전환합니다. suppress
+0개와 연속 20회 신규 warning 0개를 달성하면 Strict를 강제합니다. 번호는 실제 빌드
+근거와 소유 티켓 없이 추가하지 않습니다.

@@ -13,9 +13,15 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $artifacts = Join-Path $repoRoot 'artifacts'
 $dacpac = [IO.Path]::Combine($artifacts, 'dacpac', 'App.Database.dacpac')
-$toolDirectory = [IO.Path]::Combine($artifacts, 'tools', 'sqlpackage')
-$publishProfile = [IO.Path]::Combine($repoRoot, 'pipelines', 'profiles', 'sqlmi-dev.publish.xml')
 $sqlPackageVersion = '170.4.83'
+$toolCacheRoot = if ($env:AGENT_TEMPDIRECTORY) {
+    $env:AGENT_TEMPDIRECTORY
+}
+else {
+    [IO.Path]::GetTempPath()
+}
+$toolDirectory = Join-Path $toolCacheRoot "sqlpackage-$sqlPackageVersion"
+$publishProfile = [IO.Path]::Combine($repoRoot, 'pipelines', 'profiles', 'sqlmi-dev.publish.xml')
 $containerId = $null
 $sqlcmdPath = $null
 

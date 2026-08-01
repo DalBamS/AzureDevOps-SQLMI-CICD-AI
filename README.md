@@ -16,8 +16,9 @@ DACPAC 빌드, 소스 정책 검사, AI PR 리뷰, 임시 SQL Server 컨테이�
 수행합니다. 개발 PC에는 Docker Desktop이 필요하지 않습니다.
 
 PR 병합 후 Azure DevOps에서 파이프라인을 수동 실행해 `deployDev`, `deployTest`,
-`deployProd`를 선택하면 동일 DACPAC을 Dev → Stg → Live 데이터베이스로 순차 배포하고
-각 환경에서 생성된 배포 SQL의 결정론적 안전 게이트와 스모크 테스트를 실행합니다.
+`deployProd`를 선택하면 동일 DACPAC을 Dev → Stg → Live 환경으로 순차 승격합니다.
+각 환경은 `databaseNames`의 첫 DB를 카나리로 배포·검증한 뒤 나머지 DB를 제한 병렬
+배포하며, 기존 단일 `databaseName` 구성도 그대로 지원합니다.
 Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 
 반복 테스트 후 브랜치, 로컬 생성물, Demo DB를 초기화하는 절차는
@@ -29,6 +30,7 @@ Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 - [프로젝트 계획 · 설계 초안](docs/프로젝트-계획-초안.md)
 - [개발 환경 구성 및 테스트](docs/환경-구성-및-테스트.md)
 - [Azure DevOps 설정](docs/Azure-DevOps-설정.md)
+- [SQL MI 배포 롤백 런북](docs/롤백-런북.md)
 
 ## 핵심 개념
 
@@ -40,6 +42,7 @@ Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 ## Skeleton 구성
 
 - `database/App.Database`: Microsoft.Build.Sql 2.2 기반 Azure SQL 프로젝트
+- `database/instance`: DACPAC 밖에서 파일명 순서로 실행하는 멱등 SQL MI 인스턴스 오브젝트
 - `tests/integration`: 스키마·메타데이터·저장 프로시저 스모크 테스트
 - `eng`: 빌드, 정책 검사, hosted container 테스트, SQL MI 검증, BACPAC 도구
 - `pipelines/profiles`: 연결 정보 없이 동일 안전 속성을 고정한 Dev/Test/Prod publish profile
@@ -47,3 +50,5 @@ Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 - `ai/database-change-review.md`: AI 리뷰 가드레일과 JSON 출력 계약
 - `eng/Invoke-AiDatabaseReview.ps1`: Azure OpenAI Responses API 기반 SQL 변경 리뷰
 - `eng/Test-DeploymentScript.ps1`: 생성된 배포 SQL의 파괴 DDL, 동적 DDL, rename 검사
+- `eng/Deploy-Databases.ps1`: 카나리, 제한 병렬 fan-out, 실패 집계와 재시도 안전 배포
+- `eng/Deploy-InstanceObjects.ps1`: Entra token/SQLCMD 변수 기반 인스턴스 오브젝트 배포
