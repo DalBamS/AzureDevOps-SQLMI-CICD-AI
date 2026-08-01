@@ -26,9 +26,11 @@ SQL MI 시스템 ID에는 Entra principal 조회를 위해 Microsoft Graph의 `U
 
 ## 1. 사전 준비
 
-1. SQL MI와 통신 가능한 VNet에 self-hosted Azure Pipelines agent를 배치합니다.
-2. 같은 VNet에서는 SQL MI의 VNet-local endpoint, 다른 VNet에서는 private endpoint,
-   peering 또는 VPN 경로의 FQDN과 포트로 DNS/네트워크 연결을 확인합니다.
+1. SQL MI와 통신 가능한 네트워크에 self-hosted Azure Pipelines agent를 배치합니다.
+2. 같은 VNet, peered VNet 또는 VPN/ExpressRoute 연결망에서는 기본 VNet-local endpoint와
+   1433 포트를 사용합니다. 다른 VNet에 고정 IP를 노출해야 할 때는 선택적 private
+   endpoint와 1433 포트를 사용합니다. Demo처럼 public endpoint를 명시적으로 활성화한
+   경우에만 public FQDN과 3342 포트를 사용합니다.
 3. Azure Resource Manager 서비스 연결을 Workload Identity Federation 방식으로 생성합니다.
 4. 서비스 연결의 Entra 주체를 각 대상 데이터베이스에 사용자로 생성하고 최소 권한을 부여합니다.
 
@@ -95,14 +97,15 @@ Library의 variable group은 다음 Demo 대상으로 구성합니다.
 
 ## 5. Pipeline 생성
 
-1. PR을 생성하면 Azure hosted agent가 빌드, 정책, AI 리뷰, 컨테이너 통합 테스트를 실행합니다.
+1. PR을 생성하면 Azure hosted agent가 빌드, 정책, 컨테이너 통합 테스트를 실행합니다.
+   `enableAiReview=true`일 때만 advisory AI 리뷰를 추가합니다.
 2. PR 병합 후 Demo SQL MI를 시작합니다.
 3. Azure DevOps에서 파이프라인을 수동 실행하고 세 deploy parameter를 모두 `true`로 설정합니다.
 4. Dev는 자동 배포와 SQL MI 스모크 테스트를 수행합니다.
 5. Test 승인 후 Stg DB를 배포하고 동일 테스트를 실행합니다.
 6. Prod 승인 후 Live DB를 배포하고 동일 테스트를 실행합니다.
 
-각 환경은 동일한 `database` DACPAC artifact를 사용합니다. 이전 환경이 실패하거나 승인되지 않으면 후속 환경으로 진행하지 않습니다. 실행 시 `sqlCommandTimeout` parameter를 생략하면 명시된 3600초를 사용합니다. 서비스 기본값에는 의존하지 않습니다. `maxParallel` 기본값은 4이며 카나리 성공 뒤의 DB에만 적용됩니다. `deployInstanceObjects` 기본값은 `false`입니다.
+각 환경은 동일한 `database` DACPAC artifact를 사용합니다. 이전 환경이 실패하거나 승인되지 않으면 후속 환경으로 진행하지 않습니다. 실행 시 `sqlCommandTimeout` parameter를 생략하면 명시된 3600초를 사용합니다. SqlPackage의 60초 기본값에는 의존하지 않습니다. `maxParallel` 기본값은 4이며 카나리 성공 뒤의 DB에만 적용됩니다. `deployInstanceObjects` 기본값은 `false`입니다.
 
 Demo 데이터베이스 최초 구성:
 
@@ -161,7 +164,7 @@ ExcludeObjectTypes=Users;Logins;Permissions;RoleMembership;ServerRoleMembership
 ScriptDatabaseOptions=False
 ```
 
-SqlPackage의 `CommandTimeout` 기본값은 60초이므로 장기 실행 MI DDL에서 우발적인
+SqlPackage의 `CommandTimeout` 속성 기본값은 60초이므로 장기 실행 MI DDL에서 우발적인
 timeout이 발생할 수 있습니다. profile은 3600초를 고정하고 파이프라인 parameter
 `sqlCommandTimeout`을 `sqlCommandTimeout` 환경 변수로 전달해 네 작업에 동일하게
 override합니다. 연결 정보와 `Connection Timeout=30`은 계속 variable group/실행
@@ -175,6 +178,7 @@ role membership을 배포 비교에서 제외합니다. 이 보안 오브젝트�
 - [SqlPackage Script properties](https://learn.microsoft.com/sql/tools/sqlpackage/sqlpackage-script)
 - [SqlPackage DeployReport properties](https://learn.microsoft.com/sql/tools/sqlpackage/sqlpackage-deploy-drift-report)
 - [SqlPackage Publish properties](https://learn.microsoft.com/sql/tools/sqlpackage/sqlpackage-publish)
+- [SQL MI endpoint 유형](https://learn.microsoft.com/azure/azure-sql/managed-instance/connectivity-architecture-overview)
 
 `eng/Test-DeploymentScript.ps1`은 `deploy.sql`을 GO batch로 나누고 파괴 DDL,
 축소 가능 `ALTER COLUMN`, `sp_rename`, `sp_executesql` 동적 DDL, `SET NOEXEC` 조작을
@@ -220,9 +224,9 @@ JSON Schema를 사용해 Azure OpenAI Responses API를 호출합니다.
 수와 같은 JSON 응답 배열을, 기존 단일 응답 검증이면 객체 하나를 전달해 네트워크 없이
 이 동작을 검증할 수 있습니다.
 
-2026년 8월 기준 기본 권장 모델은 `gpt-5.6-sol`입니다. 비용을 낮춘 PR 대량 검토에는
-`gpt-5.4-mini`를 사용할 수 있습니다. 모델 제공 지역과 할당량은 Foundry에서 확인하고,
-모델 배포 이름은 예를 들어 `sql-review`로 지정합니다.
+저장소의 `aiDeploymentName` 기본값은 `gpt-5.6-sol`입니다. 이 값은 Azure OpenAI
+리소스에 실제로 만든 모델 배포 이름으로 재정의해야 합니다. 사용 가능한 모델, 지역,
+버전, 할당량은 실행 시점의 Foundry 리소스에서 확인합니다.
 
 - [Azure OpenAI Responses API와 지원 모델](https://learn.microsoft.com/azure/foundry/openai/how-to/responses)
 - [Foundry에서 Azure가 제공하는 모델](https://learn.microsoft.com/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure)
@@ -244,14 +248,19 @@ PR 코멘트가 필요하면 Azure DevOps의 GitHub 서비스 연결을 지정�
 `publishAiPrComment=true`로 실행합니다. 이 옵션을 사용하지 않아도 JSON artifact와
 파이프라인 실행 요약은 게시됩니다.
 
-권장 순서:
+- [Azure OpenAI의 Microsoft Entra ID 인증과 역할](https://learn.microsoft.com/azure/foundry-classic/openai/how-to/managed-identity)
+- [Foundry Responses API의 Microsoft Entra ID 인증](https://learn.microsoft.com/azure/foundry/foundry-models/how-to/configure-entra-id)
 
-1. deterministic SQL policy
-2. DACPAC build
+실제 파이프라인 순서:
+
+1. DACPAC build와 deterministic SQL policy
+2. PR이면 선택적 advisory AI diff 검토
 3. 컨테이너 integration test
-4. AI 위험 분석
-5. 사람 승인
-6. SQL MI publish
+4. 환경별 `Script`/`DeployReport` 생성과 deterministic 배포 SQL gate
+5. 선택적 advisory AI `deploy.sql` 검토
+6. Azure DevOps Environment 사람 승인
+7. 대상별 `DeployReport` 재생성과 승인 계획 비교
+8. SQL MI publish와 integration smoke test
 
 AI 결과는 기본적으로 advisory로만 게시하며 LLM 호출 실패도 `SucceededWithIssues`로
 표시합니다. `-FailOnBlockingFindings` 승격은 다음 조건을 **모두** 만족할 때만 승인합니다.
@@ -285,8 +294,10 @@ SQL 본문에 운영 데이터나 connection string을 포함하지 않으며 �
 - SQL MI의 감사 로그와 Azure DevOps deployment record를 동일 변경 티켓으로 연결합니다.
 - 운영 DB의 수동 DDL을 금지하고 정기적으로 DACPAC drift report를 생성합니다.
 - SQL MI update policy와 `.sqlproj`의 `Sql170` DSP가 SQL Server 2025 기준으로 일치하는지
-  확인합니다. SQL Server 2022 policy는 SQL Server 2022 mainstream support 종료일인
-  2028-01-11까지만 제공되므로 그 전에 전환 계획을 승인합니다.
+  확인합니다. Microsoft 문서상 SQL Server 2022 policy가 기존·신규 SQL MI의 기본값이므로
+  저장소의 SQL Server 2025 기준선에 맞게 명시적으로 전환합니다. SQL Server 2022 policy는
+  SQL Server 2022 mainstream support 종료일인 2028-01-11까지 제공된다고 문서화되어
+  있으므로 그 전에 전환 계획을 승인합니다.
 - 대상 database collation은 `ModelCollation`과 별개이며 profile의
   `ScriptDatabaseOptions=False`로 변경되지 않으므로 환경 생성 및 배포 전 별도 검사합니다.
 - 실패 시 동일 DACPAC 재시도 또는 사전 승인된 롤백 스크립트를 사용합니다. BACPAC import를 일반적인 롤백 수단으로 사용하지 않습니다.

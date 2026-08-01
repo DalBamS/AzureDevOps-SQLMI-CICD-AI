@@ -41,7 +41,6 @@ if (-not $PSCmdlet.ShouldProcess(
     return
 }
 
-$secureToken = ConvertTo-SecureString $AccessToken -AsPlainText -Force
 $serverInstance = "tcp:$ServerName,$Port"
 $initializer = Join-Path $PSScriptRoot 'Initialize-DemoDatabases.ps1'
 
@@ -56,7 +55,7 @@ END;
     Invoke-Sqlcmd `
         -ServerInstance $serverInstance `
         -Database master `
-        -AccessToken $secureToken `
+        -AccessToken $AccessToken `
         -Query $dropDatabase `
         -AbortOnError `
         -Encrypt Mandatory `

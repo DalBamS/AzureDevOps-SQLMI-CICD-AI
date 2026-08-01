@@ -12,8 +12,9 @@ git push --set-upstream origin <branch-name>
 ```
 
 GitHub에서 `main` 대상 PR을 생성하면 Azure DevOps가 Microsoft-hosted agent에서
-DACPAC 빌드, 소스 정책 검사, 청크 단위 AI PR 리뷰, 임시 SQL Server 컨테이너 통합
-테스트를 수행합니다. 개발 PC에는 Docker Desktop이 필요하지 않습니다.
+DACPAC 빌드, 소스 정책 검사, 임시 SQL Server 컨테이너 통합 테스트를 수행합니다.
+`enableAiReview=true`일 때만 청크 단위 AI PR 리뷰를 추가합니다. 개발 PC에는 Docker
+Desktop이 필요하지 않습니다.
 
 PR 병합 후 Azure DevOps에서 파이프라인을 수동 실행해 `deployDev`, `deployTest`,
 `deployProd`를 선택하면 동일 DACPAC을 Dev → Stg → Live 환경으로 순차 승격합니다.
@@ -29,6 +30,7 @@ Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 
 - [프로젝트 계획 · 설계 초안](docs/프로젝트-계획-초안.md)
 - [개발 환경 구성 및 테스트](docs/환경-구성-및-테스트.md)
+- [SQL 통합 테스트 규약](tests/README.md)
 - [Phase 4 의도적 실패 실습 랩](docs/실습-랩.md)
 - [Azure DevOps 설정](docs/Azure-DevOps-설정.md)
 - [SQL MI 배포 롤백 런북](docs/롤백-런북.md)
@@ -36,9 +38,9 @@ Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 ## 핵심 개념
 
 - **SSDT(.sqlproj) → Git → Azure DevOps CI(DACPAC) → 다중 환경 CD → 운영 승인 게이트**
-- **SSDT/DACPAC**(상태 기반 스키마 배포) + **BACPAC**(데이터 시딩/복원) 병행
+- **SSDT/DACPAC**(상태 기반 스키마 배포) + **BACPAC**(논리적 데이터 이동/시딩) 병행
 - Redgate · Flyway · Liquibase · DbUp · GitHub Actions 등 대체/보완 도구 검토
-- **AI 기반** 코드 리뷰 · 테스트 생성 · 배포 위험 분석으로 파이프라인 고도화
+- **AI 기반** PR 코드 리뷰 · 배포 스크립트 위험 분석으로 파이프라인 보강
 
 ## Skeleton 구성
 

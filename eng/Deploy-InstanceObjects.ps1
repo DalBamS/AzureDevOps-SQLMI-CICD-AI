@@ -79,7 +79,6 @@ foreach ($script in $scripts) {
 }
 
 $invokeSqlcmd = $null
-$secureToken = $null
 $serverInstance = "tcp:$ServerName,$Port"
 $sqlcmdVariableArguments = @(
     $normalizedVariables.GetEnumerator() |
@@ -100,14 +99,13 @@ foreach ($script in $scripts) {
         if (-not $invokeSqlcmd) {
             throw 'The pinned SqlServer PowerShell module is required to deploy instance objects.'
         }
-        $secureToken = ConvertTo-SecureString $AccessToken -AsPlainText -Force
     }
 
     Write-Host "Executing instance object script: $($script.Name)"
     Invoke-Sqlcmd `
         -ServerInstance $serverInstance `
         -Database $DatabaseName `
-        -AccessToken $secureToken `
+        -AccessToken $AccessToken `
         -InputFile $script.FullName `
         -Variable $sqlcmdVariableArguments `
         -AbortOnError `

@@ -22,7 +22,6 @@ if (-not (Get-Command Invoke-Sqlcmd -ErrorAction SilentlyContinue)) {
     throw 'The SqlServer PowerShell module is required. Install version 22.4.5.1 from PSGallery.'
 }
 
-$secureToken = ConvertTo-SecureString $AccessToken -AsPlainText -Force
 $serverInstance = "tcp:$ServerName,$Port"
 
 foreach ($name in $DatabaseName) {
@@ -39,7 +38,7 @@ END;
     Invoke-Sqlcmd `
         -ServerInstance $serverInstance `
         -Database master `
-        -AccessToken $secureToken `
+        -AccessToken $AccessToken `
         -Query $createDatabase `
         -AbortOnError `
         -Encrypt Mandatory `
@@ -92,7 +91,7 @@ GRANT VIEW DEFINITION TO [$DeployerPrincipalName];
     Invoke-Sqlcmd `
         -ServerInstance $serverInstance `
         -Database $name `
-        -AccessToken $secureToken `
+        -AccessToken $AccessToken `
         -Query $configureDeployer `
         -AbortOnError `
         -Encrypt Mandatory `

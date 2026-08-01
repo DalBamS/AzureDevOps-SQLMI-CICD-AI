@@ -44,7 +44,6 @@ if ($tests.Count -eq 0) {
     throw "No SQL integration tests found in: $TestPath"
 }
 
-$secureToken = ConvertTo-SecureString $AccessToken -AsPlainText -Force
 $serverInstance = "tcp:$ServerName,$Port"
 
 foreach ($test in $tests) {
@@ -52,7 +51,7 @@ foreach ($test in $tests) {
     Invoke-Sqlcmd `
         -ServerInstance $serverInstance `
         -Database $DatabaseName `
-        -AccessToken $secureToken `
+        -AccessToken $AccessToken `
         -InputFile $test.FullName `
         -AbortOnError `
         -Encrypt Mandatory `
