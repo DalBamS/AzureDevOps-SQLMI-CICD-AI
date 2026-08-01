@@ -806,14 +806,10 @@ function Get-SqlBatch {
         }
         $goMatch = [regex]::Match(
             $line,
-            '^[\t ]*GO(?:[\t ]+(?<Count>[1-9][0-9]*))?[\t ]*(?:--[^\r\n]*)?$',
+            '^[\t ]*GO(?:[\t ]+[0-9]+)?[\t ]*(?:--[^\r\n]*)?$',
             [Text.RegularExpressions.RegexOptions]::IgnoreCase
         )
         $isGoSeparator = $state -eq 'Code' -and $goMatch.Success
-        if ($isGoSeparator -and $goMatch.Groups['Count'].Success) {
-            $count = 0
-            $isGoSeparator = [int]::TryParse($goMatch.Groups['Count'].Value, [ref]$count)
-        }
         if ($isGoSeparator) {
             if (($batchLines -join "`n").Trim().Length -gt 0) {
                 $batches.Add([pscustomobject]@{
@@ -1060,9 +1056,378 @@ function Get-SqlBlockEndIndex {
     return -1
 }
 
+function Test-SqlReadOnlySelectTokenStream {
+    param(
+        [Parameter(Mandatory)][object[]]$Tokens,
+        [switch]$DisallowVariableAssignment
+    )
+
+    $blockedWords = @(
+        'ALTER',
+        'BACKUP',
+        'BULK',
+        'CHECKPOINT',
+        'CREATE',
+        'DBCC',
+        'DELETE',
+        'DENY',
+        'DISABLE',
+        'DROP',
+        'ENABLE',
+        'EXEC',
+        'EXECUTE',
+        'GRANT',
+        'INSERT',
+        'INTO',
+        'KILL',
+        'MERGE',
+        'OPENDATASOURCE',
+        'OPENQUERY',
+        'OPENROWSET',
+        'RECONFIGURE',
+        'RESTORE',
+        'REVOKE',
+        'SET',
+        'SHUTDOWN',
+        'TRUNCATE',
+        'UPDATE',
+        'USE',
+        'WAITFOR'
+    )
+    $cursor = 0
+    $statementCount = 0
+    while ($cursor -lt $Tokens.Count) {
+        while (
+            $cursor -lt $Tokens.Count -and
+            $Tokens[$cursor].Kind -eq 'Symbol' -and
+            $Tokens[$cursor].Value -eq ';'
+        ) {
+            $cursor++
+        }
+        if ($cursor -ge $Tokens.Count) {
+            break
+        }
+        if (
+            $Tokens[$cursor].Kind -ne 'Word' -or
+            $Tokens[$cursor].Value -ne 'SELECT'
+        ) {
+            return $false
+        }
+        $statementCount++
+        $cursor++
+        while ($cursor -lt $Tokens.Count) {
+            $token = $Tokens[$cursor]
+            if ($token.Kind -eq 'Symbol' -and $token.Value -eq ';') {
+                $cursor++
+                break
+            }
+            if ($token.Kind -eq 'Word' -and $token.Value -in $blockedWords) {
+                return $false
+            }
+            if (
+                $DisallowVariableAssignment -and
+                $token.Kind -eq 'Word' -and
+                $token.Value.StartsWith('@') -and
+                $cursor + 1 -lt $Tokens.Count -and
+                $Tokens[$cursor + 1].Kind -eq 'Symbol' -and
+                $Tokens[$cursor + 1].Value -eq '='
+            ) {
+                return $false
+            }
+            $cursor++
+        }
+    }
+    return $statementCount -gt 0
+}
+
+function Test-SqlInstanceStatementSequence {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][object[]]$Tokens,
+        [Parameter(Mandatory)][ref]$Cursor,
+        [switch]$StopAtEnd
+    )
+
+    $supportedProcedures = @(
+        'sp_add_job',
+        'sp_update_job',
+        'sp_add_jobstep',
+        'sp_update_jobstep',
+        'sp_add_jobserver'
+    )
+    while ($Cursor.Value -lt $Tokens.Count) {
+        while (
+            $Cursor.Value -lt $Tokens.Count -and
+            $Tokens[$Cursor.Value].Kind -eq 'Symbol' -and
+            $Tokens[$Cursor.Value].Value -eq ';'
+        ) {
+            $Cursor.Value++
+        }
+        if ($Cursor.Value -ge $Tokens.Count) {
+            return -not $StopAtEnd
+        }
+        $start = $Cursor.Value
+        $startValue = Get-SqlCanonicalTokenValue -Token $Tokens[$start]
+        if ($startValue -eq 'END') {
+            if (-not $StopAtEnd) {
+                return $false
+            }
+            $Cursor.Value++
+            return $true
+        }
+        if ($startValue -eq 'IF') {
+            $cursorIndex = $start + 1
+            if (
+                $cursorIndex -lt $Tokens.Count -and
+                (Get-SqlCanonicalTokenValue -Token $Tokens[$cursorIndex]) -eq 'NOT'
+            ) {
+                $cursorIndex++
+            }
+            if (
+                $cursorIndex -ge $Tokens.Count -or
+                (Get-SqlCanonicalTokenValue -Token $Tokens[$cursorIndex]) -ne 'EXISTS'
+            ) {
+                return $false
+            }
+            $cursorIndex++
+            if (
+                $cursorIndex -ge $Tokens.Count -or
+                $Tokens[$cursorIndex].Kind -ne 'Symbol' -or
+                $Tokens[$cursorIndex].Value -ne '('
+            ) {
+                return $false
+            }
+            $predicateStart = ++$cursorIndex
+            $parenthesisDepth = 1
+            while ($cursorIndex -lt $Tokens.Count -and $parenthesisDepth -gt 0) {
+                if ($Tokens[$cursorIndex].Kind -eq 'Symbol') {
+                    if ($Tokens[$cursorIndex].Value -eq '(') {
+                        $parenthesisDepth++
+                    }
+                    elseif ($Tokens[$cursorIndex].Value -eq ')') {
+                        $parenthesisDepth--
+                    }
+                }
+                $cursorIndex++
+            }
+            if ($parenthesisDepth -ne 0) {
+                return $false
+            }
+            $predicateEnd = $cursorIndex - 2
+            if (
+                $predicateEnd -lt $predicateStart -or
+                -not (
+                    Test-SqlReadOnlySelectTokenStream `
+                        -Tokens @($Tokens[$predicateStart..$predicateEnd])
+                )
+            ) {
+                return $false
+            }
+            if (
+                $cursorIndex -ge $Tokens.Count -or
+                (Get-SqlCanonicalTokenValue -Token $Tokens[$cursorIndex]) -ne 'BEGIN'
+            ) {
+                return $false
+            }
+            $Cursor.Value = $cursorIndex + 1
+            if (
+                -not (
+                    Test-SqlInstanceStatementSequence `
+                        -Text $Text `
+                        -Tokens $Tokens `
+                        -Cursor $Cursor `
+                        -StopAtEnd
+                )
+            ) {
+                return $false
+            }
+            if (
+                $Cursor.Value -lt $Tokens.Count -and
+                (Get-SqlCanonicalTokenValue -Token $Tokens[$Cursor.Value]) -eq 'ELSE'
+            ) {
+                $Cursor.Value++
+                if (
+                    $Cursor.Value -ge $Tokens.Count -or
+                    (Get-SqlCanonicalTokenValue -Token $Tokens[$Cursor.Value]) -ne 'BEGIN'
+                ) {
+                    return $false
+                }
+                $Cursor.Value++
+                if (
+                    -not (
+                        Test-SqlInstanceStatementSequence `
+                            -Text $Text `
+                            -Tokens $Tokens `
+                            -Cursor $Cursor `
+                            -StopAtEnd
+                    )
+                ) {
+                    return $false
+                }
+            }
+            continue
+        }
+
+        $end = $start
+        while (
+            $end -lt $Tokens.Count -and
+            -not (
+                $Tokens[$end].Kind -eq 'Symbol' -and
+                $Tokens[$end].Value -eq ';'
+            )
+        ) {
+            if ((Get-SqlCanonicalTokenValue -Token $Tokens[$end]) -eq 'END') {
+                return $false
+            }
+            $end++
+        }
+        if ($end -ge $Tokens.Count) {
+            return $false
+        }
+        $statementTokens = @($Tokens[$start..$end])
+        $statementValues = @(
+            $statementTokens |
+                ForEach-Object { Get-SqlCanonicalTokenValue -Token $_ }
+        )
+        switch ($startValue) {
+            'USE' {
+                if (
+                    $statementValues.Count -ne 3 -or
+                    $statementValues[1] -notin @('MASTER', 'MSDB')
+                ) {
+                    return $false
+                }
+            }
+            'DECLARE' {
+                $shape = $statementValues -join '|'
+                if (
+                    $shape -notin @(
+                        'DECLARE|@JOBNAME|SYSNAME|=|N|<STRING>|;',
+                        'DECLARE|@OWNERLOGINNAME|SYSNAME|=|N|<STRING>|;',
+                        'DECLARE|@STEPNAME|SYSNAME|=|N|<STRING>|;',
+                        'DECLARE|@LOCALSERVERNAME|SYSNAME|=|N|<STRING>|;',
+                        'DECLARE|@JOBID|UNIQUEIDENTIFIER|;',
+                        'DECLARE|@STEPID|INT|;'
+                    )
+                ) {
+                    return $false
+                }
+            }
+            'SELECT' {
+                $assignedVariables = @(
+                    for ($index = 1; $index + 1 -lt $statementTokens.Count; $index++) {
+                        if (
+                            $statementTokens[$index].Kind -eq 'Word' -and
+                            $statementTokens[$index].Value.StartsWith('@') -and
+                            $statementTokens[$index + 1].Kind -eq 'Symbol' -and
+                            $statementTokens[$index + 1].Value -eq '='
+                        ) {
+                            $statementTokens[$index].Value
+                        }
+                    }
+                )
+                if (
+                    @(
+                        $assignedVariables |
+                            Where-Object { $_ -notin @('@JOBID', '@STEPID') }
+                    ).Count -gt 0
+                ) {
+                    return $false
+                }
+                if (-not (Test-SqlReadOnlySelectTokenStream -Tokens $statementTokens)) {
+                    return $false
+                }
+            }
+            'PRINT' {
+                if (
+                    ($statementValues -join '|') -notmatch
+                        '^PRINT\|(?:N\|)?<STRING>\|;$'
+                ) {
+                    return $false
+                }
+            }
+            'CREATE' {
+                if (
+                    $statementValues.Count -ne 7 -or
+                    $statementValues[1] -ne 'LOGIN' -or
+                    $statementTokens[2].Kind -ne 'Identifier' -or
+                    ($statementValues[3..6] -join '|') -cne 'FROM|EXTERNAL|PROVIDER|;'
+                ) {
+                    return $false
+                }
+            }
+            { $_ -in @('EXEC', 'EXECUTE') } {
+                $procedure = Get-SqlProcedureInvocationDetail `
+                    -Text $Text `
+                    -ExecuteIndex $Tokens[$start].Index
+                if (-not $procedure.Success) {
+                    return $false
+                }
+                if ($procedure.Dynamic) {
+                    if (
+                        $procedure.Statement -notmatch
+                            "^(?is)EXEC(?:UTE)?\s*\(\s*N?'(?:''|[^'])*'\s*\)\s*;\s*$"
+                    ) {
+                        return $false
+                    }
+                    $dynamicTokens = @(
+                        ConvertTo-SqlToken `
+                            -Text (ConvertTo-CommentFreeSql -Text $procedure.Expression)
+                    )
+                    if (
+                        -not (
+                            Test-SqlReadOnlySelectTokenStream `
+                                -Tokens $dynamicTokens `
+                                -DisallowVariableAssignment
+                        )
+                    ) {
+                        return $false
+                    }
+                }
+                elseif (
+                    $procedure.Name -notin $supportedProcedures -or
+                    ($procedure.Parts -join '.').ToLowerInvariant() -cne
+                        "msdb.dbo.$($procedure.Name)"
+                ) {
+                    return $false
+                }
+            }
+            default {
+                return $false
+            }
+        }
+        $Cursor.Value = $end + 1
+    }
+    return -not $StopAtEnd
+}
+
+function Test-SqlInstanceStatementAllowlist {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+    foreach ($batch in @(Get-SqlBatch -Text $Text)) {
+        $commentFree = ConvertTo-CommentFreeSql -Text $batch.Text
+        $tokens = @(ConvertTo-SqlToken -Text $commentFree)
+        $cursor = 0
+        if (
+            -not (
+                Test-SqlInstanceStatementSequence `
+                    -Text $commentFree `
+                    -Tokens $tokens `
+                    -Cursor ([ref]$cursor)
+            )
+        ) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Test-SqlInstanceGuardCoverage {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
 
+    if (-not (Test-SqlInstanceStatementAllowlist -Text $Text)) {
+        return $false
+    }
     $commentFree = ConvertTo-CommentFreeSql -Text $Text
     $tokens = @(ConvertTo-SqlToken -Text $commentFree)
     $sqlBatches = @(Get-SqlBatch -Text $Text)

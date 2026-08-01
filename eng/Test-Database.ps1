@@ -115,6 +115,56 @@ try {
         throw 'SQL Server did not become ready within 120 seconds.'
     }
 
+    $goProbeTable = "SqlMiGoProbe_$PID"
+    $goProbeArguments = @{
+        ServerInstance = "tcp:localhost,$HostPort"
+        Database = 'master'
+        Username = 'sa'
+        Password = $password
+        Encrypt = 'Mandatory'
+        TrustServerCertificate = $true
+        ConnectionTimeout = 30
+        QueryTimeout = $SqlCommandTimeout
+        ErrorAction = 'Stop'
+    }
+    $goProbeRows = @(
+        Invoke-Sqlcmd @goProbeArguments -Query @"
+CREATE TABLE [tempdb].[dbo].[$goProbeTable] ([Label] nvarchar(40) NOT NULL);
+GO
+INSERT [tempdb].[dbo].[$goProbeTable] VALUES (N'before-zero');
+GO 0
+INSERT [tempdb].[dbo].[$goProbeTable] VALUES (N'after-zero');
+GO
+INSERT [tempdb].[dbo].[$goProbeTable] VALUES (N'before-double-zero');
+GO 00
+INSERT [tempdb].[dbo].[$goProbeTable] VALUES (N'after-double-zero');
+`t gO`t01 `t-- managed parser trailing comment
+INSERT [tempdb].[dbo].[$goProbeTable] VALUES (N'after-leading-zero');
+GO
+SELECT [Label] FROM [tempdb].[dbo].[$goProbeTable] ORDER BY [Label];
+"@
+    )
+    $goProbeLabels = @($goProbeRows | ForEach-Object { [string]$_.Label })
+    if (
+        ($goProbeLabels -join '|') -cne
+            'after-double-zero|after-leading-zero|after-zero'
+    ) {
+        throw "Invoke-Sqlcmd GO count grammar probe returned unexpected rows: $($goProbeLabels -join ', ')"
+    }
+    $invalidGoRejected = $false
+    try {
+        Invoke-Sqlcmd @goProbeArguments -Query "SELECT 1;`nGO 1x`nSELECT 2;" |
+            Out-Null
+    }
+    catch {
+        $invalidGoRejected = $true
+    }
+    if (-not $invalidGoRejected) {
+        throw 'Invoke-Sqlcmd unexpectedly accepted a GO count with an alphabetic suffix.'
+    }
+    Invoke-Sqlcmd @goProbeArguments -Query "DROP TABLE [tempdb].[dbo].[$goProbeTable];"
+    Write-Host 'Invoke-Sqlcmd GO 0/00/01, whitespace/comment, and invalid-suffix probes passed.'
+
     & docker exec $containerId `
         $sqlcmdPath `
         -S localhost -U sa -P $password -C `

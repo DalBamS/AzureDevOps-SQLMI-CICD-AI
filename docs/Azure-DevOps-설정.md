@@ -193,9 +193,10 @@ role membership을 배포 비교에서 제외합니다. 이 보안 오브젝트�
 advisory 단계입니다.
 
 GO separator는 공용 lexer가 code context에서 물리 행 전체가 `GO` 또는 `GO <count>`인
-경우에만 인식합니다. 뒤에는 `--` line comment만 둘 수 있습니다. multiline string,
-nested block comment, bracket identifier, double-quoted identifier 안의 단독 `GO`와
-line comment 안의 `GO`는 separator가 아닙니다.
+경우에만 인식합니다. `<count>`는 `0`, `00`, `01`을 포함한 nonnegative decimal digit
+sequence이며 분석에서는 모두 한 batch boundary로 취급합니다. 뒤에는 `--` line comment만
+둘 수 있습니다. multiline string, nested block comment, bracket identifier,
+double-quoted identifier 안의 단독 `GO`와 line comment 안의 `GO`는 separator가 아닙니다.
 
 `EXEC`/`EXECUTE`와 `sp_executesql`의 첫 SQL 표현식이 문자열 literal과 `+` 연결만으로
 구성되면 상수로 계산합니다. 문자열·주석·quoted identifier 밖의 token에 `CREATE`, `ALTER`,
@@ -243,6 +244,12 @@ instance guard body와 `ELSE` body는 `BEGIN...END` block만 지원합니다. �
 job server assignment는 같은 `@JobId`와 `server_id=0` guard가 필요합니다. procedure
 parameter도 같은 변수를 사용해야 합니다. 이 allowlist 밖의 mutation/guard shape는
 fail closed입니다.
+
+또한 instance SQL은 statement 시작 자체를 allowlist로 분류합니다. 현재 예제에 필요한
+`USE`, 제한된 `DECLARE`, read-only `SELECT`, `IF [NOT] EXISTS` block, `CREATE LOGIN`과
+상관된 Agent procedure만 허용합니다. `DISABLE/ENABLE TRIGGER`, `DBCC`, `BACKUP/RESTORE`,
+`KILL`/`SHUTDOWN`, `BULK INSERT` 등 미분류 administrative statement는 실행 전에
+차단합니다. constant dynamic SQL은 `INTO`가 없는 명시적 read-only `SELECT`만 허용합니다.
 
 직접 `DROP`/`TRUNCATE`, `SELECT ... INTO`, `GRANT`, `DENY`, `REVOKE`와 그 constant dynamic
 variant를 차단합니다. canonical final procedure 이름이 `sp_delete*`, `sp_drop*`,

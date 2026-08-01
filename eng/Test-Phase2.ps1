@@ -1096,6 +1096,161 @@ BEGIN
     EXEC(N'msdb.dbo.sp_start_job @job_name = N''fixture'';');
 END;
 '@
+        },
+        @{
+            Name = 'static-disable-trigger'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    DISABLE TRIGGER ALL ON DATABASE;
+END;
+'@
+        },
+        @{
+            Name = 'static-enable-trigger'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    ENABLE TRIGGER ALL ON DATABASE;
+END;
+'@
+        },
+        @{
+            Name = 'static-dbcc-checkident'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    DBCC CHECKIDENT (N'dbo.Fixture', RESEED, 0);
+END;
+'@
+        },
+        @{
+            Name = 'static-backup'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    BACKUP DATABASE [master] TO DISK = N'fixture.bak';
+END;
+'@
+        },
+        @{
+            Name = 'static-restore'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    RESTORE DATABASE [Fixture] FROM DISK = N'fixture.bak';
+END;
+'@
+        },
+        @{
+            Name = 'static-kill'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    KILL 53;
+END;
+'@
+        },
+        @{
+            Name = 'static-shutdown'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    SHUTDOWN WITH NOWAIT;
+END;
+'@
+        },
+        @{
+            Name = 'static-bulk-insert'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    BULK INSERT [dbo].[Fixture] FROM N'fixture.csv';
+END;
+'@
+        },
+        @{
+            Name = 'static-checkpoint'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    CHECKPOINT;
+END;
+'@
+        },
+        @{
+            Name = 'static-reconfigure'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    RECONFIGURE;
+END;
+'@
+        },
+        @{
+            Name = 'static-waitfor'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    WAITFOR DELAY '00:00:01';
+END;
+'@
+        },
+        @{
+            Name = 'dynamic-dbcc-checkident'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC(N'DBCC CHECKIDENT (N''dbo.Fixture'', RESEED, 0);');
+END;
+'@
+        },
+        @{
+            Name = 'static-select-variable-assignment'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @OwnerLoginName sysname = N'approved';
+IF EXISTS (SELECT 1)
+BEGIN
+    SELECT @OwnerLoginName = N'other';
+END;
+'@
+        },
+        @{
+            Name = 'dynamic-select-variable-assignment'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC(N'SELECT @JobId = NEWID();');
+END;
+'@
+        },
+        @{
+            Name = 'dynamic-select-output-argument'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobId uniqueidentifier;
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC sys.sp_executesql
+        N'SELECT @Value = NEWID();',
+        N'@Value uniqueidentifier OUTPUT',
+        @Value = @JobId OUTPUT;
+END;
+'@
         }
     )
     foreach ($case in $instanceSafetyCases) {
@@ -1338,6 +1493,59 @@ PRINT N'`$(NotAVariable)';
                 'GO-delimited batches: 2'
         ) `
         -Message 'A code-context GO count with a trailing line comment must split exactly two batches.'
+    $acceptedGoSeparators = @(
+        @{ Name = 'go-zero'; Line = 'GO 0' },
+        @{ Name = 'go-double-zero'; Line = 'GO 00' },
+        @{ Name = 'go-leading-zero'; Line = 'GO 01' },
+        @{ Name = 'go-large-count'; Line = 'GO 999999999999999999999999999999999999' },
+        @{ Name = 'go-mixed-case-whitespace'; Line = "`t gO`t00042 `t-- managed parser comment" }
+    )
+    foreach ($case in $acceptedGoSeparators) {
+        $safePath = Join-Path $temporaryPath "$($case.Name)-safe.sql"
+        $safeReportPath = Join-Path $temporaryPath "$($case.Name)-safe.md"
+        "SELECT 1;`r`n$($case.Line)`r`nSELECT 2;" |
+            Set-Content -Path $safePath -Encoding utf8 -NoNewline
+        & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+            -ScriptPath $safePath `
+            -ReportPath $safeReportPath
+        Assert-True `
+            -Condition (
+                (Get-Content -Path $safeReportPath -Raw) -match
+                    'GO-delimited batches: 2'
+            ) `
+            -Message "Managed GO grammar case '$($case.Name)' must split two analysis batches."
+
+        $unsafePath = Join-Path $temporaryPath "$($case.Name)-unsafe.sql"
+        "SELECT 1;`r`n$($case.Line)`r`nsp_executesql N'DROP TABLE [dbo].[Danger];';" |
+            Set-Content -Path $unsafePath -Encoding utf8 -NoNewline
+        Assert-Throws {
+            & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+                -ScriptPath $unsafePath `
+                -ReportPath (Join-Path $temporaryPath "$($case.Name)-unsafe.md")
+        } "Bare dynamic DDL after managed GO grammar case '$($case.Name)' must be analyzed."
+    }
+    foreach ($case in @(
+        @{ Name = 'go-negative'; Line = 'GO -1' },
+        @{ Name = 'go-plus'; Line = 'GO +1' },
+        @{ Name = 'go-attached-count'; Line = 'GO1' },
+        @{ Name = 'go-alpha-suffix'; Line = 'GO 1x' },
+        @{ Name = 'go-block-comment-suffix'; Line = 'GO 1 /* not a supported suffix */' },
+        @{ Name = 'go-extra-token'; Line = 'GO 1 SELECT 2' }
+    )) {
+        $casePath = Join-Path $temporaryPath "$($case.Name).sql"
+        $reportPath = Join-Path $temporaryPath "$($case.Name).md"
+        "SELECT 1;`n$($case.Line)`nSELECT 2;" |
+            Set-Content -Path $casePath -Encoding utf8 -NoNewline
+        & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+            -ScriptPath $casePath `
+            -ReportPath $reportPath
+        Assert-True `
+            -Condition (
+                (Get-Content -Path $reportPath -Raw) -match
+                    'GO-delimited batches: 1'
+            ) `
+            -Message "Invalid GO suffix case '$($case.Name)' must remain in one analysis batch."
+    }
     $dacFxMultilinePath = Join-Path $temporaryPath 'dacfx-multiline.sql'
     $dacFxMultilineReportPath = Join-Path $temporaryPath 'dacfx-multiline.md'
     $dacFxMultilineScript = Get-TestDeploymentScript `
