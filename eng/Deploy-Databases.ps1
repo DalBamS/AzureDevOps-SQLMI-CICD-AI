@@ -103,6 +103,8 @@ foreach ($requiredProperty in @(
     'allDatabaseScriptsGated',
     'gatedDatabases',
     'dacpacSha256',
+    'postDeploymentContract',
+    'postDeploymentPayloadSha256',
     'artifacts'
 )) {
     if ($null -eq $metadata.PSObject.Properties[$requiredProperty]) {
@@ -121,7 +123,7 @@ if (
         [TypeCode]::Int64,
         [TypeCode]::UInt64
     ) -or
-    [int64]$metadata.manifestVersion -ne 3
+    [int64]$metadata.manifestVersion -ne 4
 ) {
     throw "Approved deployment manifest version '$($metadata.manifestVersion)' is not supported."
 }
@@ -159,6 +161,12 @@ if (
     (Get-FileHash -Path $DacpacPath -Algorithm SHA256).Hash -cne ([string]$metadata.dacpacSha256).ToUpperInvariant()
 ) {
     throw 'Downloaded DACPAC does not match the approved deployment manifest.'
+}
+if (
+    [string]$metadata.postDeploymentContract -cne 'sqlmi-cicd-postdeploy-v1' -or
+    [string]$metadata.postDeploymentPayloadSha256 -notmatch '^[A-Fa-f0-9]{64}$'
+) {
+    throw 'Approved deployment manifest has an invalid post-deployment recovery contract.'
 }
 
 $expectedArtifacts = [ordered]@{
@@ -222,6 +230,17 @@ foreach ($artifact in $manifestArtifacts) {
 if ((Resolve-Path $ApprovedReportPath).Path -cne $approvedArtifactPaths["representativeReport|$($rollout.Canary)"]) {
     throw 'ApprovedReportPath does not match the manifest representative report.'
 }
+$expectedPostDeploymentHash = ([string]$metadata.postDeploymentPayloadSha256).ToUpperInvariant()
+$approvedScriptKeys = @(
+    $approvedArtifactPaths.Keys |
+        Where-Object { $_ -like 'representativeScript|*' -or $_ -like 'databaseScript|*' }
+)
+foreach ($scriptKey in $approvedScriptKeys) {
+    $approvedPostDeployment = Get-DacFxPostDeploymentPayload -Path $approvedArtifactPaths[$scriptKey]
+    if ($approvedPostDeployment.Sha256 -cne $expectedPostDeploymentHash) {
+        throw "Approved script '$scriptKey' does not match the manifest post-deployment payload hash."
+    }
+}
 $usePerDatabaseApprovedReports = [bool]$ValidateAllDatabasePlans
 
 $context = [pscustomobject]@{
@@ -239,6 +258,7 @@ $context = [pscustomobject]@{
     TestPath = (Resolve-Path $TestPath).Path
     ReportDirectory = (Resolve-Path $ReportDirectory).Path
     RepresentativeDatabase = $rollout.Canary
+    PostDeploymentPayloadSha256 = $expectedPostDeploymentHash
     ModulePath = $modulePath
     ConfirmScript = $confirmScript
     PolicyScript = $policyScript
@@ -322,13 +342,25 @@ $worker = {
         else {
             $WorkerContext.ApprovedReportPath
         }
-        & $WorkerContext.ConfirmScript `
-            -ApprovedReportPath $comparisonReport `
-            -CurrentReportPath $reportPath `
-            -CompareOperationsOnly:(
-                $comparisonReport -eq $WorkerContext.ApprovedReportPath -and
-                $Database -ne $WorkerContext.RepresentativeDatabase
-            )
+        $reportMatchesApproval = $true
+        try {
+            & $WorkerContext.ConfirmScript `
+                -ApprovedReportPath $comparisonReport `
+                -CurrentReportPath $reportPath `
+                -CompareOperationsOnly:(
+                    $comparisonReport -eq $WorkerContext.ApprovedReportPath -and
+                    $Database -ne $WorkerContext.RepresentativeDatabase
+                )
+        }
+        catch {
+            if ($_.Exception.Message -ne 'The target database changed after approval. Generate and approve a new deployment plan.') {
+                throw
+            }
+            if (Test-DeployReportHasChanges -Path $reportPath) {
+                throw
+            }
+            $reportMatchesApproval = $false
+        }
 
         $scriptAccessToken = Get-WorkerAccessToken
         $scriptArguments = @(
@@ -375,8 +407,22 @@ $worker = {
         else {
             Get-Content -Path $scriptPath -Raw
         }
-        if ($approvedScriptContent -cne $currentScriptContent) {
-            throw 'The target deployment script changed after approval. Generate and approve a new deployment plan.'
+        $scriptMatchesApproval = $approvedScriptContent -ceq $currentScriptContent
+        $isPostDeploymentRecovery = -not $reportMatchesApproval -or -not $scriptMatchesApproval
+        if ($isPostDeploymentRecovery) {
+            if (Test-DeployReportHasChanges -Path $reportPath) {
+                throw 'The target deployment script changed while schema operations remain. Generate and approve a new deployment plan.'
+            }
+            $currentPostDeployment = Get-DacFxPostDeploymentPayload `
+                -Path $scriptPath `
+                -RequirePostDeploymentOnly
+            $approvedPostDeployment = Get-DacFxPostDeploymentPayload -Path $approvedScript
+            if (
+                $currentPostDeployment.Sha256 -cne $WorkerContext.PostDeploymentPayloadSha256 -or
+                $approvedPostDeployment.Sha256 -cne $WorkerContext.PostDeploymentPayloadSha256
+            ) {
+                throw 'Post-deployment recovery payload does not match the approved manifest.'
+            }
         }
 
         $executionAccessToken = Get-WorkerAccessToken
@@ -399,7 +445,12 @@ $worker = {
         return [pscustomobject]@{
             DatabaseName = $Database
             Success = $true
-            Status = 'Validated deployment script executed; smoke test passed'
+            Status = if ($isPostDeploymentRecovery) {
+                'Approved post-deployment recovery script executed; smoke test passed'
+            }
+            else {
+                'Validated deployment script executed; smoke test passed'
+            }
             Error = ''
         }
     }
@@ -430,7 +481,7 @@ if (@($canaryResult | Where-Object { -not $_.Success }).Count -gt 0) {
         -Results $results.ToArray() `
         -SummaryPath $SummaryPath `
         -EnvironmentName $EnvironmentName
-    throw "Canary deployment failed for '$($rollout.Canary)'; remaining databases were not started."
+    throw "Canary deployment failed for '$($rollout.Canary)'; remaining databases were not started. $($canaryResult[0].Error)"
 }
 
 if ($rollout.Remaining.Count -gt 0) {

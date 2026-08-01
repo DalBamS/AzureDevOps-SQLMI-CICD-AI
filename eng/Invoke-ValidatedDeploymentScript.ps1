@@ -21,6 +21,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$sqlCmdModulePath = Join-Path $PSScriptRoot 'SqlCmd.Common.psm1'
+Import-Module $sqlCmdModulePath -Force
+$sqlCmdResolution = Resolve-SqlCmdScript -Path $ScriptPath
+$sqlCmdVariables = @(
+    $sqlCmdResolution.Variables |
+        ForEach-Object { "$($_.Name)=$($_.Value)" }
+)
+
 $requiredVersion = '22.4.5.1'
 $installedModule = Get-Module -ListAvailable -Name SqlServer |
     Where-Object Version -eq $requiredVersion |
@@ -32,14 +40,19 @@ Import-Module SqlServer -RequiredVersion $requiredVersion -Force
 
 $serverInstance = "tcp:$ServerName,$Port"
 Write-Information "Executing validated deployment script for '$DatabaseName'." -InformationAction Continue
-Invoke-Sqlcmd `
-    -ServerInstance $serverInstance `
-    -Database $DatabaseName `
-    -AccessToken $AccessToken `
-    -InputFile (Resolve-Path $ScriptPath).Path `
-    -AbortOnError `
-    -Encrypt Mandatory `
-    -TrustServerCertificate:$false `
-    -ConnectionTimeout 30 `
-    -QueryTimeout $CommandTimeout `
-    -ErrorAction Stop
+$invokeArguments = @{
+    ServerInstance = $serverInstance
+    Database = $DatabaseName
+    AccessToken = $AccessToken
+    InputFile = (Resolve-Path $ScriptPath).Path
+    AbortOnError = $true
+    Encrypt = 'Mandatory'
+    TrustServerCertificate = $false
+    ConnectionTimeout = 30
+    QueryTimeout = $CommandTimeout
+    ErrorAction = 'Stop'
+}
+if ($sqlCmdVariables.Count -gt 0) {
+    $invokeArguments.Variable = $sqlCmdVariables
+}
+Invoke-Sqlcmd @invokeArguments

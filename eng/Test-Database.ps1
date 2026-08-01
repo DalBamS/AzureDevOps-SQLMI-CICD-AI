@@ -126,6 +126,7 @@ try {
     $connectionString = "Server=localhost,$HostPort;Initial Catalog=AppDb_Test;User ID=sa;Password=$password;Encrypt=True;TrustServerCertificate=True;Connection Timeout=30;"
     New-Item -ItemType Directory -Force -Path $exactScriptTestPath | Out-Null
     $initialScriptPath = Join-Path $exactScriptTestPath 'initial.deploy.sql'
+    $failedPostDeploymentScriptPath = Join-Path $exactScriptTestPath 'failed-postdeploy.deploy.sql'
     $initialPolicyPath = Join-Path $exactScriptTestPath 'initial.policy.md'
     & $sqlPackage `
         /Action:Script `
@@ -140,18 +141,52 @@ try {
     & ([IO.Path]::Combine($PSScriptRoot, 'Test-DeploymentScript.ps1')) `
         -ScriptPath $initialScriptPath `
         -ReportPath $initialPolicyPath
-    Invoke-Sqlcmd `
-        -ServerInstance "tcp:localhost,$HostPort" `
-        -Database AppDb_Test `
-        -Username sa `
-        -Password $password `
-        -InputFile $initialScriptPath `
-        -AbortOnError `
-        -Encrypt Mandatory `
-        -TrustServerCertificate `
-        -ConnectionTimeout 30 `
-        -QueryTimeout $SqlCommandTimeout `
-        -ErrorAction Stop
+    Import-Module ([IO.Path]::Combine($PSScriptRoot, 'Phase2.Common.psm1')) -Force
+    Import-Module ([IO.Path]::Combine($PSScriptRoot, 'SqlCmd.Common.psm1')) -Force
+    $approvedPostDeployment = Get-DacFxPostDeploymentPayload -Path $initialScriptPath
+    $initialResolution = Resolve-SqlCmdScript -Path $initialScriptPath
+    $initialVariables = @(
+        $initialResolution.Variables |
+            ForEach-Object { "$($_.Name)=$($_.Value)" }
+    )
+    $failedPostDeploymentScript = [regex]::Replace(
+        (Get-Content -Path $initialScriptPath -Raw),
+        '(?ms)(^-- SQLMI-CICD POSTDEPLOY START v1[ \t]*\r?\n).*?(^-- SQLMI-CICD POSTDEPLOY END v1[ \t]*\r?$)',
+        "`${1}THROW 51000, 'Intentional post-deployment retry fixture failure.', 1;`r`n`${2}"
+    )
+    if (
+        $failedPostDeploymentScript -notmatch 'Intentional post-deployment retry fixture failure' -or
+        $failedPostDeploymentScript -ceq (Get-Content -Path $initialScriptPath -Raw)
+    ) {
+        throw 'Unable to construct the intentional post-deployment failure fixture.'
+    }
+    Set-Content `
+        -Path $failedPostDeploymentScriptPath `
+        -Value $failedPostDeploymentScript `
+        -NoNewline `
+        -Encoding utf8
+    $postDeploymentFailed = $false
+    try {
+        Invoke-Sqlcmd `
+            -ServerInstance "tcp:localhost,$HostPort" `
+            -Database AppDb_Test `
+            -Username sa `
+            -Password $password `
+            -InputFile $failedPostDeploymentScriptPath `
+            -Variable $initialVariables `
+            -AbortOnError `
+            -Encrypt Mandatory `
+            -TrustServerCertificate `
+            -ConnectionTimeout 30 `
+            -QueryTimeout $SqlCommandTimeout `
+            -ErrorAction Stop
+    }
+    catch {
+        $postDeploymentFailed = $true
+    }
+    if (-not $postDeploymentFailed) {
+        throw 'The intentional post-deployment failure fixture did not fail.'
+    }
 
     $seedQueryArguments = @{
         ServerInstance = "tcp:localhost,$HostPort"
@@ -171,8 +206,8 @@ FROM [app].[FeatureFlag]
 WHERE [FlagName] = N'database-cicd-ready';
 '@
     ).SeedCount
-    if ($initialSeedCount -ne 1) {
-        throw 'The initial exact deployment script did not execute the post-deployment seed.'
+    if ($initialSeedCount -ne 0) {
+        throw 'The intentional post-deployment failure fixture unexpectedly inserted seed data.'
     }
 
     $retryReportPath = Join-Path $exactScriptTestPath 'retry.deploy-report.xml'
@@ -188,14 +223,9 @@ WHERE [FlagName] = N'database-cicd-ready';
     if ($LASTEXITCODE -ne 0) {
         throw 'Retry DeployReport generation failed.'
     }
-    Import-Module ([IO.Path]::Combine($PSScriptRoot, 'Phase2.Common.psm1')) -Force
     if (Test-DeployReportHasChanges -Path $retryReportPath) {
         throw 'The retry DeployReport should contain no schema operations.'
     }
-    Invoke-Sqlcmd @seedQueryArguments -Query @'
-DELETE FROM [app].[FeatureFlag]
-WHERE [FlagName] = N'database-cicd-ready';
-'@
     & $sqlPackage `
         /Action:Script `
         "/SourceFile:$dacpac" `
@@ -209,12 +239,24 @@ WHERE [FlagName] = N'database-cicd-ready';
     & ([IO.Path]::Combine($PSScriptRoot, 'Test-DeploymentScript.ps1')) `
         -ScriptPath $retryScriptPath `
         -ReportPath $retryPolicyPath
+    $retryPostDeployment = Get-DacFxPostDeploymentPayload `
+        -Path $retryScriptPath `
+        -RequirePostDeploymentOnly
+    if ($retryPostDeployment.Sha256 -cne $approvedPostDeployment.Sha256) {
+        throw 'The post-deployment-only retry payload differs from the approved initial payload.'
+    }
+    $retryResolution = Resolve-SqlCmdScript -Path $retryScriptPath
+    $retryVariables = @(
+        $retryResolution.Variables |
+            ForEach-Object { "$($_.Name)=$($_.Value)" }
+    )
     Invoke-Sqlcmd `
         -ServerInstance "tcp:localhost,$HostPort" `
         -Database AppDb_Test `
         -Username sa `
         -Password $password `
         -InputFile $retryScriptPath `
+        -Variable $retryVariables `
         -AbortOnError `
         -Encrypt Mandatory `
         -TrustServerCertificate `
@@ -229,10 +271,10 @@ WHERE [FlagName] = N'database-cicd-ready';
 '@
     ).SeedCount
     if ($retrySeedCount -ne 1) {
-        throw 'The empty-report retry script did not restore post-deployment seed data.'
+        throw 'The post-deployment-only retry script did not restore seed data.'
     }
     Write-Information `
-        'SqlPackage exact-script execution and empty-report retry passed.' `
+        'SqlPackage schema-success/postdeploy-failure recovery and exact-script execution passed.' `
         -InformationAction Continue
 
     $tests = Get-ChildItem -Path ([IO.Path]::Combine($repoRoot, 'tests', 'integration')) -File -Filter '*.sql' |

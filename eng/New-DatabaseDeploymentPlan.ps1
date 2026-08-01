@@ -162,6 +162,7 @@ Invoke-SqlPackageAction -Action Script -TargetDatabase $representative -OutputPa
 & $policyScript `
     -ScriptPath $scriptPath `
     -ReportPath $policyReportPath
+$representativePostDeployment = Get-DacFxPostDeploymentPayload -Path $scriptPath
 
 $drifted = [System.Collections.Generic.List[string]]::new()
 if ($ValidateAllDatabasePlans) {
@@ -193,6 +194,10 @@ if ($ValidateAllDatabasePlans) {
         & $policyScript `
             -ScriptPath $databaseScriptPath `
             -ReportPath $databasePolicyReportPath
+        $databasePostDeployment = Get-DacFxPostDeploymentPayload -Path $databaseScriptPath
+        if ($databasePostDeployment.Sha256 -cne $representativePostDeployment.Sha256) {
+            throw "Database '$database' has a post-deployment payload that differs from representative '$representative'."
+        }
         try {
             & $confirmScript `
                 -ApprovedReportPath $approvedReportPath `
@@ -244,7 +249,7 @@ if ($ValidateAllDatabasePlans) {
 }
 
 $targetMetadata = [ordered]@{
-    manifestVersion = 3
+    manifestVersion = 4
     environment = $EnvironmentName
     representativeDatabase = $representative
     targetDatabases = $targets
@@ -253,6 +258,8 @@ $targetMetadata = [ordered]@{
     gatedDatabases = if ($ValidateAllDatabasePlans) { $targets } else { @($representative) }
     driftPolicy = $DatabasePlanDriftPolicy
     dacpacSha256 = (Get-FileHash -Path $DacpacPath -Algorithm SHA256).Hash
+    postDeploymentContract = $representativePostDeployment.Contract
+    postDeploymentPayloadSha256 = $representativePostDeployment.Sha256
     artifacts = $manifestArtifacts.ToArray()
 }
 $targetMetadata |

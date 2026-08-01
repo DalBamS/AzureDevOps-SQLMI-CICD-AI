@@ -78,6 +78,179 @@ function Test-DeployReportHasChanges {
     return $report.SelectNodes("//*[local-name()='Operation']").Count -gt 0
 }
 
+function ConvertFrom-NestedSqlBlockComment {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+    $result = [Text.StringBuilder]::new($Text.Length)
+    $index = 0
+    while ($index -lt $Text.Length) {
+        if ($Text[$index] -eq "'") {
+            [void]$result.Append("'")
+            $index++
+            $closed = $false
+            while ($index -lt $Text.Length) {
+                [void]$result.Append($Text[$index])
+                if ($Text[$index] -ne "'") {
+                    $index++
+                    continue
+                }
+                if ($index + 1 -lt $Text.Length -and $Text[$index + 1] -eq "'") {
+                    [void]$result.Append("'")
+                    $index += 2
+                    continue
+                }
+                $index++
+                $closed = $true
+                break
+            }
+            if (-not $closed) {
+                throw 'DacFx script contains an unterminated string literal.'
+            }
+            continue
+        }
+        if ($Text[$index] -in '[', '"') {
+            $opening = $Text[$index]
+            $closing = if ($opening -eq '[') { ']' } else { '"' }
+            [void]$result.Append($opening)
+            $index++
+            $closed = $false
+            while ($index -lt $Text.Length) {
+                [void]$result.Append($Text[$index])
+                if ($Text[$index] -ne $closing) {
+                    $index++
+                    continue
+                }
+                if ($index + 1 -lt $Text.Length -and $Text[$index + 1] -eq $closing) {
+                    [void]$result.Append($closing)
+                    $index += 2
+                    continue
+                }
+                $index++
+                $closed = $true
+                break
+            }
+            if (-not $closed) {
+                throw 'DacFx script contains an unterminated quoted identifier.'
+            }
+            continue
+        }
+        if (
+            $Text[$index] -eq '/' -and
+            $index + 1 -lt $Text.Length -and
+            $Text[$index + 1] -eq '*'
+        ) {
+            $depth = 1
+            $index += 2
+            while ($index -lt $Text.Length -and $depth -gt 0) {
+                if (
+                    $Text[$index] -eq '/' -and
+                    $index + 1 -lt $Text.Length -and
+                    $Text[$index + 1] -eq '*'
+                ) {
+                    $depth++
+                    $index += 2
+                    continue
+                }
+                if (
+                    $Text[$index] -eq '*' -and
+                    $index + 1 -lt $Text.Length -and
+                    $Text[$index + 1] -eq '/'
+                ) {
+                    $depth--
+                    $index += 2
+                    continue
+                }
+                if ($Text[$index] -in "`r", "`n") {
+                    [void]$result.Append($Text[$index])
+                }
+                $index++
+            }
+            if ($depth -ne 0) {
+                throw 'DacFx script contains an unterminated block comment.'
+            }
+            continue
+        }
+        [void]$result.Append($Text[$index])
+        $index++
+    }
+    return $result.ToString()
+}
+
+function Get-DacFxPostDeploymentPayload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path $_ -PathType Leaf })]
+        [string]$Path,
+        [switch]$RequirePostDeploymentOnly
+    )
+
+    $startMarker = '-- SQLMI-CICD POSTDEPLOY START v1'
+    $endMarker = '-- SQLMI-CICD POSTDEPLOY END v1'
+    $text = (Get-Content -Path $Path -Raw) -replace "`r`n", "`n"
+    $startMatches = @([regex]::Matches($text, "(?m)^$([regex]::Escape($startMarker))$"))
+    $endMatches = @([regex]::Matches($text, "(?m)^$([regex]::Escape($endMarker))$"))
+    if ($startMatches.Count -ne 1 -or $endMatches.Count -ne 1) {
+        throw 'DacFx script must contain exactly one approved post-deployment marker pair.'
+    }
+    $start = $startMatches[0]
+    $end = $endMatches[0]
+    if ($end.Index -le $start.Index) {
+        throw 'DacFx post-deployment markers are out of order.'
+    }
+    $payloadStart = $start.Index + $start.Length
+    $payload = $text.Substring($payloadStart, $end.Index - $payloadStart)
+    if ([string]::IsNullOrWhiteSpace($payload)) {
+        throw 'DacFx post-deployment payload is empty.'
+    }
+
+    if ($RequirePostDeploymentOnly) {
+        $prefix = ConvertFrom-NestedSqlBlockComment -Text $text.Substring(0, $start.Index)
+        $suffix = $text.Substring($end.Index + $end.Length)
+        $prefixPattern = @'
+(?isx)\A\s*
+GO\s+
+SET\s+ANSI_NULLS\s*,\s*ANSI_PADDING\s*,\s*ANSI_WARNINGS\s*,\s*ARITHABORT\s*,\s*CONCAT_NULL_YIELDS_NULL\s*,\s*QUOTED_IDENTIFIER\s+ON\s*;\s*
+SET\s+NUMERIC_ROUNDABORT\s+OFF\s*;\s*
+GO\s*
+:setvar\s+DatabaseName\s+"[^"\r\n]+"\s*
+:setvar\s+DefaultFilePrefix\s+"[^"\r\n]+"\s*
+:setvar\s+DefaultDataPath\s+"[^"\r\n]+"\s*
+:setvar\s+DefaultLogPath\s+"[^"\r\n]+"\s*
+GO\s*
+:on\s+error\s+exit\s*
+GO\s*
+:setvar\s+__IsSqlCmdEnabled\s+"True"\s*
+GO\s*
+IF\s+N'\$\(__IsSqlCmdEnabled\)'\s+NOT\s+LIKE\s+N'True'\s*
+BEGIN\s*
+PRINT\s+N'(?:''|[^'])*'\s*;\s*
+SET\s+NOEXEC\s+ON\s*;\s*
+END\s*
+GO\s*
+USE\s+\[\$\(DatabaseName\)\]\s*;\s*
+GO\s*\z
+'@
+        $suffixPattern = @'
+(?isx)\A\s*
+GO\s*
+GO\s*
+PRINT\s+N'(?:''|[^'])*'\s*;\s*
+GO\s*\z
+'@
+        if ($prefix -notmatch $prefixPattern -or $suffix -notmatch $suffixPattern) {
+            throw 'Current DacFx script contains schema or pre-deployment SQL outside the approved post-deployment payload.'
+        }
+    }
+
+    $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+    return [pscustomobject]@{
+        Contract = 'sqlmi-cicd-postdeploy-v1'
+        Payload = $payload
+        Sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+    }
+}
+
 function Invoke-DatabaseFanOut {
     [CmdletBinding()]
     param(
@@ -198,6 +371,7 @@ Export-ModuleMember -Function @(
     'Resolve-DatabaseNames',
     'Get-DatabaseRollout',
     'Test-DeployReportHasChanges',
+    'Get-DacFxPostDeploymentPayload',
     'Invoke-DatabaseFanOut',
     'Write-DatabaseDeploymentSummary'
 )

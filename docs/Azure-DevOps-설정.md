@@ -147,8 +147,8 @@ Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제
 - `deploy.sql`: 실제 실행 예정 SQL
 - `deploy-report.xml`: DacFx 변경 계획
 - `deployment-script-policy.md`: 결정론적 위험 DDL 검사와 allowlist 결과
-- `target-databases.json`: 대표 DB, 전체 대상, 검사 모드, gated DB 목록, DACPAC과 승인
-  artifact의 SHA-256
+- `target-databases.json`: 대표 DB, 전체 대상, 검사 모드, gated DB 목록, DACPAC·승인
+  artifact·post-deployment payload의 SHA-256
 - `all-database-reports`: 전수 검사 시 DB별 DacFx 변경 계획
 - `all-database-scripts`: 전수 검사 시 DB별 실제 실행 예정 SQL
 - `all-database-policy-reports`: 전수 검사 시 DB별 결정론적 정책 결과
@@ -198,6 +198,20 @@ advisory 단계입니다.
 증명할 수 없는 동적 표현식은 fail closed 오류로 차단합니다. `EXEC dbo.StoredProcedure
 @p=...` 형태의 정적 stored procedure 호출은 허용합니다.
 
+`sp_executesql`과 `sp_rename`은 bare, bracket, double-quote와 최대 4-part qualified
+identifier를 같은 canonical procedure 이름으로 해석합니다. `ALTER TABLE`의 `DROP
+COLUMN`, `DROP CONSTRAINT`, `ALTER COLUMN`은 문자열·주석·quoted identifier를 제외한
+token stream에서 statement 길이 제한 없이 검사합니다.
+
+Gate는 `:setvar Name "value"`를 중복 없이 엄격하게 읽고 실제 SQLCMD 순서대로 모든
+`$(Name)`을 확장한 결과를 검사합니다. 미선언·잘못된 이름, 중복·잘못된 directive,
+중첩 치환과 quote·semicolon·제어 문자가 포함된 값은 fail closed입니다. DacFx의
+`DatabaseName`, `DefaultFilePrefix`, `DefaultDataPath`, `DefaultLogPath`,
+`__IsSqlCmdEnabled`는 같은 규칙으로 처리합니다. escaped `` `$(``만 literal로 보존합니다.
+정책 보고서는 variable map hash를 기록하고 exact Script와 정책 보고서의 artifact hash가
+manifest에 결합됩니다. 실행기는 같은 `SqlCmd.Common.psm1` parser가 만든 map만
+`Invoke-Sqlcmd -Variable`에 전달하므로 gate와 실행의 치환 의미가 달라지지 않습니다.
+
 승인자는 대기 중인 `Deploy*` stage를 승인하기 전에 완료된 `Plan*` stage의 artifact를 검토합니다. 초기 도입 기간에는 Dev 자동 배포만 허용하고 Test/Prod에서 `deploy.sql`을 DBA가 승인하도록 운영합니다. `DropObjectsNotInSource=False`로 인해 제거가 자동 반영되지 않으므로, 승인된 제거는 별도 expand/contract 절차와 명시적 스크립트로 처리합니다.
 
 기본 Plan은 대표 DB만 조회하며 비용/MI 부하 경고를 남깁니다.
@@ -210,10 +224,11 @@ Script에 결정론적 정책 gate를 적용합니다. 보고서, script, 정책
 따라서 전수 검사는 대상 DB마다 DeployReport 1회와 Script 1회를 실행해 기본 대표 검사보다
 SQL MI 부하와 pipeline 시간이 증가합니다.
 
-`target-databases.json` manifest v3는 대표/전수 모드 모두 필수입니다. 배포는 manifest
+`target-databases.json` manifest v4는 대표/전수 모드 모두 필수입니다. 배포는 manifest
 version, 환경, 검사 모드, 순서가 보존된 대상/gated DB 목록을 pipeline runtime 값과
 대조하고, ReviewPath 하위 상대 경로만 허용한 뒤 DACPAC, 보고서, script, 정책 보고서의
-SHA-256을 모두 확인합니다. 누락, 중복·대소문자 충돌, 경로 이탈, hash 불일치는 즉시
+SHA-256과 marker 사이 approved post-deployment payload hash를 모두 확인합니다. 누락,
+중복·대소문자 충돌, 경로 이탈, hash 불일치는 즉시
 실패합니다. manifest 자체에는 별도 서명이 없으므로 이 계약은 승인 후 같은 실행의 Azure
 DevOps pipeline artifact가 변경되지 않는 경계를 신뢰합니다. 승인 후 artifact를 교체하거나
 다른 실행의 DACPAC/review artifact를 혼합해서는 안 됩니다.
@@ -233,10 +248,15 @@ smoke test까지 통과해야 나머지를 최대 `maxParallel`로 배포합니�
 만료를 피하도록 각 DB의 DeployReport, Script 생성, Script 실행, smoke test 직전에
 `eng/Get-AzureSqlAccessToken.ps1`로 Azure SQL access token을 새로 가져옵니다.
 각 DB 실패는 모두 수집되며 성공/실패 요약과 실패 DB 목록을 Azure DevOps summary에
-게시합니다. DeployReport에 schema operation이 없어도 post-deployment data script는
+게시합니다. 기본 계약은 승인 report와 Script의 strict equality입니다. DeployReport에
+schema operation이 없어도 post-deployment data script는
 별도로 필요할 수 있으므로 current Script 생성, gate, 승인 비교, 실행, smoke를 생략하지
-않습니다. 완전한 no-op script도 실행하므로 소량의 연결·실행 비용이 들지만 data-only DACPAC과
-schema 성공/postdeploy 실패 재시도의 정확성을 우선합니다.
+않습니다. schema 성공 후 postdeploy가 실패한 재시도에서만 strict equality 예외를
+허용합니다. 현재 report의 schema operation이 0이고, current Script가 DacFx shell과
+`SQLMI-CICD POSTDEPLOY START/END v1` marker 사이 payload만 포함하며, 그 payload hash가
+manifest와 승인 Script의 hash에 모두 같아야 합니다. marker 누락·중복, payload 변경,
+pre/schema SQL 혼입은 실행 전에 실패합니다. 완전한 no-op script도 실행하므로 소량의
+연결·실행 비용이 들지만 data-only DACPAC과 부분 성공 재시도의 정확성을 우선합니다.
 
 Plan도 각 DeployReport와 Script 직전에 같은 token provider를 호출합니다. Azure DevOps의
 장시간 Plan과 rollout `AzureCLI@2` 작업은 WIF IdToken 만료 이후 재로그인을 위해
