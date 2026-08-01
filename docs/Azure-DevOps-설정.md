@@ -1,6 +1,6 @@
 # Azure DevOps 설정 가이드
 
-## 현재 데모 구성
+## 데모 구성 예시
 
 | 항목 | 구성 값 |
 |---|---|
@@ -8,7 +8,7 @@
 | GitHub | `<owner>/<repository>` |
 | Pipeline | `Azure SQL MI CI-CD` |
 | Azure 연결 | `sc-sqlmi-wif` (Microsoft Entra issuer 기반 Workload Identity Federation) |
-| 관리 ID | `<deployer-principal-name>` |
+| 배포 주체 | `<deployer-principal-name>` |
 | Demo SQL MI | `<sql-mi-name>`, public endpoint `3342` |
 | Dev DB | `AppDb_CicdDemo_Dev` |
 | Stg DB | `AppDb_CicdDemo_Stg` |
@@ -20,7 +20,7 @@ Demo는 한 SQL MI 안에서 데이터베이스를 분리해 Dev → Stg → Liv
 DBA 한 명이 Azure DevOps Environment 승인을 통해 순차 배포하는 전제입니다. 실제
 운영에서는 장애 및 권한 경계를 위해 Live를 별도 SQL MI로 분리합니다.
 
-현재 self-hosted agent는 이 개발 PC에서 실행하는 데모용입니다. 운영 전에는 SQL MI VNet 내부의 전용 VM 또는 Managed DevOps Pool로 교체하십시오.
+Demo self-hosted agent를 개발 PC에서 실행할 수 있지만, 운영 전에는 SQL MI VNet 내부의 전용 VM 또는 Managed DevOps Pool로 교체하십시오.
 
 SQL MI 시스템 ID에는 Entra principal 조회를 위해 Microsoft Graph의 `User.Read.All`, `GroupMember.Read.All`, `Application.Read.All` application permission을 부여했습니다. 이는 광범위한 `Directory Readers` 역할 대신 Microsoft가 안내하는 lower-level permission 조합을 사용한 것입니다.
 
@@ -31,7 +31,7 @@ SQL MI 시스템 ID에는 Entra principal 조회를 위해 Microsoft Graph의 `U
 3. Azure Resource Manager 서비스 연결을 Workload Identity Federation 방식으로 생성합니다.
 4. 서비스 연결의 Entra 주체를 각 대상 데이터베이스에 사용자로 생성하고 최소 권한을 부여합니다.
 
-예시 권한은 초기 구축용 기준입니다. 조직의 권한 분리 정책에 따라 사용자 지정 database role로 축소하십시오. Demo DB에서는 `<deployer-principal-name>` 관리 ID에 동일 역할을 부여합니다.
+예시 권한은 초기 구축용 기준입니다. 조직의 권한 분리 정책에 따라 사용자 지정 database role로 축소하십시오. `<deployer-principal-name>`은 Azure DevOps 서비스 연결이 사용하는 Entra 주체 이름으로 바꿉니다.
 
 ```sql
 CREATE USER [<deployer-principal-name>] FROM EXTERNAL PROVIDER;
@@ -95,17 +95,22 @@ Library의 variable group은 다음 Demo 대상으로 구성합니다.
 Demo 데이터베이스 최초 구성:
 
 ```powershell
-az sql mi start -g <sql-mi-resource-group> --mi <sql-mi-name>
+$resourceGroup = '<sql-mi-resource-group>'
+$managedInstance = '<sql-mi-name>'
+$sqlServer = '<sql-mi-public-fqdn>'
+$deployerPrincipal = '<deployer-principal-name>'
+
+az sql mi start -g $resourceGroup --mi $managedInstance
 $token = az account get-access-token `
   --resource 'https://database.windows.net/' `
   --query accessToken `
   --output tsv
 
 & ./eng/Initialize-DemoDatabases.ps1 `
-  -ServerName '<sql-mi-public-fqdn>' `
+  -ServerName $sqlServer `
   -Port 3342 `
   -DatabaseName @('AppDb_CicdDemo_Dev', 'AppDb_CicdDemo_Stg', 'AppDb_CicdDemo_Live') `
-  -DeployerPrincipalName '<deployer-principal-name>' `
+  -DeployerPrincipalName $deployerPrincipal `
   -AccessToken $token
 ```
 
@@ -115,7 +120,7 @@ SQL MI 시작에는 일반적으로 수 분 이상 걸리며 `az sql mi start`�
 Demo가 끝나면 비용 절감을 위해 인스턴스를 중지합니다.
 
 ```powershell
-az sql mi stop -g <sql-mi-resource-group> --mi <sql-mi-name>
+az sql mi stop -g $resourceGroup --mi $managedInstance
 ```
 
 Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제되지 않으므로 `main` 브랜치의 **Build validation** 정책에 이 파이프라인을 Required로 연결합니다. 현재 구성은 GitHub 저장소를 사용하므로 GitHub branch protection에서 Azure Pipelines 상태 검사를 Required로 설정합니다.
@@ -157,7 +162,7 @@ JSON Schema를 사용해 Azure OpenAI Responses API를 호출합니다.
 - [Azure OpenAI Responses API와 지원 모델](https://learn.microsoft.com/azure/foundry/openai/how-to/responses)
 - [Foundry에서 Azure가 제공하는 모델](https://learn.microsoft.com/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure)
 
-현재 Demo pipeline의 기본 parameter는 다음과 같이 구성되어 있습니다.
+AI 리뷰를 사용할 때 파이프라인 실행 parameter에 환경별 값을 전달합니다. 저장소의 기본값은 개인 리소스 노출과 잘못된 환경 호출을 막기 위해 비활성화되어 있습니다.
 
 | Parameter | 예시 |
 |---|---|

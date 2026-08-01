@@ -40,11 +40,11 @@ parameters:
   - name: enableAiReview
     displayName: Run advisory AI SQL review
     type: boolean
-    default: true
+    default: false
   - name: aiEndpoint
     displayName: Azure OpenAI endpoint
     type: string
-    default: https://<azure-openai-resource>.openai.azure.com/openai/v1/
+    default: ''
   - name: aiDeploymentName
     displayName: Azure OpenAI model deployment
     type: string
@@ -52,11 +52,11 @@ parameters:
   - name: publishAiPrComment
     displayName: Publish AI review as a GitHub PR comment
     type: boolean
-    default: true
+    default: false
   - name: githubServiceConnection
     displayName: GitHub service connection for PR comments
     type: string
-    default: <github-service-connection>
+    default: ''
 
 variables:
   artifactName: database
