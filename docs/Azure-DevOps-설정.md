@@ -157,7 +157,7 @@ Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제
 내용은 완전히 동일하며 연결 정보는 포함하지 않습니다. Plan과 승인 후 재검증의 `Script`,
 `DeployReport`는 같은 환경 profile과 같은 timeout override를 사용합니다. 실제 실행은
 SqlPackage가 계획을 다시 계산하는 `Publish`가 아니라 검증을 마친 현재 Script를 deterministic
-sanitized SQL로 변환해 `Invoke-Sqlcmd -InputFile`로 실행합니다.
+sanitized SQL로 변환해 `Invoke-Sqlcmd -Query`에 메모리 문자열로 전달합니다.
 
 공통 게시 옵션:
 
@@ -209,14 +209,16 @@ Gate는 line-leading SQLCMD command 중 `:setvar Name "value"`와 정확한 `:on
 `:on error ignore`와
 unknown command는 fail closed입니다. 허용 directive를 제거하고 실제 SQLCMD 순서대로 모든
 `$(Name)`을 확장한 deterministic sanitized SQL을 정책 검사와 실행에 함께 사용합니다.
+변수 확장이 끝난 물리 행도 lexical state로 다시 검사하므로 치환값이 합성한 line-leading
+`:r`, `:quit`, `:on error ignore`, `!!` 등은 sanitized hash 계산 전에 차단됩니다.
 미선언·잘못된 이름, 중복·잘못된 directive, 중첩 치환과 quote·semicolon·제어 문자가 포함된
 값도 fail closed입니다. DacFx의
 `DatabaseName`, `DefaultFilePrefix`, `DefaultDataPath`, `DefaultLogPath`,
 `__IsSqlCmdEnabled`는 같은 규칙으로 처리합니다. escaped `` `$(``만 literal로 보존합니다.
 정책 보고서는 canonical variable map과 sanitized SQL hash를 기록하고 exact Script와 정책
 보고서의 artifact hash가 manifest에 결합됩니다. 실행기는 같은 `SqlCmd.Common.psm1` 변환
-결과를 임시 파일에 기록하고 `Invoke-Sqlcmd -DisableCommands -DisableVariables`로 실행한 뒤
-파일을 삭제하므로 gate 이후 2차 SQLCMD 해석이 발생하지 않습니다. executor는 정책 보고서의
+결과를 `Invoke-Sqlcmd -Query -DisableCommands -DisableVariables`로 메모리에서 실행하므로
+검증 후 mutable 임시 파일 교체와 2차 SQLCMD 해석이 발생하지 않습니다. executor는 정책 보고서의
 sanitized SQL hash를 입력받아 실행 직전 재변환 hash와 일치하는지도 확인합니다.
 
 승인자는 대기 중인 `Deploy*` stage를 승인하기 전에 완료된 `Plan*` stage의 artifact를 검토합니다. 초기 도입 기간에는 Dev 자동 배포만 허용하고 Test/Prod에서 `deploy.sql`을 DBA가 승인하도록 운영합니다. `DropObjectsNotInSource=False`로 인해 제거가 자동 반영되지 않으므로, 승인된 제거는 별도 expand/contract 절차와 명시적 스크립트로 처리합니다.
@@ -253,7 +255,7 @@ Script와 정확히 같아야 합니다. 대표 모드의 비대표 DB 비교에
 밖의 주석, SQLCMD 변수, DDL은 정규화하지 않습니다. 보고서
 또는 Script가 달라지거나 현재 Script가 위험하면 해당 DB를 배포하지 않습니다. 비교가
 끝난 동일 Script의 sanitized SQL을 pinned SqlServer module 22.4.5.1의 `Invoke-Sqlcmd
--InputFile`로 `DisableCommands`, `DisableVariables`, `AbortOnError`, `Encrypt Mandatory`,
+-Query`에 메모리 문자열로 전달하고 `DisableCommands`, `DisableVariables`, `AbortOnError`, `Encrypt Mandatory`,
 `TrustServerCertificate=False` 조건에서 실행합니다.
 Deploy 경로는 `/Action:Publish`를 호출하지 않습니다. 첫 DB는 카나리로 exact script 실행과
 smoke test까지 통과해야 나머지를 최대 `maxParallel`로 배포합니다. 장시간 rollout에서 토큰

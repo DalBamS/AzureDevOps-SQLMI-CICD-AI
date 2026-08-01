@@ -45,31 +45,18 @@ Import-Module SqlServer -RequiredVersion $requiredVersion -Force
 
 $serverInstance = "tcp:$ServerName,$Port"
 Write-Information "Executing validated deployment script for '$DatabaseName'." -InformationAction Continue
-$sanitizedPath = Join-Path `
-    ([IO.Path]::GetTempPath()) `
-    "sqlmi-sanitized-$([guid]::NewGuid().ToString('N')).sql"
-try {
-    Set-Content `
-        -Path $sanitizedPath `
-        -Value $sqlCmdResolution.SanitizedText `
-        -Encoding utf8 `
-        -NoNewline
-    $invokeArguments = @{
-        ServerInstance = $serverInstance
-        Database = $DatabaseName
-        AccessToken = $AccessToken
-        InputFile = $sanitizedPath
-        AbortOnError = $true
-        DisableCommands = $true
-        DisableVariables = $true
-        Encrypt = 'Mandatory'
-        TrustServerCertificate = $false
-        ConnectionTimeout = 30
-        QueryTimeout = $CommandTimeout
-        ErrorAction = 'Stop'
-    }
-    Invoke-Sqlcmd @invokeArguments
+$invokeArguments = @{
+    ServerInstance = $serverInstance
+    Database = $DatabaseName
+    AccessToken = $AccessToken
+    Query = $sqlCmdResolution.SanitizedText
+    AbortOnError = $true
+    DisableCommands = $true
+    DisableVariables = $true
+    Encrypt = 'Mandatory'
+    TrustServerCertificate = $false
+    ConnectionTimeout = 30
+    QueryTimeout = $CommandTimeout
+    ErrorAction = 'Stop'
 }
-finally {
-    Remove-Item -Path $sanitizedPath -Force -ErrorAction SilentlyContinue
-}
+Invoke-Sqlcmd @invokeArguments

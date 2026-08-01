@@ -135,13 +135,70 @@ function Resolve-SqlCmdVariable {
     return $expanded.Replace($literalMarker, '$(')
 }
 
+function Get-SqlCmdReferenceName {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    $referenceSource = $Text.Replace('`$(', '__SQLCMD_ESCAPED_REFERENCE__')
+    return @(
+        [regex]::Matches(
+            $referenceSource,
+            '\$\((?<name>[A-Za-z_][A-Za-z0-9_]*)\)'
+        ) |
+            ForEach-Object { $_.Groups['name'].Value } |
+            Sort-Object -Unique
+    )
+}
+
+function Assert-NoSqlCmdControl {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    $state = 'Code'
+    $blockDepth = 0
+    foreach ($line in $Text.Split("`n")) {
+        $firstNonWhitespace = 0
+        while (
+            $firstNonWhitespace -lt $line.Length -and
+            [char]::IsWhiteSpace($line[$firstNonWhitespace])
+        ) {
+            $firstNonWhitespace++
+        }
+        if (
+            $state -notin @('String', 'BlockComment') -and
+            $firstNonWhitespace -lt $line.Length -and
+            (
+                $line[$firstNonWhitespace] -eq ':' -or
+                $line.Substring($firstNonWhitespace).StartsWith('!!')
+            )
+        ) {
+            throw 'SQLCMD variable expansion produced a forbidden control command.'
+        }
+        $lexicalState = Get-SqlLexicalState `
+            -Line $line `
+            -State $state `
+            -BlockDepth $blockDepth
+        $state = $lexicalState.State
+        $blockDepth = $lexicalState.BlockDepth
+    }
+}
+
 function Resolve-SqlCmdScript {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [ValidateScript({ Test-Path $_ -PathType Leaf })]
         [string]$Path,
-        [Collections.IDictionary]$CanonicalVariables = @{}
+        [Collections.IDictionary]$CanonicalVariables = @{},
+        [Collections.IDictionary]$ExternalVariables = @{},
+        [switch]$DisallowSetVariableDirectives,
+        [switch]$RequireExactExternalVariables
     )
 
     $text = (Get-Content -Path $Path -Raw).Replace("`r`n", "`n").Replace("`r", "`n")
@@ -149,6 +206,25 @@ function Resolve-SqlCmdScript {
     $variableNames = [System.Collections.Generic.HashSet[string]]::new(
         [StringComparer]::OrdinalIgnoreCase
     )
+    foreach ($externalName in $ExternalVariables.Keys) {
+        $name = [string]$externalName
+        $value = [string]$ExternalVariables[$externalName]
+        if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+            throw "Invalid external SQLCMD variable name '$name'."
+        }
+        if (-not $variableNames.Add($name)) {
+            throw "Duplicate external SQLCMD variable declaration: $name"
+        }
+        if (
+            [string]::IsNullOrWhiteSpace($value) -or
+            $value -match '[;\x00-\x1F]' -or
+            $value.Contains('$(') -or
+            $value.Contains('`')
+        ) {
+            throw "External SQLCMD variable '$name' contains a value that cannot be reviewed safely."
+        }
+        $variables[$name] = $value
+    }
     $sanitizedLines = [System.Collections.Generic.List[string]]::new()
     $state = 'Code'
     $blockDepth = 0
@@ -175,6 +251,9 @@ function Resolve-SqlCmdScript {
                 '^(?i)\s*:setvar\s+(?<name>[A-Za-z_][A-Za-z0-9_]*)\s+"(?<value>[^"\r\n]*)"\s*$'
             )
             if ($setVariable.Success) {
+                if ($DisallowSetVariableDirectives) {
+                    throw 'SQLCMD setvar directives are not allowed in this script contract.'
+                }
                 $name = $setVariable.Groups['name'].Value
                 $value = $setVariable.Groups['value'].Value
                 if (-not $variableNames.Add($name)) {
@@ -192,13 +271,13 @@ function Resolve-SqlCmdScript {
                 continue
             }
             if ($line -match '^(?i)\s*:setvar\b') {
-                throw "Malformed SQLCMD setvar directive: $line"
+                throw 'Malformed SQLCMD setvar directive.'
             }
             if ($line -match '^(?i)\s*:on\s+error\s+exit\s*$') {
                 $sanitizedLines.Add('')
                 continue
             }
-            throw "SQLCMD control command is not allowed: $($line.Trim())"
+            throw 'SQLCMD control command is not allowed.'
         }
 
         $sanitizedLines.Add($line)
@@ -228,8 +307,23 @@ function Resolve-SqlCmdScript {
     }
 
     $sanitizedSource = $sanitizedLines -join "`n"
+    if ($RequireExactExternalVariables) {
+        $referencedVariables = [System.Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::OrdinalIgnoreCase
+        )
+        foreach ($referenceName in Get-SqlCmdReferenceName -Text $sanitizedSource) {
+            [void]$referencedVariables.Add($referenceName)
+        }
+        foreach ($externalName in $ExternalVariables.Keys) {
+            if (-not $referencedVariables.Contains([string]$externalName)) {
+                throw "External SQLCMD variable '$externalName' is not referenced by the script."
+            }
+        }
+    }
     $sanitizedText = Resolve-SqlCmdVariable -Text $sanitizedSource -Variables $variables
     $canonicalText = Resolve-SqlCmdVariable -Text $sanitizedSource -Variables $canonicalValues
+    Assert-NoSqlCmdControl -Text $sanitizedText
+    Assert-NoSqlCmdControl -Text $canonicalText
     $canonicalMap = @(
         foreach ($name in @($canonicalValues.Keys | Sort-Object)) {
             "$($name.ToLowerInvariant())=$($canonicalValues[$name])"
@@ -253,4 +347,4 @@ function Resolve-SqlCmdScript {
     }
 }
 
-Export-ModuleMember -Function 'Resolve-SqlCmdScript'
+Export-ModuleMember -Function 'Get-SqlCmdReferenceName', 'Resolve-SqlCmdScript'

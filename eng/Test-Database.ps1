@@ -151,33 +151,20 @@ try {
         param([Parameter(Mandatory)][string]$Path)
 
         $resolution = Resolve-SqlCmdScript -Path $Path
-        $sanitizedPath = Join-Path `
-            $exactScriptTestPath `
-            "sanitized-$([guid]::NewGuid().ToString('N')).sql"
-        try {
-            Set-Content `
-                -Path $sanitizedPath `
-                -Value $resolution.SanitizedText `
-                -Encoding utf8 `
-                -NoNewline
-            Invoke-Sqlcmd `
-                -ServerInstance "tcp:localhost,$HostPort" `
-                -Database AppDb_Test `
-                -Username sa `
-                -Password $password `
-                -InputFile $sanitizedPath `
-                -DisableCommands `
-                -DisableVariables `
-                -AbortOnError `
-                -Encrypt Mandatory `
-                -TrustServerCertificate `
-                -ConnectionTimeout 30 `
-                -QueryTimeout $SqlCommandTimeout `
-                -ErrorAction Stop
-        }
-        finally {
-            Remove-Item -Path $sanitizedPath -Force -ErrorAction SilentlyContinue
-        }
+        Invoke-Sqlcmd `
+            -ServerInstance "tcp:localhost,$HostPort" `
+            -Database AppDb_Test `
+            -Username sa `
+            -Password $password `
+            -Query $resolution.SanitizedText `
+            -DisableCommands `
+            -DisableVariables `
+            -AbortOnError `
+            -Encrypt Mandatory `
+            -TrustServerCertificate `
+            -ConnectionTimeout 30 `
+            -QueryTimeout $SqlCommandTimeout `
+            -ErrorAction Stop
     }
     $failedPostDeploymentScript = [regex]::Replace(
         (Get-Content -Path $initialScriptPath -Raw),

@@ -17,6 +17,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot 'SqlCmd.Common.psm1') -Force
 
 if (-not $ScriptPath) {
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -50,6 +51,10 @@ foreach ($entry in $SqlcmdVariables.GetEnumerator()) {
     $normalizedVariables[$name] = $value
 }
 
+$requiredVariableNames = [System.Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::OrdinalIgnoreCase
+)
+$scriptResolutions = @{}
 foreach ($script in $scripts) {
     if ($script.Name -notmatch '^\d{3}-[A-Za-z0-9-]+\.sql$') {
         throw "Instance script '$($script.Name)' must use the NNN-description.sql naming convention."
@@ -59,34 +64,51 @@ foreach ($script in $scripts) {
     if ($content -notmatch '(?im)^\s*--\s*Idempotency:\s*\S+') {
         throw "Instance script '$($script.Name)' must document its Idempotency precondition."
     }
-    if ($content -notmatch '(?is)\bIF\b.*\bEXISTS\b') {
-        throw "Instance script '$($script.Name)' must guard create/update behavior with an existence check."
-    }
-    if ($content -match '(?is)\bDROP\s+(?:LOGIN|CREDENTIAL)\b|\bsp_delete_job\b') {
-        throw "Instance script '$($script.Name)' contains a prohibited destructive operation."
-    }
-
-    $requiredVariables = @(
-        [regex]::Matches($content, '\$\((?<name>[A-Za-z][A-Za-z0-9_]*)\)') |
-            ForEach-Object { $_.Groups['name'].Value } |
-            Sort-Object -Unique
-    )
+    $requiredVariables = @(Get-SqlCmdReferenceName -Text $content)
     foreach ($requiredVariable in $requiredVariables) {
+        [void]$requiredVariableNames.Add($requiredVariable)
         if (-not $normalizedVariables.ContainsKey($requiredVariable)) {
             throw "Instance script '$($script.Name)' requires SQLCMD variable '$requiredVariable'."
         }
+    }
+    $scriptVariables = [ordered]@{}
+    foreach ($requiredVariable in $requiredVariables) {
+        $scriptVariables[$requiredVariable] = $normalizedVariables[$requiredVariable]
+    }
+    $resolution = Resolve-SqlCmdScript `
+        -Path $script.FullName `
+        -ExternalVariables $scriptVariables `
+        -DisallowSetVariableDirectives `
+        -RequireExactExternalVariables
+    if ($resolution.SanitizedText -notmatch '(?is)\bIF\b.*\bEXISTS\b') {
+        throw "Instance script '$($script.Name)' must guard create/update behavior with an existence check."
+    }
+    if (
+        $resolution.SanitizedText -match
+            '(?is)\bDROP\s+(?:LOGIN|CREDENTIAL)\b|\bsp_delete_job\b'
+    ) {
+        throw "Instance script '$($script.Name)' contains a prohibited destructive operation."
+    }
+    $scriptResolutions[$script.FullName] = $resolution
+}
+foreach ($variableName in $normalizedVariables.Keys) {
+    if (-not $requiredVariableNames.Contains([string]$variableName)) {
+        throw "SQLCMD variable '$variableName' is not referenced by any instance script."
     }
 }
 
 $invokeSqlcmd = $null
 $serverInstance = "tcp:$ServerName,$Port"
-$sqlcmdVariableArguments = @(
-    $normalizedVariables.GetEnumerator() |
-        Sort-Object Key |
-        ForEach-Object { "$($_.Key)=$($_.Value)" }
-)
 
+$scriptIndex = 0
 foreach ($script in $scripts) {
+    $scriptIndex++
+    $resolution = $scriptResolutions[$script.FullName]
+    Write-Information (
+        "Validated instance script $scriptIndex/$($scripts.Count) '$($script.Name)' " +
+        "for '$serverInstance/$DatabaseName'; sanitized SHA-256: " +
+        $resolution.SanitizedSha256
+    ) -InformationAction Continue
     if (-not $PSCmdlet.ShouldProcess(
         "$serverInstance/$DatabaseName",
         "Execute instance script $($script.Name)"
@@ -106,8 +128,9 @@ foreach ($script in $scripts) {
         -ServerInstance $serverInstance `
         -Database $DatabaseName `
         -AccessToken $AccessToken `
-        -InputFile $script.FullName `
-        -Variable $sqlcmdVariableArguments `
+        -Query $resolution.SanitizedText `
+        -DisableCommands `
+        -DisableVariables `
         -AbortOnError `
         -Encrypt Mandatory `
         -TrustServerCertificate:$false `

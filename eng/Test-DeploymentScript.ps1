@@ -490,6 +490,119 @@ function Read-SqlIdentifierPath {
             }
         }
     }
+
+function Test-ConstantDynamicDdl {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+    $tokens = @(ConvertTo-SqlToken -Text (ConvertTo-CodeOnly -Text $Text))
+    $objectTypes = @(
+        'TABLE',
+        'VIEW',
+        'PROCEDURE',
+        'PROC',
+        'FUNCTION',
+        'INDEX',
+        'SCHEMA',
+        'TRIGGER',
+        'TYPE',
+        'SEQUENCE',
+        'SYNONYM',
+        'DATABASE',
+        'ROLE',
+        'USER',
+        'LOGIN'
+    )
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        if ($tokens[$index].Kind -ne 'Word') {
+            continue
+        }
+        $verb = $tokens[$index].Value
+        if ($verb -eq 'TRUNCATE') {
+            if (
+                $index + 1 -lt $tokens.Count -and
+                $tokens[$index + 1].Kind -eq 'Word' -and
+                $tokens[$index + 1].Value -eq 'TABLE'
+            ) {
+                return $true
+            }
+            continue
+        }
+        if ($verb -in @('ALTER', 'DROP')) {
+            if (
+                $index + 1 -lt $tokens.Count -and
+                $tokens[$index + 1].Kind -eq 'Word' -and
+                $tokens[$index + 1].Value -in $objectTypes
+            ) {
+                return $true
+            }
+            continue
+        }
+        if ($verb -ne 'CREATE') {
+            continue
+        }
+
+        $cursor = $index + 1
+        if (
+            $cursor + 1 -lt $tokens.Count -and
+            $tokens[$cursor].Kind -eq 'Word' -and
+            $tokens[$cursor].Value -eq 'OR' -and
+            $tokens[$cursor + 1].Kind -eq 'Word' -and
+            $tokens[$cursor + 1].Value -eq 'ALTER'
+        ) {
+            $cursor += 2
+        }
+        if (
+            $cursor -lt $tokens.Count -and
+            $tokens[$cursor].Kind -eq 'Word' -and
+            $tokens[$cursor].Value -in $objectTypes
+        ) {
+            return $true
+        }
+
+        $sawIndexModifier = $false
+        while ($cursor -lt $tokens.Count) {
+            if ($tokens[$cursor].Kind -eq 'Symbol' -and $tokens[$cursor].Value -eq ';') {
+                break
+            }
+            if ($tokens[$cursor].Kind -ne 'Word') {
+                break
+            }
+            if ($tokens[$cursor].Value -eq 'INDEX') {
+                return $sawIndexModifier
+            }
+            if (
+                $tokens[$cursor].Value -in @(
+                    'UNIQUE',
+                    'CLUSTERED',
+                    'NONCLUSTERED',
+                    'COLUMNSTORE'
+                )
+            ) {
+                $sawIndexModifier = $true
+                $cursor++
+                continue
+            }
+            while (
+                $cursor -lt $tokens.Count -and
+                -not (
+                    $tokens[$cursor].Kind -eq 'Symbol' -and
+                    $tokens[$cursor].Value -eq ';'
+                )
+            ) {
+                if (
+                    $tokens[$cursor].Kind -eq 'Word' -and
+                    $tokens[$cursor].Value -eq 'INDEX'
+                ) {
+                    return $true
+                }
+                $cursor++
+            }
+            break
+        }
+    }
+    return $false
+}
+
 function ConvertFrom-ConstantSqlExpression {
     param(
         [Parameter(Mandatory)][string]$Text,
@@ -792,7 +905,7 @@ function Add-DynamicExecutionFinding {
             -StartLine $findingLine `
             -Rules $Rules `
             -Findings $Findings
-        if ($dynamicCodeOnly -match '(?is)\b(?:(?:CREATE|ALTER|DROP)\s+(?:TABLE|VIEW|PROCEDURE|PROC|FUNCTION|INDEX|SCHEMA|TRIGGER|TYPE|SEQUENCE|SYNONYM|DATABASE|ROLE|USER|LOGIN)|TRUNCATE\s+TABLE)\b') {
+        if (Test-ConstantDynamicDdl -Text $dynamicSql) {
             $Findings.Add([pscustomobject]@{
                 Rule = 'DEPLOY008'
                 Severity = 'error'

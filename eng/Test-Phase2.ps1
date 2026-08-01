@@ -252,7 +252,107 @@ try {
         }
         WhatIf = $true
     }
-    & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') @instanceArguments
+    $instanceWhatIfOutput = @(
+        & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') @instanceArguments *>&1
+    )
+    $instanceWhatIfLines = @($instanceWhatIfOutput | ForEach-Object { $_.ToString() })
+    $instanceWhatIfText = $instanceWhatIfLines -join "`n"
+    $instanceWhatIfHashes = @(
+        [regex]::Matches(
+            $instanceWhatIfText,
+            '(?i)sanitized SHA-256:\s*(?<hash>[A-F0-9]{64})'
+        ) |
+            ForEach-Object { $_.Groups['hash'].Value }
+    )
+    Assert-True `
+        -Condition (
+            $instanceWhatIfLines.Count -eq 3 -and
+            @($instanceWhatIfLines | Where-Object {
+                $_ -notmatch (
+                    "^Validated instance script \d/2 '\d{3}-[A-Za-z0-9-]+\.sql' " +
+                    "for 'tcp:sqlmi\.example\.test,1433/master'; sanitized SHA-256: " +
+                    '[A-F0-9]{64}$'
+                ) -and
+                $_ -cne 'Processed 2 instance object script(s) in filename order.'
+            }).Count -eq 0 -and
+            $instanceWhatIfHashes.Count -eq 2 -and
+            $instanceWhatIfText -match '001-entra-login\.sql' -and
+            $instanceWhatIfText -match '010-agent-job\.sql' -and
+            $instanceWhatIfText -match 'tcp:sqlmi\.example\.test,1433/master' -and
+            $instanceWhatIfText -notmatch 'fixture-token|example-deployer|CREATE LOGIN|sp_add_job'
+        ) `
+        -Message 'Instance WhatIf output must contain only file order, target, and sanitized hashes.'
+    $instanceSqlCmdCallPath = Join-Path $temporaryPath 'instance-sqlcmd-calls.jsonl'
+    $env:PHASE2_SQLCMD_MOCK_PATH = $instanceSqlCmdCallPath
+    function global:Invoke-Sqlcmd {
+        [CmdletBinding()]
+        param(
+            [string]$ServerInstance,
+            [string]$Database,
+            [string]$AccessToken,
+            [string]$Query,
+            [switch]$DisableCommands,
+            [switch]$DisableVariables,
+            [switch]$AbortOnError,
+            [string]$Encrypt,
+            [switch]$TrustServerCertificate,
+            [int]$QueryTimeout,
+            [int]$ConnectionTimeout
+        )
+
+        $queryHash = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Query))
+        )
+        [pscustomobject]@{
+            ServerInstance = $ServerInstance
+            Database = $Database
+            AccessTokenLength = $AccessToken.Length
+            QueryContainsCreateLogin = $Query -match 'CREATE LOGIN'
+            QueryContainsAddJob = $Query -match 'sp_add_job'
+            QueryContainsVariable = $Query -match '\$\('
+            QuerySha256 = $queryHash
+            DisableCommands = $DisableCommands.IsPresent
+            DisableVariables = $DisableVariables.IsPresent
+            AbortOnError = $AbortOnError.IsPresent
+            Encrypt = $Encrypt
+            TrustServerCertificate = $TrustServerCertificate.IsPresent
+            QueryTimeout = $QueryTimeout
+            ConnectionTimeout = $ConnectionTimeout
+        } |
+            ConvertTo-Json -Compress |
+            Add-Content -Path $env:PHASE2_SQLCMD_MOCK_PATH -Encoding utf8
+    }
+    try {
+        $executeInstanceArguments = @{} + $instanceArguments
+        [void]$executeInstanceArguments.Remove('WhatIf')
+        & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
+            @executeInstanceArguments `
+            -Confirm:$false
+    }
+    finally {
+        Remove-Item Function:\global:Invoke-Sqlcmd -Force
+        Remove-Item Env:\PHASE2_SQLCMD_MOCK_PATH -ErrorAction SilentlyContinue
+    }
+    $instanceSqlCmdCalls = @(
+        Get-Content -Path $instanceSqlCmdCallPath |
+            ForEach-Object { $_ | ConvertFrom-Json }
+    )
+    Assert-True `
+        -Condition (
+            $instanceSqlCmdCalls.Count -eq 2 -and
+            $instanceSqlCmdCalls[0].QueryContainsCreateLogin -and
+            $instanceSqlCmdCalls[1].QueryContainsAddJob -and
+            $instanceSqlCmdCalls[0].QuerySha256 -ceq $instanceWhatIfHashes[0] -and
+            $instanceSqlCmdCalls[1].QuerySha256 -ceq $instanceWhatIfHashes[1] -and
+            @($instanceSqlCmdCalls | Where-Object {
+                -not $_.DisableCommands -or
+                -not $_.DisableVariables -or
+                -not $_.AbortOnError -or
+                $_.TrustServerCertificate -or
+                $_.QueryContainsVariable
+            }).Count -eq 0
+        ) `
+        -Message 'Current instance examples must execute sanitized in-memory SQL in filename order with secondary parsing disabled.'
     Assert-Throws {
         & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
             -ServerName 'sqlmi.example.test' `
@@ -264,6 +364,66 @@ try {
             } `
             -WhatIf
     } 'Missing instance SQLCMD variables should fail validation, including under WhatIf.'
+    $instanceFixturePath = Join-Path $temporaryPath 'instance-script-fixture'
+    New-Item -ItemType Directory -Force -Path $instanceFixturePath | Out-Null
+    foreach ($case in @(
+        @{ Name = 'direct-include'; Sql = ':r C:\payload.sql'; Variables = @{} },
+        @{ Name = 'direct-quit'; Sql = ':quit'; Variables = @{} },
+        @{ Name = 'direct-ignore'; Sql = ':on error ignore'; Variables = @{} },
+        @{ Name = 'direct-shell'; Sql = '!! whoami'; Variables = @{} },
+        @{ Name = 'expanded-quit'; Sql = ':$(Command)'; Variables = @{ Command = 'quit' } },
+        @{ Name = 'expanded-ignore'; Sql = ':on error $(Mode)'; Variables = @{ Mode = 'ignore' } },
+        @{
+            Name = 'embedded-setvar'
+            Sql = ":setvar Command `":quit`"`n`$(Command)"
+            Variables = @{ Command = 'benign' }
+        }
+    )) {
+        Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
+        @(
+            '-- Idempotency: fixture precondition'
+            'IF EXISTS (SELECT 1) PRINT N''fixture'';'
+            $case.Sql
+        ) | Set-Content `
+            -Path (Join-Path $instanceFixturePath "001-$($case.Name).sql") `
+            -Encoding utf8
+        Assert-Throws {
+            & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
+                -ServerName 'sqlmi.example.test' `
+                -AccessToken 'fixture-token' `
+                -ScriptPath $instanceFixturePath `
+                -SqlcmdVariables $case.Variables `
+                -WhatIf
+        } "Instance SQLCMD control case '$($case.Name)' must fail closed, including under WhatIf."
+    }
+    Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
+    @(
+        '-- Idempotency: fixture precondition'
+        'IF EXISTS (SELECT 1) PRINT N''$(RequiredName)'';'
+    ) | Set-Content `
+        -Path (Join-Path $instanceFixturePath '001-extra-variable.sql') `
+        -Encoding utf8
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
+            -ServerName 'sqlmi.example.test' `
+            -AccessToken 'fixture-token' `
+            -ScriptPath $instanceFixturePath `
+            -SqlcmdVariables @{ RequiredName = 'expected'; ExtraName = 'unexpected' } `
+            -WhatIf
+    } 'Instance deployment must reject extra SQLCMD variables, including under WhatIf.'
+    Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
+    @(
+        '-- Idempotency: fixture precondition'
+        'IF EXISTS (SELECT 1) PRINT N''`$(NotAVariable)'';'
+    ) | Set-Content `
+        -Path (Join-Path $instanceFixturePath '001-escaped-reference.sql') `
+        -Encoding utf8
+    & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
+        -ServerName 'sqlmi.example.test' `
+        -AccessToken 'fixture-token' `
+        -ScriptPath $instanceFixturePath `
+        -SqlcmdVariables @{} `
+        -WhatIf
 
     & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
         -ScriptPath (Join-Path $fixtures 'deployment-safe.sql') `
@@ -296,7 +456,15 @@ try {
         @{ Name = 'omitted-schema-sp-rename'; Sql = 'EXEC master..sp_rename N''dbo.OldName'', N''NewName'';' },
         @{ Name = 'malformed-trailing-dot'; Sql = 'EXEC master..benignProc.;' },
         @{ Name = 'malformed-five-part'; Sql = 'EXEC server.database.schema.extra.benignProc @p=1;' },
-        @{ Name = 'malformed-missing-final'; Sql = 'EXEC master..;' }
+        @{ Name = 'malformed-missing-final'; Sql = 'EXEC master..;' },
+        @{ Name = 'dynamic-create-unique-index'; Sql = "EXEC(N'CREATE UNIQUE INDEX [IX_T] ON [dbo].[T]([Id]);');" },
+        @{ Name = 'dynamic-create-clustered-index'; Sql = "EXEC(N'CREATE CLUSTERED INDEX [IX_T] ON [dbo].[T]([Id]);');" },
+        @{ Name = 'dynamic-create-unique-nonclustered-index'; Sql = "EXEC(N'CREATE UNIQUE NONCLUSTERED INDEX [IX_T] ON [dbo].[T]([Id]);');" },
+        @{ Name = 'dynamic-create-columnstore-index'; Sql = "EXEC(N'CREATE COLUMNSTORE INDEX [IX_T] ON [dbo].[T]([Id]);');" },
+        @{ Name = 'dynamic-create-modifier-comments'; Sql = "EXEC(N'CREATE /* review */ UNIQUE`nNONCLUSTERED /* gap */ INDEX [IX_T] ON [dbo].[T]([Id]);');" },
+        @{ Name = 'dynamic-create-unknown-modifier'; Sql = "EXEC(N'CREATE UNIQUE HASH INDEX [IX_T] ON [dbo].[T]([Id]);');" },
+        @{ Name = 'dynamic-create-xml-index'; Sql = "EXEC(N'CREATE XML INDEX [IX_T] ON [dbo].[T]([Payload]);');" },
+        @{ Name = 'dynamic-create-spatial-index'; Sql = "EXEC(N'CREATE SPATIAL INDEX [IX_T] ON [dbo].[T]([Shape]);');" }
     )
     foreach ($case in $dynamicPolicyCases) {
         $casePath = Join-Path $temporaryPath "$($case.Name).sql"
@@ -318,6 +486,7 @@ try {
         @{ Name = 'static-procedure'; Sql = 'EXEC dbo.StoredProcedure @p = 1;' },
         @{ Name = 'static-return-procedure'; Sql = 'EXEC @rc = dbo.StoredProcedure @p = 1;' },
         @{ Name = 'constant-select'; Sql = "EXEC(N'SELECT 1;');" },
+        @{ Name = 'constant-select-ddl-text'; Sql = "EXEC(N'SELECT N''CREATE UNIQUE INDEX [IX_T] ON [dbo].[T]([Id])'';');" },
         @{ Name = 'named-constant-select'; Sql = "EXEC sys.sp_executesql @stmt = N'SELECT 1;';" },
         @{ Name = 'nested-comment'; Sql = '/* outer /* nested */ EXEC(N''DROP TABLE dbo.Hidden''); */ SELECT 1;' },
         @{ Name = 'bracket-apostrophe'; Sql = 'CREATE TABLE [dbo].[O''Brien] ([Id] int NOT NULL);' },
@@ -361,6 +530,14 @@ PRINT N'`$(NotAVariable)';
         @{ Name = 'sqlcmd-after-line-comment-quote'; Sql = "-- '`n:quit`nSELECT 1;" },
         @{ Name = 'sqlcmd-after-line-comment-bracket'; Sql = "-- [`n:exit`nSELECT 1;" },
         @{ Name = 'sqlcmd-after-line-comment-double-quote'; Sql = "-- `"`n:connect tcp:other.example.test`nSELECT 1;" },
+        @{ Name = 'sqlcmd-expanded-include'; Sql = ":setvar C `":r C:\payload.sql`"`n`$(C)" },
+        @{ Name = 'sqlcmd-expanded-quit'; Sql = ":setvar C `":quit`"`n`$(C)" },
+        @{ Name = 'sqlcmd-expanded-ignore'; Sql = ":setvar C `":on error ignore`"`n`$(C)" },
+        @{ Name = 'sqlcmd-expanded-shell'; Sql = ":setvar C `"!! whoami`"`n`$(C)" },
+        @{ Name = 'sqlcmd-expanded-leading-space'; Sql = ":setvar C `"   :QuIt`"`n`$(C)" },
+        @{ Name = 'sqlcmd-expanded-concat-command'; Sql = ":setvar C `"quit`"`n:`$(C)" },
+        @{ Name = 'sqlcmd-command-in-bracket-identifier'; Sql = "SELECT [first`n:quit`nlast];" },
+        @{ Name = 'sqlcmd-command-in-quoted-identifier'; Sql = "SELECT `"first`n!! whoami`nlast`";" },
         @{ Name = 'alter-long-whitespace'; Sql = "ALTER TABLE [dbo].[T] $(' ' * 1001) DROP COLUMN [C];" },
         @{ Name = 'alter-very-long-whitespace'; Sql = "ALTER TABLE [dbo].[T] $(' ' * 10000) DROP CONSTRAINT [DF_T_C];" },
         @{ Name = 'alter-nested-comment'; Sql = "ALTER TABLE [dbo].[T] /* outer /* $('x' * 1500) */ outer */ DROP COLUMN [C];" },
@@ -499,7 +676,9 @@ PRINT N'`$(NotAVariable)';
     Assert-True `
         -Condition (
             $deploymentExecutorText -match 'Invoke-Sqlcmd' -and
-            $deploymentExecutorText -match 'InputFile\s*=\s*\$sanitizedPath' -and
+            $deploymentExecutorText -match 'Query\s*=\s*\$sqlCmdResolution\.SanitizedText' -and
+            $deploymentExecutorText -notmatch '\bInputFile\s*=' -and
+            $deploymentExecutorText -notmatch '\$sanitizedPath' -and
             $deploymentExecutorText -match 'AccessToken\s*=\s*\$AccessToken' -and
             $deploymentExecutorText -match 'AbortOnError\s*=\s*\$true' -and
             $deploymentExecutorText -match 'DisableCommands\s*=\s*\$true' -and
@@ -507,10 +686,9 @@ PRINT N'`$(NotAVariable)';
             $deploymentExecutorText -match 'ExpectedSanitizedSha256' -and
             $deploymentExecutorText -match 'SanitizedSha256\s+-cne' -and
             $deploymentExecutorText -match "Encrypt\s*=\s*'Mandatory'" -and
-            $deploymentExecutorText -match 'TrustServerCertificate\s*=\s*\$false' -and
-            $deploymentExecutorText -match 'finally\s*\{[\s\S]*?Remove-Item\s+-Path\s+\$sanitizedPath'
+            $deploymentExecutorText -match 'TrustServerCertificate\s*=\s*\$false'
         ) `
-        -Message 'Exact execution must use sanitized SQL, disable secondary SQLCMD parsing, and delete its temporary file.'
+        -Message 'Exact execution must pass validated sanitized SQL in memory and disable secondary SQLCMD parsing.'
     Assert-Throws {
         & (Join-Path $PSScriptRoot 'Invoke-ValidatedDeploymentScript.ps1') `
             -ServerName 'sqlmi.example.test' `
@@ -519,6 +697,68 @@ PRINT N'`$(NotAVariable)';
             -ScriptPath (Join-Path $fixtures 'deployment-safe.sql') `
             -ExpectedSanitizedSha256 ('0' * 64)
     } 'Exact execution must reject a sanitized SQL hash that differs from the policy gate output.'
+    Import-Module (Join-Path $PSScriptRoot 'SqlCmd.Common.psm1') -Force
+    $executorFixturePath = Join-Path $fixtures 'deployment-safe.sql'
+    $executorResolution = Resolve-SqlCmdScript -Path $executorFixturePath
+    $deploymentQueryCallPath = Join-Path $temporaryPath 'deployment-query-call.json'
+    $env:PHASE2_SQLCMD_MOCK_PATH = $deploymentQueryCallPath
+    function global:Invoke-Sqlcmd {
+        [CmdletBinding()]
+        param(
+            [string]$ServerInstance,
+            [string]$Database,
+            [string]$AccessToken,
+            [string]$Query,
+            [switch]$DisableCommands,
+            [switch]$DisableVariables,
+            [switch]$AbortOnError,
+            [string]$Encrypt,
+            [switch]$TrustServerCertificate,
+            [int]$ConnectionTimeout,
+            [int]$QueryTimeout
+        )
+
+        [pscustomobject]@{
+            ServerInstance = $ServerInstance
+            Database = $Database
+            AccessTokenLength = $AccessToken.Length
+            QuerySha256 = [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData(
+                    [Text.Encoding]::UTF8.GetBytes($Query)
+                )
+            )
+            DisableCommands = $DisableCommands.IsPresent
+            DisableVariables = $DisableVariables.IsPresent
+            AbortOnError = $AbortOnError.IsPresent
+            Encrypt = $Encrypt
+            TrustServerCertificate = $TrustServerCertificate.IsPresent
+            ConnectionTimeout = $ConnectionTimeout
+            QueryTimeout = $QueryTimeout
+        } |
+            ConvertTo-Json -Compress |
+            Set-Content -Path $env:PHASE2_SQLCMD_MOCK_PATH -Encoding utf8
+    }
+    try {
+        & (Join-Path $PSScriptRoot 'Invoke-ValidatedDeploymentScript.ps1') `
+            -ServerName 'sqlmi.example.test' `
+            -DatabaseName 'AppDb' `
+            -AccessToken 'fixture-token' `
+            -ScriptPath $executorFixturePath `
+            -ExpectedSanitizedSha256 $executorResolution.SanitizedSha256
+    }
+    finally {
+        Remove-Item Function:\global:Invoke-Sqlcmd -Force
+        Remove-Item Env:\PHASE2_SQLCMD_MOCK_PATH -ErrorAction SilentlyContinue
+    }
+    $deploymentQueryCall = Get-Content -Path $deploymentQueryCallPath -Raw | ConvertFrom-Json
+    Assert-True `
+        -Condition (
+            $deploymentQueryCall.QuerySha256 -ceq $executorResolution.SanitizedSha256 -and
+            $deploymentQueryCall.DisableCommands -and
+            $deploymentQueryCall.DisableVariables -and
+            $deploymentQueryCall.AbortOnError
+        ) `
+        -Message 'Deployment execution Query must be the exact policy-validated sanitized SQL hash.'
 
     $injectionMarker = Join-Path $temporaryPath 'pipeline-parameter-injection.txt'
     $env:PHASE2_WARNING_PAYLOAD = "46010`"; Set-Content -Path '$injectionMarker' -Value injected; #"
