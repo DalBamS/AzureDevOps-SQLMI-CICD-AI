@@ -1,0 +1,125 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - database/**
+      - eng/**
+      - tests/**
+      - pipelines/**
+      - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - main
+
+parameters:
+  - name: deployDev
+    displayName: Deploy to Dev
+    type: boolean
+    default: false
+  - name: deployTest
+    displayName: Deploy to Test
+    type: boolean
+    default: false
+  - name: deployProd
+    displayName: Deploy to Production
+    type: boolean
+    default: false
+  - name: privateAgentPool
+    displayName: SQL MI private agent pool
+    type: string
+    default: sqlmi-private-agents
+  - name: azureServiceConnection
+    displayName: Azure workload identity service connection
+    type: string
+    default: sc-sqlmi-wif
+
+variables:
+  artifactName: database
+  sqlPackageVersion: 170.4.83
+
+stages:
+  - stage: Build
+    displayName: Build and validate
+    jobs:
+      - job: BuildDacpac
+        displayName: Build DACPAC
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UseDotNet@2
+            displayName: Use .NET 10 SDK
+            inputs:
+              packageType: sdk
+              version: 10.x
+
+          - pwsh: ./eng/Build.ps1 -DacVersion "1.0.$(Build.BuildId).0"
+            displayName: Build SQL project
+
+          - pwsh: ./eng/Test-SqlPolicy.ps1
+            displayName: Run deterministic SQL policy
+
+          - publish: artifacts/dacpac
+            artifact: $(artifactName)
+            displayName: Publish immutable DACPAC
+
+          - publish: artifacts/sql-policy-report.md
+            artifact: sql-policy-report
+            displayName: Publish policy report
+
+      - job: IntegrationTest
+        displayName: Deploy and smoke test SQL Server 2022
+        dependsOn: BuildDacpac
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UseDotNet@2
+            displayName: Use .NET 10 SDK
+            inputs:
+              packageType: sdk
+              version: 10.x
+
+          - download: current
+            artifact: $(artifactName)
+
+          - pwsh: |
+              New-Item -ItemType Directory -Force -Path artifacts/dacpac | Out-Null
+              Copy-Item "$(Pipeline.Workspace)/$(artifactName)/App.Database.dacpac" artifacts/dacpac/
+              ./eng/Test-Database.ps1 -SkipBuild
+            displayName: Run database integration tests
+
+  - template: pipelines/templates/deploy-stage.yml
+    parameters:
+      stageName: Dev
+      displayName: Deploy Dev
+      environmentName: sqlmi-dev
+      variableGroup: sqlmi-dev
+      agentPool: ${{ parameters.privateAgentPool }}
+      azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      enabled: ${{ parameters.deployDev }}
+      dependsOn: Build
+
+  - template: pipelines/templates/deploy-stage.yml
+    parameters:
+      stageName: Test
+      displayName: Deploy Test
+      environmentName: sqlmi-test
+      variableGroup: sqlmi-test
+      agentPool: ${{ parameters.privateAgentPool }}
+      azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      enabled: ${{ and(parameters.deployDev, parameters.deployTest) }}
+      dependsOn: DeployDev
+
+  - template: pipelines/templates/deploy-stage.yml
+    parameters:
+      stageName: Prod
+      displayName: Deploy Production
+      environmentName: sqlmi-prod
+      variableGroup: sqlmi-prod
+      agentPool: ${{ parameters.privateAgentPool }}
+      azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      enabled: ${{ and(parameters.deployDev, parameters.deployTest, parameters.deployProd) }}
+      dependsOn: DeployTest

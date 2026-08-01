@@ -1,0 +1,8 @@
+**/bin/
+**/obj/
+.env
+.tools/
+artifacts/
+TestResults/
+*.bacpac
+*.publish.xml.user
