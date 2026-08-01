@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build">
+  <Sdk Name="Microsoft.Build.Sql" Version="2.2.0" />
+
+  <PropertyGroup>
+    <Name>App.Database</Name>
+    <DacApplicationName>App.Database</DacApplicationName>
+    <DacDescription>Reference Azure SQL Managed Instance database project.</DacDescription>
+    <DacVersion Condition="'$(DacVersion)' == ''">1.0.0.0</DacVersion>
+    <DSP>Microsoft.Data.Tools.Schema.Sql.Sql160DatabaseSchemaProvider</DSP>
+    <ModelCollation>1033, CI</ModelCollation>
+    <DefaultSchema>dbo</DefaultSchema>
+    <RunSqlCodeAnalysis>true</RunSqlCodeAnalysis>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <TreatTSqlWarningsAsErrors>true</TreatTSqlWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Build Remove="Scripts\**\*.sql" />
+    <PostDeploy Include="Scripts\PostDeployment.sql" />
+  </ItemGroup>
+</Project>
