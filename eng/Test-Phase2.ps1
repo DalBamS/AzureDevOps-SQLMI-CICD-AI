@@ -1880,6 +1880,58 @@ SELECT N'$(DatabaseName)', N'$(DefaultFilePrefix)', N'$(DefaultDataPath)', N'$(D
     Assert-True `
         -Condition ($templateText -notmatch '\$\{\{\s*each[^\r\n]*databaseNames') `
         -Message 'Runtime databaseNames must not be expanded by a compile-time each expression.'
+    $planJob = [regex]::Match(
+        $templateText,
+        '(?s)- job: GeneratePlan(?<job>.*?)(?=\r?\n\s+- stage: Deploy)'
+    ).Groups['job'].Value
+    $planModuleDisplayIndex = $planJob.IndexOf(
+        'displayName: Prepare pinned SQL plan module',
+        [StringComparison]::Ordinal
+    )
+    $planModuleStartIndex = if ($planModuleDisplayIndex -ge 0) {
+        $planJob.LastIndexOf(
+            '- pwsh: |',
+            $planModuleDisplayIndex,
+            [StringComparison]::Ordinal
+        )
+    }
+    else {
+        -1
+    }
+    $planModuleSetup = if ($planModuleStartIndex -ge 0) {
+        $planJob.Substring(
+            $planModuleStartIndex,
+            $planModuleDisplayIndex - $planModuleStartIndex
+        )
+    }
+    else {
+        ''
+    }
+    $planScriptText = Get-Content `
+        -Path (Join-Path $PSScriptRoot 'New-DatabaseDeploymentPlan.ps1') `
+        -Raw
+    Assert-True `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($planJob) -and
+            -not [string]::IsNullOrWhiteSpace($planModuleSetup) -and
+            $planModuleSetup -match (
+                '(?s)\$requiredVersion\s*=\s*\[version\]["'']\$\(sqlServerModuleVersion\)["'']' +
+                '.*?Get-Module\s+-ListAvailable\s+-Name\s+SqlServer' +
+                '.*?Where-Object\s+Version\s+-eq\s+\$requiredVersion' +
+                '.*?Install-Module.*?-Name\s+SqlServer' +
+                '.*?-RequiredVersion\s+\$requiredVersion' +
+                '.*?-Repository\s+PSGallery' +
+                '.*?-Scope\s+CurrentUser' +
+                '.*?Import-Module\s+SqlServer\s+-RequiredVersion\s+\$requiredVersion'
+            ) -and
+            $planModuleStartIndex -lt
+                $planJob.IndexOf(
+                    './eng/New-DatabaseDeploymentPlan.ps1',
+                    [StringComparison]::Ordinal
+                ) -and
+            $planScriptText -match "Test-DeploymentScript\.ps1"
+        ) `
+        -Message 'The Plan job must prepare the exact pinned SqlServer module before deployment policy parsing.'
     Assert-True `
         -Condition ($templateText -match 'DeployInstanceObjects[\s\S]+dependsOn:\s*DeployDacpac') `
         -Message 'Instance object deployment must depend on successful DACPAC rollout.'

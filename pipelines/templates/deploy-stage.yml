@@ -82,6 +82,22 @@ stages:
               }
             displayName: Install pinned SqlPackage
 
+          - pwsh: |
+              $requiredVersion = [version]"$(sqlServerModuleVersion)"
+              $installed = Get-Module -ListAvailable -Name SqlServer |
+                Where-Object Version -eq $requiredVersion
+              if (-not $installed) {
+                Install-Module `
+                  -Name SqlServer `
+                  -RequiredVersion $requiredVersion `
+                  -Repository PSGallery `
+                  -Scope CurrentUser `
+                  -Force `
+                  -AllowClobber
+              }
+              Import-Module SqlServer -RequiredVersion $requiredVersion -Force
+            displayName: Prepare pinned SQL plan module
+
           - task: AzureCLI@2
             displayName: Generate representative deployment plan
             inputs:
