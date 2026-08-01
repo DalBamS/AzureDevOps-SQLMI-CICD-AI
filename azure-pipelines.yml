@@ -125,6 +125,22 @@ stages:
             env:
               VALIDATED_SUPPRESS_TSQL_WARNINGS: ${{ parameters.validatedSuppressTSqlWarnings }}
 
+          - pwsh: |
+              $requiredVersion = [version]'$(sqlServerModuleVersion)'
+              $installed = Get-Module -ListAvailable -Name SqlServer |
+                Where-Object Version -eq $requiredVersion |
+                Select-Object -First 1
+              if (-not $installed) {
+                Install-Module `
+                  -Name SqlServer `
+                  -RequiredVersion $requiredVersion `
+                  -Scope CurrentUser `
+                  -Repository PSGallery `
+                  -Force `
+                  -AllowClobber
+              }
+            displayName: Install pinned SQL batch parser
+
           - pwsh: ./eng/Test-SqlPolicy.ps1
             displayName: Run deterministic SQL policy
 

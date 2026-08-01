@@ -1,5 +1,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:SqlServerModuleVersion = [version]'22.4.5.1'
+$script:ManagedBatchParserTypes = $null
 
 function Get-TextSha256 {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
@@ -771,104 +773,162 @@ function Get-SqlBareProcedureInvocation {
     return $invocations.ToArray()
 }
 
+function Get-SqlManagedBatchParserTypes {
+    if ($script:ManagedBatchParserTypes) {
+        return $script:ManagedBatchParserTypes
+    }
+
+    $moduleCandidates = @(
+        Get-Module -ListAvailable -Name SqlServer |
+            Where-Object Version -eq $script:SqlServerModuleVersion |
+            Sort-Object ModuleBase
+    )
+    if ($moduleCandidates.Count -eq 0) {
+        throw (
+            "The pinned SqlServer PowerShell module $script:SqlServerModuleVersion is " +
+            'required for deterministic SQL batch parsing.'
+        )
+    }
+
+    $assemblyRelativePath = if ($PSVersionTable.PSEdition -eq 'Core') {
+        [IO.Path]::Combine('coreclr', 'Microsoft.SqlTools.ManagedBatchParser.dll')
+    }
+    else {
+        'Microsoft.SqlTools.ManagedBatchParser.dll'
+    }
+    $assemblyPaths = @(
+        $moduleCandidates |
+            ForEach-Object {
+                [IO.Path]::GetFullPath(
+                    [IO.Path]::Combine($_.ModuleBase, $assemblyRelativePath)
+                )
+            } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+    )
+    if ($assemblyPaths.Count -eq 0) {
+        throw (
+            'The pinned SqlServer module does not contain the expected managed batch ' +
+            'parser assembly.'
+        )
+    }
+
+    $assembly = @(
+        [AppDomain]::CurrentDomain.GetAssemblies() |
+            Where-Object {
+                $_.GetName().Name -eq 'Microsoft.SqlTools.ManagedBatchParser'
+            }
+    ) | Select-Object -First 1
+    if ($assembly) {
+        $loadedPath = [IO.Path]::GetFullPath($assembly.Location)
+        if ($loadedPath -notin $assemblyPaths) {
+            throw (
+                'A managed batch parser from outside pinned SqlServer module ' +
+                "$script:SqlServerModuleVersion is already loaded."
+            )
+        }
+    }
+    else {
+        Import-Module `
+            -Name $moduleCandidates[0].Path `
+            -Scope Local `
+            -Force `
+            -ErrorAction Stop
+        $assembly = @(
+            [AppDomain]::CurrentDomain.GetAssemblies() |
+                Where-Object {
+                    $_.GetName().Name -eq 'Microsoft.SqlTools.ManagedBatchParser' -and
+                    [IO.Path]::GetFullPath($_.Location) -in $assemblyPaths
+                }
+        ) | Select-Object -First 1
+    }
+    if (-not $assembly) {
+        throw (
+            'Failed to load the managed batch parser from pinned SqlServer module ' +
+            "$script:SqlServerModuleVersion."
+        )
+    }
+
+    $wrapperType = $assembly.GetType(
+        'Microsoft.SqlTools.ServiceLayer.BatchParser.BatchParserWrapper',
+        $false
+    )
+    $conditionsType = $assembly.GetType(
+        'Microsoft.SqlTools.ServiceLayer.BatchParser.ExecutionEngineCode.ExecutionEngineConditions',
+        $false
+    )
+    if (
+        -not $wrapperType -or
+        -not $conditionsType -or
+        -not $wrapperType.GetMethod(
+            'GetBatches',
+            [type[]]@([string], $conditionsType)
+        )
+    ) {
+        throw 'The pinned managed batch parser API has an unsupported shape.'
+    }
+
+    $script:ManagedBatchParserTypes = [pscustomobject]@{
+        Wrapper = $wrapperType
+        Conditions = $conditionsType
+    }
+    return $script:ManagedBatchParserTypes
+}
+
 function Get-SqlBatch {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
 
-    $batches = [System.Collections.Generic.List[object]]::new()
-    $batchLines = [System.Collections.Generic.List[string]]::new()
-    $state = 'Code'
-    $blockDepth = 0
-    $batchStartIndex = 0
-    $batchStartLine = 1
-    $lineStartIndex = 0
-    $lineNumber = 1
-    $batchIndex = 0
-
-    while ($lineStartIndex -le $Text.Length) {
-        $lineEndIndex = $lineStartIndex
-        while (
-            $lineEndIndex -lt $Text.Length -and
-            $Text[$lineEndIndex] -notin "`r", "`n"
-        ) {
-            $lineEndIndex++
+    $types = Get-SqlManagedBatchParserTypes
+    $parser = [Activator]::CreateInstance($types.Wrapper)
+    try {
+        $conditions = [Activator]::CreateInstance($types.Conditions)
+        # SQLCMD directives and variables are resolved by the stricter repository
+        # converter before this parser runs. Disable its second variable-expansion pass
+        # while retaining the same pinned GO grammar through BatchSeparator.
+        $conditions.IsSqlCmd = $false
+        $conditions.BatchSeparator = 'GO'
+        try {
+            $parsedBatches = @($parser.GetBatches($Text, $conditions))
         }
-        $line = $Text.Substring($lineStartIndex, $lineEndIndex - $lineStartIndex)
-        $newlineLength = 0
-        if ($lineEndIndex -lt $Text.Length) {
-            $newlineLength = 1
-            if (
-                $Text[$lineEndIndex] -eq "`r" -and
-                $lineEndIndex + 1 -lt $Text.Length -and
-                $Text[$lineEndIndex + 1] -eq "`n"
-            ) {
-                $newlineLength = 2
-            }
-        }
-        $goMatch = [regex]::Match(
-            $line,
-            '^[\t ]*GO(?:[\t ]+(?<Count>[0-9]+))?[\t ]*(?:--[^\r\n]*)?$',
-            [Text.RegularExpressions.RegexOptions]::IgnoreCase
-        )
-        $isGoCandidate = (
-            $state -eq 'Code' -and
-            [regex]::IsMatch(
-                $line,
-                '^[\t ]*GO(?=$|[\t ]|--|/\*|[-+])',
-                [Text.RegularExpressions.RegexOptions]::IgnoreCase
+        catch {
+            throw [InvalidOperationException]::new(
+                (
+                    'SQL batch parsing failed through pinned SqlServer module ' +
+                    "$script:SqlServerModuleVersion."
+                ),
+                $_.Exception.GetBaseException()
             )
-        )
-        if ($isGoCandidate -and -not $goMatch.Success) {
-            throw "SQL contains an invalid GO batch separator on physical line $lineNumber."
         }
-        if ($isGoCandidate -and $goMatch.Groups['Count'].Success) {
-            $count = 0
-            if (-not [int]::TryParse($goMatch.Groups['Count'].Value, [ref]$count)) {
-                throw (
-                    'SQL GO batch count must be a nonnegative Int32 value on physical ' +
-                    "line $lineNumber."
-                )
-            }
+    }
+    finally {
+        if ($parser) {
+            $parser.Dispose()
         }
-        $isGoSeparator = $state -eq 'Code' -and $goMatch.Success
-        if ($isGoSeparator) {
-            if (($batchLines -join "`n").Trim().Length -gt 0) {
-                $batches.Add([pscustomobject]@{
-                    BatchIndex = $batchIndex
-                    Text = $batchLines -join "`n"
-                    StartIndex = $batchStartIndex
-                    EndIndex = $lineStartIndex
-                    StartLine = $batchStartLine
-                })
-                $batchIndex++
-            }
-            $batchLines.Clear()
-            $batchStartIndex = $lineEndIndex + $newlineLength
-            $batchStartLine = $lineNumber + 1
-        }
-        else {
-            $batchLines.Add($line)
-            $lexicalState = Get-SqlLexicalState `
-                -Line $line `
-                -State $state `
-                -BlockDepth $blockDepth
-            $state = $lexicalState.State
-            $blockDepth = $lexicalState.BlockDepth
-        }
-        if ($newlineLength -eq 0) {
-            break
-        }
-        $lineStartIndex = $lineEndIndex + $newlineLength
-        $lineNumber++
     }
 
-    if (($batchLines -join "`n").Trim().Length -gt 0) {
+    $batches = [System.Collections.Generic.List[object]]::new()
+    $searchIndex = 0
+    $batchIndex = 0
+    foreach ($parsedBatch in $parsedBatches) {
+        $batchText = [string]$parsedBatch.BatchText
+        $startIndex = $Text.IndexOf(
+            $batchText,
+            $searchIndex,
+            [StringComparison]::Ordinal
+        )
+        if ($startIndex -lt 0) {
+            throw 'The pinned managed batch parser returned an unmappable batch.'
+        }
+        $endIndex = $startIndex + $batchText.Length
         $batches.Add([pscustomobject]@{
             BatchIndex = $batchIndex
-            Text = $batchLines -join "`n"
-            StartIndex = $batchStartIndex
-            EndIndex = $Text.Length
-            StartLine = $batchStartLine
+            Text = $batchText
+            StartIndex = $startIndex
+            EndIndex = $endIndex
+            StartLine = [int]$parsedBatch.StartLine
+            BatchExecutionCount = [int]$parsedBatch.BatchExecutionCount
         })
+        $searchIndex = $endIndex
+        $batchIndex++
     }
     return $batches.ToArray()
 }

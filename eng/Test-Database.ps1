@@ -53,6 +53,7 @@ if (-not $sqlServerModule) {
         -AllowClobber
 }
 Import-Module SqlServer -RequiredVersion $sqlServerModuleVersion -Force
+Import-Module ([IO.Path]::Combine($PSScriptRoot, 'SqlCmd.Common.psm1')) -Force
 
 if (-not $SkipBuild) {
     & ([IO.Path]::Combine($PSScriptRoot, 'Build.ps1'))
@@ -115,57 +116,78 @@ try {
         throw 'SQL Server did not become ready within 120 seconds.'
     }
 
-    foreach ($case in @(
-        @{ Name = 'compact-comment'; Line = 'GO--comment'; ExpectedBatches = 2 },
-        @{ Name = 'compact-count-comment'; Line = 'GO 1--comment'; ExpectedBatches = 2 },
-        @{ Name = 'compact-leading-zero-comment'; Line = 'GO 01--comment'; ExpectedBatches = 2 },
-        @{ Name = 'whitespace-compact-comment'; Line = "`t gO`t1--comment"; ExpectedBatches = 2 },
-        @{ Name = 'attached-count'; Line = 'GO0'; ExpectedBatches = 1 },
-        @{ Name = 'attached-decimal'; Line = 'GO.1'; ExpectedBatches = 1 }
-    )) {
+    $goParserCases = @(
+        @{ Name = 'separator'; Sql = "SELECT 1;`nGO`nSELECT 2;"; ExpectedBatches = 2 },
+        @{ Name = 'zero'; Sql = "SELECT 1;`nGO 0`nSELECT 2;"; ExpectedBatches = 2 },
+        @{ Name = 'leading-zero'; Sql = "SELECT 1;`nGO 01`nSELECT 2;"; ExpectedBatches = 2 },
+        @{ Name = 'int32-max'; Sql = "SELECT 1;`nGO 2147483647`nSELECT 2;"; ExpectedBatches = 2 },
+        @{ Name = 'compact-comment'; Sql = "SELECT 1;`nGO--comment`nSELECT 2;"; ExpectedBatches = 2 },
+        @{ Name = 'compact-count-comment'; Sql = "SELECT 1;`nGO 1--comment`nSELECT 2;"; ExpectedBatches = 2 },
+        @{ Name = 'attached-plus'; Sql = "SELECT 1;`nGO+1`nSELECT 2;"; ExpectedBatches = 1 },
+        @{ Name = 'attached-zero'; Sql = "SELECT 1;`nGO0`nSELECT 2;"; ExpectedBatches = 1 },
+        @{ Name = 'attached-decimal'; Sql = "SELECT 1;`nGO.1`nSELECT 2;"; ExpectedBatches = 1 },
+        @{ Name = 'attached-slash'; Sql = "SELECT 1;`nGO/1`nSELECT 2;"; Error = $true },
+        @{ Name = 'attached-dollar'; Sql = 'SELECT 1;' + "`n" + 'GO$x' + "`nSELECT 2;"; Error = $true },
+        @{ Name = 'attached-bang'; Sql = "SELECT 1;`nGO!x`nSELECT 2;"; Error = $true },
+        @{ Name = 'attached-parenthesis'; Sql = "SELECT 1;`nGO(x)`nSELECT 2;"; Error = $true },
+        @{ Name = 'overflow'; Sql = "SELECT 1;`nGO 2147483648`nSELECT 2;"; Error = $true },
+        @{ Name = 'negative'; Sql = "SELECT 1;`nGO -1`nSELECT 2;"; Error = $true },
+        @{ Name = 'compact-negative'; Sql = "SELECT 1;`nGO-1`nSELECT 2;"; Error = $true },
+        @{ Name = 'positive-sign'; Sql = "SELECT 1;`nGO +1`nSELECT 2;"; Error = $true },
+        @{ Name = 'decimal-count'; Sql = "SELECT 1;`nGO 1.5`nSELECT 2;"; Error = $true },
+        @{ Name = 'multiline-string'; Sql = "PRINT N'first`nGO`nlast';"; ExpectedBatches = 1 },
+        @{ Name = 'nested-comment'; Sql = "/* outer /* nested`nGO`n*/ outer */`nSELECT 1;"; ExpectedBatches = 1 },
+        @{ Name = 'bracket-identifier'; Sql = "SELECT 1 AS [first`nGO`nlast];"; ExpectedBatches = 1 },
+        @{ Name = 'quoted-identifier'; Sql = "SELECT 1 AS `"first`nGO`nlast`";"; ExpectedBatches = 1 },
+        @{ Name = 'line-comment'; Sql = "-- GO`nSELECT 1;"; ExpectedBatches = 1 }
+    )
+    foreach ($case in $goParserCases) {
         $batchParser = [Microsoft.SqlTools.ServiceLayer.BatchParser.BatchParserWrapper]::new()
+        $managedError = $false
         try {
             $conditions = [Microsoft.SqlTools.ServiceLayer.BatchParser.ExecutionEngineCode.ExecutionEngineConditions]::new()
             $conditions.IsSqlCmd = $true
             $conditions.BatchSeparator = 'GO'
             $parsedBatches = @(
-                $batchParser.GetBatches(
-                    "SELECT 1;`n$($case.Line)`nSELECT 2;",
-                    $conditions
-                )
-            )
-            if ($parsedBatches.Count -ne $case.ExpectedBatches) {
-                throw "Managed parser returned unexpected metadata for GO grammar case '$($case.Name)'."
-            }
-        }
-        finally {
-            $batchParser.Dispose()
-        }
-    }
-    foreach ($case in @(
-        @{ Name = 'compact-block-comment'; Line = 'GO/**/' },
-        @{ Name = 'compact-count-block-comment'; Line = 'GO 1/**/' },
-        @{ Name = 'negative-count'; Line = 'GO-1' }
-    )) {
-        $batchParser = [Microsoft.SqlTools.ServiceLayer.BatchParser.BatchParserWrapper]::new()
-        $grammarRejected = $false
-        try {
-            $conditions = [Microsoft.SqlTools.ServiceLayer.BatchParser.ExecutionEngineCode.ExecutionEngineConditions]::new()
-            $conditions.IsSqlCmd = $true
-            $conditions.BatchSeparator = 'GO'
-            [void]$batchParser.GetBatches(
-                "SELECT 1;`n$($case.Line)`nSELECT 2;",
-                $conditions
+                $batchParser.GetBatches($case.Sql, $conditions)
             )
         }
         catch {
-            $grammarRejected = $true
+            $managedError = $true
         }
         finally {
             $batchParser.Dispose()
         }
-        if (-not $grammarRejected) {
-            throw "Managed parser unexpectedly accepted GO grammar case '$($case.Name)'."
+
+        $adapterError = $false
+        try {
+            $adapterBatches = @(SqlCmd.Common\Get-SqlBatch -Text $case.Sql)
+        }
+        catch {
+            $adapterError = $true
+        }
+        if ($managedError -ne $adapterError) {
+            throw "GO adapter diverged from the managed parser for '$($case.Name)'."
+        }
+        $expectedError = $case.ContainsKey('Error') -and $case.Error
+        if ($managedError -ne $expectedError) {
+            throw "Managed parser returned an unexpected error classification for '$($case.Name)'."
+        }
+        if (-not $expectedError) {
+            if (
+                $parsedBatches.Count -ne $case.ExpectedBatches -or
+                $adapterBatches.Count -ne $parsedBatches.Count
+            ) {
+                throw "GO adapter returned unexpected batches for '$($case.Name)'."
+            }
+            for ($index = 0; $index -lt $parsedBatches.Count; $index++) {
+                if (
+                    $adapterBatches[$index].Text -cne $parsedBatches[$index].BatchText -or
+                    $adapterBatches[$index].StartLine -ne $parsedBatches[$index].StartLine
+                ) {
+                    throw "GO adapter metadata diverged for '$($case.Name)'."
+                }
+            }
         }
     }
 
@@ -267,7 +289,7 @@ SELECT [Label] FROM [tempdb].[dbo].[$goProbeTable] ORDER BY [Label];
         throw 'Invoke-Sqlcmd unexpectedly accepted a GO count with an alphabetic suffix.'
     }
     Invoke-Sqlcmd @goProbeArguments -Query "DROP TABLE [tempdb].[dbo].[$goProbeTable];"
-    Write-Host 'Managed parser and Invoke-Sqlcmd GO count boundary probes passed.'
+    Write-Host 'Managed parser adapter and Invoke-Sqlcmd GO grammar probes passed.'
 
     & docker exec $containerId `
         $sqlcmdPath `

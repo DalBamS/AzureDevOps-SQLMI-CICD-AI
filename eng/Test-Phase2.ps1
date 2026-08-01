@@ -1586,6 +1586,7 @@ PRINT N'`$(NotAVariable)';
         ) `
         -Message 'A code-context GO count with a trailing line comment must split exactly two batches.'
     $acceptedGoSeparators = @(
+        @{ Name = 'go-bare'; Line = 'GO' },
         @{ Name = 'go-zero'; Line = 'GO 0' },
         @{ Name = 'go-double-zero'; Line = 'GO 00' },
         @{ Name = 'go-leading-zero'; Line = 'GO 01' },
@@ -1620,19 +1621,25 @@ PRINT N'`$(NotAVariable)';
                 -ReportPath (Join-Path $temporaryPath "$($case.Name)-unsafe.md")
         } "Bare dynamic DDL after managed GO grammar case '$($case.Name)' must be analyzed."
     }
-    $attachedGoPath = Join-Path $temporaryPath 'go-attached-count.sql'
-    $attachedGoReport = Join-Path $temporaryPath 'go-attached-count.md'
-    "SELECT 1;`nGO1`nSELECT 2;" |
-        Set-Content -Path $attachedGoPath -Encoding utf8 -NoNewline
-    & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
-        -ScriptPath $attachedGoPath `
-        -ReportPath $attachedGoReport
-    Assert-True `
-        -Condition (
-            (Get-Content -Path $attachedGoReport -Raw) -match
-                'GO-delimited batches: 1'
-        ) `
-        -Message 'GO1 is an ordinary SQL token, not a managed GO separator candidate.'
+    foreach ($case in @(
+        @{ Name = 'go-attached-count'; Line = 'GO1' },
+        @{ Name = 'go-attached-zero'; Line = 'GO0' },
+        @{ Name = 'go-attached-plus'; Line = 'GO+1' }
+    )) {
+        $ordinaryPath = Join-Path $temporaryPath "$($case.Name).sql"
+        $ordinaryReport = Join-Path $temporaryPath "$($case.Name).md"
+        "SELECT 1;`n$($case.Line)`nSELECT 2;" |
+            Set-Content -Path $ordinaryPath -Encoding utf8 -NoNewline
+        & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+            -ScriptPath $ordinaryPath `
+            -ReportPath $ordinaryReport
+        Assert-True `
+            -Condition (
+                (Get-Content -Path $ordinaryReport -Raw) -match
+                    'GO-delimited batches: 1'
+            ) `
+            -Message "$($case.Line) must remain ordinary SQL exactly as the managed parser classifies it."
+    }
     foreach ($case in @(
         @{ Name = 'go-int32-overflow'; Line = 'GO 2147483648' },
         @{ Name = 'go-numeric-overflow'; Line = 'GO 999999999999999999999999999999999999' },
@@ -1640,6 +1647,10 @@ PRINT N'`$(NotAVariable)';
         @{ Name = 'go-plus'; Line = 'GO +1' },
         @{ Name = 'go-decimal'; Line = 'GO 1.5' },
         @{ Name = 'go-alpha-suffix'; Line = 'GO 1x' },
+        @{ Name = 'go-attached-slash'; Line = 'GO/1' },
+        @{ Name = 'go-attached-dollar'; Line = 'GO$x' },
+        @{ Name = 'go-attached-bang'; Line = 'GO!x' },
+        @{ Name = 'go-attached-parenthesis'; Line = 'GO(x)' },
         @{ Name = 'go-compact-block-comment'; Line = 'GO/**/' },
         @{ Name = 'go-compact-count-block-comment'; Line = 'GO 1/**/' },
         @{ Name = 'go-block-comment-suffix'; Line = 'GO 1 /* not a supported suffix */' },

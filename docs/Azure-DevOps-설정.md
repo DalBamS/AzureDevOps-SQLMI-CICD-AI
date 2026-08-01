@@ -192,13 +192,18 @@ role membership을 배포 비교에서 제외합니다. 이 보안 오브젝트�
 네 필드가 모두 필요하고 만료된 항목은 자동 무효입니다. AI 검토는 이 게이트 이후의
 advisory 단계입니다.
 
-GO separator는 공용 lexer가 code context에서 물리 행 전체가 `GO` 또는 `GO <count>`인
-경우에만 인식합니다. `<count>`는 `0`, `00`, `01`을 포함한 nonnegative decimal digit
-sequence이면서 Int32 범위(`0..2147483647`)여야 하며 분석에서는 모두 한 batch boundary로
-취급합니다. overflow, sign, decimal, 다른 suffix는 실행 전에 실패합니다. 뒤에는 `GO--comment`,
-`GO 1--comment`처럼 공백 없이 붙인 형태를 포함해 `--` line comment만 둘 수 있습니다.
-multiline string, nested block comment, bracket identifier,
-double-quoted identifier 안의 단독 `GO`와 line comment 안의 `GO`는 separator가 아닙니다.
+GO 분리는 직접 만든 punctuation 규칙 대신 pinned SqlServer module 22.4.5.1의
+`Microsoft.SqlTools.ManagedBatchParser.dll`을 로드해 `Invoke-Sqlcmd`와 같은 parser로
+수행합니다. `GO`, Int32 범위의 `GO <count>`(`0`, `00`, `01` 포함), `GO--comment`,
+`GO 1--comment`는 separator입니다. overflow, 공백 뒤 sign/decimal, `GO/1`, `GO$x`,
+`GO!x`, `GO(x)`는 parser 오류로 실행 전에 실패합니다. 반면 `GO0`, `GO+1`, `GO.1`은
+separator가 아닌 일반 SQL로 유지합니다. multiline string, nested block comment,
+bracket/double-quoted identifier와 line comment 안의 `GO`는 separator가 아닙니다.
+
+Repository converter가 SQLCMD command와 변수를 먼저 엄격하게 확장·제거하므로 batch adapter는
+두 번째 SQLCMD variable 해석을 끄고 pinned `BatchSeparator=GO` grammar만 사용합니다. 따라서
+escaped literal도 다시 변수로 해석되지 않으며 승인되지 않은 SQLCMD command는 기존처럼 parser
+호출 전에 차단됩니다.
 
 `EXEC`/`EXECUTE`와 `sp_executesql`의 첫 SQL 표현식이 문자열 literal과 `+` 연결만으로
 구성되면 상수로 계산합니다. 문자열·주석·quoted identifier 밖의 token에 `CREATE`, `ALTER`,
