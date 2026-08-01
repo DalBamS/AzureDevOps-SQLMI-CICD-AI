@@ -1,0 +1,13 @@
+{
+  "risk": "low",
+  "summary": "Old path separator boundary.",
+  "blockingFindings": [
+    {
+      "file": "new.sql",
+      "line": 2,
+      "reason": "The old path contains a separator-like substring.",
+      "recommendation": "Corroborate the header with file metadata."
+    }
+  ],
+  "advisories": []
+}

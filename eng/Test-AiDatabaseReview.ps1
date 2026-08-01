@@ -149,6 +149,112 @@ try {
     $spaceReview = Get-Content -Path $spaceOutputPath -Raw | ConvertFrom-Json
     Assert-Equal $spaceReview.blockingFindings[0].file 'database/App.Database/Sample Data.sql' 'An unquoted Git path containing spaces must be reviewed.'
     Assert-Equal $spaceReview.blockingFindings[0].line 20 'A path containing spaces must retain its new-file line mapping.'
+    $mixedDiffPath = Join-Path $temporaryPath 'mixed-quoted-paths.diff'
+    Set-Content -Path $mixedDiffPath -Encoding utf8 -Value @(
+        "diff --git `"a/docs/old.md`" b/$koreanPath"
+        '--- "a/docs/old.md"'
+        "+++ b/$koreanPath"
+        '@@ -1 +40,1 @@'
+        '+first mixed direction'
+        "diff --git a/docs/old.md `"b/$quotedPath`""
+        '--- a/docs/old.md'
+        "+++ `"b/$quotedPath`""
+        '@@ -1 +70,1 @@'
+        '+second mixed direction'
+        'diff --git a/database/App.Database/Tables/Following.sql b/database/App.Database/Tables/Following.sql'
+        '--- a/database/App.Database/Tables/Following.sql'
+        '+++ b/database/App.Database/Tables/Following.sql'
+        '@@ -1 +90,1 @@'
+        '+following file'
+    )
+    $mixedOutputPath = Join-Path $temporaryPath 'mixed-quoted-paths.json'
+    & $reviewScript `
+        -ReviewInputPath $mixedDiffPath `
+        -ValidateOnlyResponsePath (Join-Path $fixtures 'ai-review-mixed-paths.json') `
+        -OutputPath $mixedOutputPath
+    $mixedReview = Get-Content -Path $mixedOutputPath -Raw | ConvertFrom-Json
+    Assert-Equal $mixedReview.blockingFindings[0].file $koreanPath 'Quoted-to-unquoted rename paths must use the decoded new path.'
+    Assert-Equal $mixedReview.blockingFindings[0].line 40 'Quoted-to-unquoted rename paths must retain the first hunk line.'
+    Assert-Equal $mixedReview.blockingFindings[1].file $koreanPath 'Unquoted-to-quoted copy paths must use the decoded new path.'
+    Assert-Equal $mixedReview.blockingFindings[1].line 70 'Unquoted-to-quoted copy paths must retain the second hunk line.'
+    Assert-Equal $mixedReview.blockingFindings[2].file 'database/App.Database/Tables/Following.sql' 'A mixed quoted path must not capture the following file.'
+    Assert-Equal $mixedReview.blockingFindings[2].line 90 'The following file must retain its own hunk line.'
+    $pathBoundaryDiff = Join-Path $temporaryPath 'path-boundary.diff'
+    Set-Content -Path $pathBoundaryDiff -Encoding utf8 -Value @(
+        'diff --git a/old.sql b/new b/leaf.sql'
+        '--- a/old.sql'
+        '+++ b/new b/leaf.sql'
+        '@@ -1 +12,1 @@'
+        '+boundary'
+    )
+    $pathBoundaryOutput = Join-Path $temporaryPath 'path-boundary.json'
+    & $reviewScript `
+        -ReviewInputPath $pathBoundaryDiff `
+        -ValidateOnlyResponsePath (Join-Path $fixtures 'ai-review-ambiguous-space-path.json') `
+        -OutputPath $pathBoundaryOutput
+    $pathBoundaryReview = Get-Content $pathBoundaryOutput -Raw | ConvertFrom-Json
+    Assert-Equal $pathBoundaryReview.blockingFindings[0].file 'new b/leaf.sql' 'An unquoted new path must retain separator-like text.'
+    Assert-Equal $pathBoundaryReview.blockingFindings[0].line 12 'An unquoted new path must retain its hunk line.'
+    $oldPathBoundaryDiff = Join-Path $temporaryPath 'old-path-boundary.diff'
+    Set-Content -Path $oldPathBoundaryDiff -Encoding utf8 -Value @(
+        'diff --git a/old b/part.sql b/new.sql'
+        '--- a/old b/part.sql'
+        '+++ b/new.sql'
+        '@@ -1 +32,1 @@'
+        '+old boundary'
+    )
+    $oldPathBoundaryOutput = Join-Path $temporaryPath 'old-path-boundary.json'
+    & $reviewScript `
+        -ReviewInputPath $oldPathBoundaryDiff `
+        -ValidateOnlyResponsePath (Join-Path $fixtures 'ai-review-ambiguous-old-path.json') `
+        -OutputPath $oldPathBoundaryOutput
+    $oldPathBoundaryReview = Get-Content $oldPathBoundaryOutput -Raw | ConvertFrom-Json
+    Assert-Equal $oldPathBoundaryReview.blockingFindings[0].file 'new.sql' 'Separator-like text in an old path must not capture the new path.'
+    Assert-Equal $oldPathBoundaryReview.blockingFindings[0].line 32 'An unquoted old path must retain the new hunk line.'
+
+    $emojiDiff = Join-Path $temporaryPath 'emoji-path.diff'
+    Set-Content -Path $emojiDiff -Encoding utf8 -Value @(
+        'diff --git "a/docs/old.md" "b/docs/😀.md"'
+        '--- "a/docs/old.md"'
+        '+++ "b/docs/😀.md"'
+        '@@ -1 +22,1 @@'
+        '+emoji'
+    )
+    $emojiOutput = Join-Path $temporaryPath 'emoji-path.json'
+    & $reviewScript `
+        -ReviewInputPath $emojiDiff `
+        -ValidateOnlyResponsePath (Join-Path $fixtures 'ai-review-emoji-path.json') `
+        -OutputPath $emojiOutput
+    $emojiReview = Get-Content $emojiOutput -Raw | ConvertFrom-Json
+    Assert-Equal $emojiReview.blockingFindings[0].file 'docs/😀.md' 'A quoted non-BMP path must preserve its Unicode code point.'
+    Assert-Equal $emojiReview.blockingFindings[0].line 22 'A quoted non-BMP path must retain its hunk line.'
+    foreach ($invalidDiff in @(
+        @{
+            Header = 'diff --git "a/docs/\q.md" b/docs/new.md'
+            Old = '--- "a/docs/\q.md"'
+            New = '+++ b/docs/new.md'
+        },
+        @{
+            Header = 'diff --git "a/docs/old.md"b/docs/new.md'
+            Old = '--- "a/docs/old.md"'
+            New = '+++ b/docs/new.md'
+        }
+    )) {
+        $invalidDiffPath = Join-Path $temporaryPath (([guid]::NewGuid().ToString('N')) + '.diff')
+        Set-Content -Path $invalidDiffPath -Encoding utf8 -Value @(
+            $invalidDiff.Header,
+            $invalidDiff.Old,
+            $invalidDiff.New,
+            '@@ -1 +1 @@',
+            '+invalid'
+        )
+        Assert-Throws {
+            & $reviewScript `
+                -ReviewInputPath $invalidDiffPath `
+                -ValidateOnlyResponsePath (Join-Path $fixtures 'ai-review-path-parser.json') `
+                -OutputPath (Join-Path $temporaryPath 'invalid-path.json')
+        } "Malformed Git path header must fail closed: $($invalidDiff.Header)"
+    }
     $reviewScriptText = Get-Content -Path $reviewScript -Raw
     Assert-Equal `
         ([bool]($reviewScriptText -match 'git\s+-c\s+core\.quotePath=false\s+diff')) `

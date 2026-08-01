@@ -28,6 +28,7 @@ param(
     [int]$CommandTimeout = 3600,
     [ValidateRange(1, 64)]
     [int]$MaxParallel = 4,
+    [switch]$ValidateAllDatabasePlans,
     [string]$TestPath,
     [string]$SmokeTestScriptPath,
     [string]$ReportDirectory,
@@ -41,6 +42,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $modulePath = Join-Path $PSScriptRoot 'Phase2.Common.psm1'
 $confirmScript = Join-Path $PSScriptRoot 'Confirm-DeploymentPlan.ps1'
+$policyScript = Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1'
 $testScript = Join-Path $PSScriptRoot 'Test-DeployedDatabase.ps1'
 Import-Module $modulePath -Force
 
@@ -76,66 +78,144 @@ $approvedReportsDirectory = Join-Path $approvedReviewPath 'all-database-reports'
 $approvedScriptsDirectory = Join-Path $approvedReviewPath 'all-database-scripts'
 $approvedPolicyReportsDirectory = Join-Path $approvedReviewPath 'all-database-policy-reports'
 $metadataPath = Join-Path $approvedReviewPath 'target-databases.json'
-$usePerDatabaseApprovedReports = $false
-if (Test-Path $metadataPath -PathType Leaf) {
-    try {
-        $metadata = Get-Content -Path $metadataPath -Raw | ConvertFrom-Json -ErrorAction Stop
-    }
-    catch {
-        throw "Approved target metadata is invalid JSON: $($_.Exception.Message)"
-    }
-    if (
-        $null -eq $metadata.PSObject.Properties['representativeDatabase'] -or
-        $null -eq $metadata.PSObject.Properties['targetDatabases'] -or
-        $null -eq $metadata.PSObject.Properties['allDatabasePlansValidated']
-    ) {
-        throw 'Approved target metadata is missing required deployment plan fields.'
-    }
-    $metadataTargets = @($metadata.targetDatabases | ForEach-Object { [string]$_ })
-    if (
-        [string]$metadata.representativeDatabase -cne $rollout.Canary -or
-        $metadataTargets.Count -ne $targets.Count -or
-        (Compare-Object -ReferenceObject $targets -DifferenceObject $metadataTargets -SyncWindow 0)
-    ) {
-        throw 'Approved target metadata does not match the requested database rollout.'
-    }
-    if ($metadata.allDatabasePlansValidated -isnot [bool]) {
-        throw 'Approved target metadata has an invalid allDatabasePlansValidated value.'
-    }
-    $usePerDatabaseApprovedReports = [bool]$metadata.allDatabasePlansValidated
-    if ($usePerDatabaseApprovedReports) {
-        if (
-            $null -eq $metadata.PSObject.Properties['allDatabaseScriptsGated'] -or
-            $metadata.allDatabaseScriptsGated -isnot [bool] -or
-            -not [bool]$metadata.allDatabaseScriptsGated -or
-            $null -eq $metadata.PSObject.Properties['gatedDatabases']
-        ) {
-            throw 'Approved target metadata does not confirm that every database deployment script passed the policy gate.'
-        }
-        $gatedDatabases = @($metadata.gatedDatabases | ForEach-Object { [string]$_ })
-        if (
-            $gatedDatabases.Count -ne $targets.Count -or
-            (Compare-Object -ReferenceObject $targets -DifferenceObject $gatedDatabases -SyncWindow 0)
-        ) {
-            throw 'Approved target metadata gated database list does not match the requested rollout.'
-        }
-        if (-not (Test-Path $approvedReportsDirectory -PathType Container)) {
-            throw 'Approved target metadata requires per-database reports, but the report directory is missing.'
-        }
-        foreach ($database in $targets) {
-            $databaseReportPath = Join-Path $approvedReportsDirectory "$database.deploy-report.xml"
-            $databaseScriptPath = Join-Path $approvedScriptsDirectory "$database.deploy.sql"
-            $databasePolicyReportPath = Join-Path $approvedPolicyReportsDirectory "$database.deployment-script-policy.md"
-            if (
-                -not (Test-Path $databaseReportPath -PathType Leaf) -or
-                -not (Test-Path $databaseScriptPath -PathType Leaf) -or
-                -not (Test-Path $databasePolicyReportPath -PathType Leaf)
-            ) {
-                throw "Approved gated plan artifacts are incomplete for '$database'."
-            }
-        }
+if (-not (Test-Path $metadataPath -PathType Leaf)) {
+    throw "Approved deployment manifest is required: $metadataPath"
+}
+try {
+    $metadata = Get-Content -Path $metadataPath -Raw | ConvertFrom-Json -ErrorAction Stop
+}
+catch {
+    throw "Approved deployment manifest is invalid JSON: $($_.Exception.Message)"
+}
+foreach ($requiredProperty in @(
+    'manifestVersion',
+    'environment',
+    'representativeDatabase',
+    'targetDatabases',
+    'allDatabasePlansValidated',
+    'allDatabaseScriptsGated',
+    'gatedDatabases',
+    'dacpacSha256',
+    'artifacts'
+)) {
+    if ($null -eq $metadata.PSObject.Properties[$requiredProperty]) {
+        throw "Approved deployment manifest is missing '$requiredProperty'."
     }
 }
+$manifestVersionType = [Type]::GetTypeCode($metadata.manifestVersion.GetType())
+if (
+    $manifestVersionType -notin @(
+        [TypeCode]::SByte,
+        [TypeCode]::Byte,
+        [TypeCode]::Int16,
+        [TypeCode]::UInt16,
+        [TypeCode]::Int32,
+        [TypeCode]::UInt32,
+        [TypeCode]::Int64,
+        [TypeCode]::UInt64
+    ) -or
+    [int64]$metadata.manifestVersion -ne 3
+) {
+    throw "Approved deployment manifest version '$($metadata.manifestVersion)' is not supported."
+}
+if ([string]$metadata.environment -cne $EnvironmentName) {
+    throw 'Approved deployment manifest environment does not match the runtime environment.'
+}
+$metadataTargets = @($metadata.targetDatabases | ForEach-Object { [string]$_ })
+if (
+    [string]$metadata.representativeDatabase -cne $rollout.Canary -or
+    $metadataTargets.Count -ne $targets.Count -or
+    (Compare-Object -ReferenceObject $targets -DifferenceObject $metadataTargets -SyncWindow 0)
+) {
+    throw 'Approved deployment manifest does not match the requested database rollout.'
+}
+if (
+    $metadata.allDatabasePlansValidated -isnot [bool] -or
+    [bool]$metadata.allDatabasePlansValidated -ne [bool]$ValidateAllDatabasePlans
+) {
+    throw 'Approved deployment manifest validation mode does not match the runtime mode.'
+}
+$expectedGatedDatabases = @(
+    if ($ValidateAllDatabasePlans) { $targets } else { $rollout.Canary }
+)
+$gatedDatabases = @($metadata.gatedDatabases | ForEach-Object { [string]$_ })
+if (
+    $metadata.allDatabaseScriptsGated -isnot [bool] -or
+    [bool]$metadata.allDatabaseScriptsGated -ne [bool]$ValidateAllDatabasePlans -or
+    $gatedDatabases.Count -ne $expectedGatedDatabases.Count -or
+    (Compare-Object -ReferenceObject $expectedGatedDatabases -DifferenceObject $gatedDatabases -SyncWindow 0)
+) {
+    throw 'Approved deployment manifest gated database contract does not match the runtime mode.'
+}
+if (
+    [string]$metadata.dacpacSha256 -notmatch '^[A-Fa-f0-9]{64}$' -or
+    (Get-FileHash -Path $DacpacPath -Algorithm SHA256).Hash -cne ([string]$metadata.dacpacSha256).ToUpperInvariant()
+) {
+    throw 'Downloaded DACPAC does not match the approved deployment manifest.'
+}
+
+$expectedArtifacts = [ordered]@{
+    ('representativeReport|' + $rollout.Canary) = 'deploy-report.xml'
+    ('representativeScript|' + $rollout.Canary) = 'deploy.sql'
+    ('representativePolicy|' + $rollout.Canary) = 'deployment-script-policy.md'
+}
+if ($ValidateAllDatabasePlans) {
+    foreach ($database in $targets) {
+        $expectedArtifacts["databaseReport|$database"] = "all-database-reports/$database.deploy-report.xml"
+        $expectedArtifacts["databaseScript|$database"] = "all-database-scripts/$database.deploy.sql"
+        $expectedArtifacts["databasePolicy|$database"] = "all-database-policy-reports/$database.deployment-script-policy.md"
+    }
+}
+$manifestArtifacts = @($metadata.artifacts)
+if ($manifestArtifacts.Count -ne $expectedArtifacts.Count) {
+    throw 'Approved deployment manifest contains an unexpected artifact set.'
+}
+$seenArtifactPaths = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+$approvedArtifactPaths = @{}
+foreach ($artifact in $manifestArtifacts) {
+    foreach ($property in @('kind', 'database', 'path', 'sha256')) {
+        if ($null -eq $artifact.PSObject.Properties[$property]) {
+            throw "Approved deployment manifest artifact is missing '$property'."
+        }
+    }
+    $relativePath = ([string]$artifact.path).Replace('\', '/')
+    if (
+        [string]::IsNullOrWhiteSpace($relativePath) -or
+        [IO.Path]::IsPathRooted($relativePath) -or
+        $relativePath -eq '..' -or
+        $relativePath.StartsWith('../') -or
+        -not $seenArtifactPaths.Add($relativePath)
+    ) {
+        throw "Approved deployment manifest contains an unsafe or duplicate artifact path: $relativePath"
+    }
+    $artifactKey = "$([string]$artifact.kind)|$([string]$artifact.database)"
+    if (
+        -not $expectedArtifacts.Contains($artifactKey) -or
+        $expectedArtifacts[$artifactKey] -cne $relativePath
+    ) {
+        throw "Approved deployment manifest contains an unexpected artifact: $artifactKey"
+    }
+    $artifactPath = [IO.Path]::GetFullPath((Join-Path $approvedReviewPath $relativePath))
+    $reviewRootPrefix = [IO.Path]::GetFullPath($approvedReviewPath).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    ) + [IO.Path]::DirectorySeparatorChar
+    if (
+        -not $artifactPath.StartsWith($reviewRootPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path $artifactPath -PathType Leaf) -or
+        [string]$artifact.sha256 -notmatch '^[A-Fa-f0-9]{64}$' -or
+        (Get-FileHash -Path $artifactPath -Algorithm SHA256).Hash -cne ([string]$artifact.sha256).ToUpperInvariant()
+    ) {
+        throw "Approved deployment artifact failed path or SHA-256 validation: $relativePath"
+    }
+    $approvedArtifactPaths[$artifactKey] = $artifactPath
+}
+if ((Resolve-Path $ApprovedReportPath).Path -cne $approvedArtifactPaths["representativeReport|$($rollout.Canary)"]) {
+    throw 'ApprovedReportPath does not match the manifest representative report.'
+}
+$usePerDatabaseApprovedReports = [bool]$ValidateAllDatabasePlans
 
 $context = [pscustomobject]@{
     ServerName = $ServerName
@@ -145,6 +225,7 @@ $context = [pscustomobject]@{
     SqlPackagePath = (Resolve-Path $SqlPackagePath).Path
     ApprovedReportPath = $resolvedApprovedReportPath
     ApprovedReportsDirectory = $approvedReportsDirectory
+    ApprovedScriptsDirectory = $approvedScriptsDirectory
     UsePerDatabaseApprovedReports = $usePerDatabaseApprovedReports
     AccessTokenProviderPath = (Resolve-Path $AccessTokenProviderPath).Path
     CommandTimeout = $CommandTimeout
@@ -153,6 +234,7 @@ $context = [pscustomobject]@{
     RepresentativeDatabase = $rollout.Canary
     ModulePath = $modulePath
     ConfirmScript = $confirmScript
+    PolicyScript = $policyScript
     TestScript = (Resolve-Path $SmokeTestScriptPath).Path
 }
 
@@ -177,8 +259,35 @@ $worker = {
         return [string]$providerOutput[0]
     }
 
+    function Get-ComparableDeploymentScript {
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [Parameter(Mandatory)][string]$TargetDatabase
+        )
+
+        $content = Get-Content -Path $Path -Raw
+        $escapedDatabase = [regex]::Escape($TargetDatabase)
+        $content = [regex]::Replace(
+            $content,
+            "(?im)^(\s*Deployment script for\s+)$escapedDatabase(\s*)$",
+            '${1}__TARGET_DATABASE__${2}'
+        )
+        $content = [regex]::Replace(
+            $content,
+            "(?im)^(\s*:setvar\s+DatabaseName\s+)`"$escapedDatabase`"(\s*)$",
+            '${1}"__TARGET_DATABASE__"${2}'
+        )
+        return [regex]::Replace(
+            $content,
+            "(?im)^(\s*:setvar\s+DefaultFilePrefix\s+)`"$escapedDatabase`"(\s*)$",
+            '${1}"__TARGET_DATABASE__"${2}'
+        )
+    }
+
     try {
         $reportPath = Join-Path $WorkerContext.ReportDirectory "$Database.deploy-report.xml"
+        $scriptPath = Join-Path $WorkerContext.ReportDirectory "$Database.deploy.sql"
+        $policyReportPath = Join-Path $WorkerContext.ReportDirectory "$Database.deployment-script-policy.md"
         $connection = "Server=tcp:$($WorkerContext.ServerName),$($WorkerContext.Port);Initial Catalog=$Database;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
         $reportAccessToken = Get-WorkerAccessToken
         $reportArguments = @(
@@ -214,6 +323,55 @@ $worker = {
                     $comparisonReport -eq $WorkerContext.ApprovedReportPath -and
                     $Database -ne $WorkerContext.RepresentativeDatabase
                 )
+
+            $scriptAccessToken = Get-WorkerAccessToken
+            $scriptArguments = @(
+                '/Action:Script',
+                "/SourceFile:$($WorkerContext.DacpacPath)",
+                "/TargetConnectionString:$connection",
+                "/AccessToken:$scriptAccessToken",
+                "/OutputPath:$scriptPath",
+                "/Profile:$($WorkerContext.PublishProfilePath)",
+                "/p:CommandTimeout=$($WorkerContext.CommandTimeout)"
+            )
+            & $WorkerContext.SqlPackagePath @scriptArguments 2>&1 |
+                ForEach-Object { Write-Host "[$Database] $_" }
+            if ($LASTEXITCODE -ne 0) {
+                throw "Current deployment script generation failed with exit code $LASTEXITCODE."
+            }
+            & $WorkerContext.PolicyScript `
+                -ScriptPath $scriptPath `
+                -ReportPath $policyReportPath
+
+            $approvedScript = if ($WorkerContext.UsePerDatabaseApprovedReports) {
+                Join-Path $WorkerContext.ApprovedScriptsDirectory "$Database.deploy.sql"
+            }
+            else {
+                Join-Path (Split-Path -Parent $WorkerContext.ApprovedReportPath) 'deploy.sql'
+            }
+            $approvedScriptContent = if (
+                -not $WorkerContext.UsePerDatabaseApprovedReports -and
+                $Database -ne $WorkerContext.RepresentativeDatabase
+            ) {
+                Get-ComparableDeploymentScript `
+                    -Path $approvedScript `
+                    -TargetDatabase $WorkerContext.RepresentativeDatabase
+            }
+            else {
+                Get-Content -Path $approvedScript -Raw
+            }
+            $currentScriptContent = if (
+                -not $WorkerContext.UsePerDatabaseApprovedReports -and
+                $Database -ne $WorkerContext.RepresentativeDatabase
+            ) {
+                Get-ComparableDeploymentScript -Path $scriptPath -TargetDatabase $Database
+            }
+            else {
+                Get-Content -Path $scriptPath -Raw
+            }
+            if ($approvedScriptContent -cne $currentScriptContent) {
+                throw 'The target deployment script changed after approval. Generate and approve a new deployment plan.'
+            }
 
             $publishAccessToken = Get-WorkerAccessToken
             $publishArguments = @(

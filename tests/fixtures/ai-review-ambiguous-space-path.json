@@ -1,0 +1,13 @@
+{
+  "risk": "low",
+  "summary": "Unquoted separator boundary.",
+  "blockingFindings": [
+    {
+      "file": "new b/leaf.sql",
+      "line": 2,
+      "reason": "The new path contains a separator-like substring.",
+      "recommendation": "Use the first valid path boundary."
+    }
+  ],
+  "advisories": []
+}

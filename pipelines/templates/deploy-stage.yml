@@ -253,6 +253,7 @@ stages:
                           -AccessTokenProviderPath "./eng/Get-AzureSqlAccessToken.ps1" `
                           -CommandTimeout ${{ parameters.sqlCommandTimeout }} `
                           -MaxParallel ${{ parameters.maxParallel }} `
+                          -ValidateAllDatabasePlans:([bool]::Parse($env:validateAllDatabasePlans)) `
                           -ReportDirectory "$(Agent.TempDirectory)/database-deploy-reports" `
                           -SummaryPath $summaryPath `
                           -EnvironmentName "${{ parameters.environmentName }}"
@@ -265,6 +266,7 @@ stages:
                   env:
                     databaseName: $(databaseName)
                     databaseNames: $(databaseNames)
+                    validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
 
                 - publish: $(Pipeline.Workspace)/deployment-review-pitr/${{ parameters.environmentName }}
                   artifact: deployment-review-${{ parameters.environmentName }}-pitr-marker

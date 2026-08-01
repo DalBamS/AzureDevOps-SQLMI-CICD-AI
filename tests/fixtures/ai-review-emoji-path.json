@@ -1,0 +1,13 @@
+{
+  "risk": "low",
+  "summary": "Non-BMP path.",
+  "blockingFindings": [
+    {
+      "file": "docs/😀.md",
+      "line": 2,
+      "reason": "The path contains a Unicode surrogate pair.",
+      "recommendation": "Preserve the complete code point."
+    }
+  ],
+  "advisories": []
+}

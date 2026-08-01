@@ -147,7 +147,8 @@ Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제
 - `deploy.sql`: 실제 실행 예정 SQL
 - `deploy-report.xml`: DacFx 변경 계획
 - `deployment-script-policy.md`: 결정론적 위험 DDL 검사와 allowlist 결과
-- `target-databases.json`: 대표 DB, 전체 대상, 전수 검사와 모든 script gate 완료 여부
+- `target-databases.json`: 대표 DB, 전체 대상, 검사 모드, gated DB 목록, DACPAC과 승인
+  artifact의 SHA-256
 - `all-database-reports`: 전수 검사 시 DB별 DacFx 변경 계획
 - `all-database-scripts`: 전수 검사 시 DB별 실제 실행 예정 SQL
 - `all-database-policy-reports`: 전수 검사 시 DB별 결정론적 정책 결과
@@ -202,11 +203,25 @@ Script에 결정론적 정책 gate를 적용합니다. 보고서, script, 정책
 따라서 전수 검사는 대상 DB마다 DeployReport 1회와 Script 1회를 실행해 기본 대표 검사보다
 SQL MI 부하와 pipeline 시간이 증가합니다.
 
-승인 이후 배포 직전에 각 DB의 DeployReport를 다시 생성합니다. 대표 전용 Plan은 작업
-집합을 대표 보고서와 비교하고, 전수 Plan은 각 DB별 승인 보고서와 비교합니다. 대상 DB에
-새 드리프트가 생기면 해당 DB를 배포하지 않습니다. 첫 DB는 카나리로 publish 후 smoke
-test까지 통과해야 나머지를 최대 `maxParallel`로 배포합니다. 장시간 rollout에서 토큰
-만료를 피하도록 각 DB의 DeployReport, Publish, smoke test 직전에
+`target-databases.json` manifest v3는 대표/전수 모드 모두 필수입니다. 배포는 manifest
+version, 환경, 검사 모드, 순서가 보존된 대상/gated DB 목록을 pipeline runtime 값과
+대조하고, ReviewPath 하위 상대 경로만 허용한 뒤 DACPAC, 보고서, script, 정책 보고서의
+SHA-256을 모두 확인합니다. 누락, 중복·대소문자 충돌, 경로 이탈, hash 불일치는 즉시
+실패합니다. manifest 자체에는 별도 서명이 없으므로 이 계약은 승인 후 같은 실행의 Azure
+DevOps pipeline artifact가 변경되지 않는 경계를 신뢰합니다. 승인 후 artifact를 교체하거나
+다른 실행의 DACPAC/review artifact를 혼합해서는 안 됩니다.
+
+승인 이후 Publish 직전에 각 DB의 DeployReport와 deployment Script를 순서대로 다시
+생성합니다. 대표 전용 Plan은 작업 집합을 대표 보고서와 비교하고, 전수 Plan은 각 DB별 승인
+보고서와 비교합니다. 현재 Script는 결정론적 정책 gate를 다시 통과하고 승인된 gated
+Script와 정확히 같아야 합니다. 대표 모드의 비대표 DB 비교에서만 DacFx가 삽입하는
+`Deployment script for <database>`, `:setvar DatabaseName "<database>"`,
+`:setvar DefaultFilePrefix "<database>"`의 대상 DB 값을 고정 placeholder로 바꿉니다. 그
+밖의 주석, SQLCMD 변수, DDL은 정규화하지 않습니다. 보고서
+또는 Script가 달라지거나 현재 Script가 위험하면 해당 DB를 배포하지 않습니다. 첫
+DB는 카나리로 publish 후 smoke test까지 통과해야 나머지를 최대 `maxParallel`로 배포합니다.
+장시간 rollout에서 토큰 만료를 피하도록 변경이 있는 각 DB의 DeployReport, Script, Publish,
+smoke test 직전에
 `eng/Get-AzureSqlAccessToken.ps1`로 Azure SQL access token을 새로 가져옵니다.
 각 DB 실패는 모두 수집되며 성공/실패 요약과 실패 DB 목록을 Azure DevOps summary에
 게시합니다. 이미 목표 상태인 DB는 재시도에서 publish를 생략하고 smoke를 재실행합니다.

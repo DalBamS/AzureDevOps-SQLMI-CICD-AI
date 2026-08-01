@@ -419,10 +419,22 @@ function ConvertFrom-GitPathToken {
     if ($Token.StartsWith('"') -and $Token.EndsWith('"')) {
         $body = $Token.Substring(1, $Token.Length - 2)
         $bytes = [System.Collections.Generic.List[byte]]::new()
+        $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
         for ($index = 0; $index -lt $body.Length; $index++) {
             $character = $body[$index]
             if ($character -ne '\') {
-                foreach ($byte in [Text.Encoding]::UTF8.GetBytes([string]$character)) {
+                $literalStart = $index
+                while ($index + 1 -lt $body.Length -and $body[$index + 1] -ne '\') {
+                    $index++
+                }
+                $literal = $body.Substring($literalStart, $index - $literalStart + 1)
+                try {
+                    $literalBytes = $strictUtf8.GetBytes($literal)
+                }
+                catch {
+                    throw "Git diff path contains invalid Unicode: $($_.Exception.Message)"
+                }
+                foreach ($byte in $literalBytes) {
                     $bytes.Add($byte)
                 }
                 continue
@@ -454,12 +466,12 @@ function ConvertFrom-GitPathToken {
                 'v' { 11 }
                 'f' { 12 }
                 'r' { 13 }
-                default { [byte][char]$escaped }
+                default { throw "Git diff path contains unsupported escape sequence '\$escaped'." }
             }
             $bytes.Add([byte]$escapedByte)
         }
         try {
-            $path = [Text.UTF8Encoding]::new($false, $true).GetString($bytes.ToArray())
+            $path = $strictUtf8.GetString($bytes.ToArray())
         }
         catch {
             throw "Git diff path is not valid UTF-8: $($_.Exception.Message)"
@@ -471,18 +483,65 @@ function ConvertFrom-GitPathToken {
     return $Matches.path
 }
 
+function ConvertFrom-GitDiffHeader {
+    param(
+        [Parameter(Mandatory)][string]$Line,
+        [AllowNull()][string]$ExpectedOldPath,
+        [AllowNull()][string]$ExpectedNewPath
+    )
+
+    if (-not $Line.StartsWith('diff --git ')) {
+        return $null
+    }
+    $payload = $Line.Substring('diff --git '.Length)
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($separator in [regex]::Matches($payload, '\s+')) {
+        $oldToken = $payload.Substring(0, $separator.Index)
+        $newToken = $payload.Substring($separator.Index + $separator.Length)
+        if ([string]::IsNullOrWhiteSpace($oldToken) -or [string]::IsNullOrWhiteSpace($newToken)) {
+            continue
+        }
+        try {
+            $oldPath = ConvertFrom-GitPathToken -Token $oldToken
+            $newPath = ConvertFrom-GitPathToken -Token $newToken
+        }
+        catch {
+            continue
+        }
+        if (
+            ($null -ne $ExpectedOldPath -and $oldPath -cne $ExpectedOldPath) -or
+            ($null -ne $ExpectedNewPath -and $newPath -cne $ExpectedNewPath)
+        ) {
+            continue
+        }
+        if ($seen.Add("$oldPath`0$newPath")) {
+            $candidates.Add([pscustomobject]@{
+                OldPath = $oldPath
+                NewPath = $newPath
+            })
+        }
+    }
+    if ($candidates.Count -ne 1) {
+        throw 'Git diff header paths cannot be resolved unambiguously against the file metadata.'
+    }
+    return $candidates[0]
+}
+
 function ConvertFrom-GitDiff {
     param([Parameter(Mandatory)][string]$Content)
 
     $sections = [System.Collections.Generic.List[object]]::new()
     $sourcePath = $null
+    $diffHeaderLine = $null
+    $metadataOldPath = $null
     $contentLines = [System.Collections.Generic.List[string]]::new()
     $lineMap = [System.Collections.Generic.List[int]]::new()
     $newLine = 0
     $inHunk = $false
 
     foreach ($line in [regex]::Split($Content, '\r\n|\n|\r')) {
-        if ($line -match '^diff --git (?:(?<oldQuoted>"(?:\\.|[^"])*") (?<newQuoted>"(?:\\.|[^"])*")|a/(?<oldPath>.+) b/(?<newPath>.+))$') {
+        if ($line.StartsWith('diff --git ')) {
             if ($sourcePath -and $contentLines.Count -gt 0) {
                 $sections.Add([pscustomobject]@{
                     Content = $contentLines -join "`n"
@@ -491,16 +550,42 @@ function ConvertFrom-GitDiff {
                     LineMap = $lineMap.ToArray()
                 })
             }
-            $newPathToken = if ($Matches['newQuoted']) {
-                $Matches['newQuoted']
-            }
-            else {
-                "b/$($Matches['newPath'])"
-            }
-            $sourcePath = ConvertFrom-GitPathToken -Token $newPathToken
+            $diffHeaderLine = $line
+            $sourcePath = $null
+            $metadataOldPath = $null
             $contentLines = [System.Collections.Generic.List[string]]::new()
             $lineMap = [System.Collections.Generic.List[int]]::new()
             $inHunk = $false
+            continue
+        }
+        if (-not $inHunk -and $line.StartsWith('--- ')) {
+            $oldToken = $line.Substring(4)
+            $metadataOldPath = if ($oldToken -eq '/dev/null') {
+                $null
+            }
+            else {
+                ConvertFrom-GitPathToken -Token $oldToken
+            }
+            continue
+        }
+        if (-not $inHunk -and $line.StartsWith('+++ ')) {
+            $newToken = $line.Substring(4)
+            $metadataNewPath = if ($newToken -eq '/dev/null') {
+                $null
+            }
+            else {
+                ConvertFrom-GitPathToken -Token $newToken
+            }
+            $header = ConvertFrom-GitDiffHeader `
+                -Line $diffHeaderLine `
+                -ExpectedOldPath $metadataOldPath `
+                -ExpectedNewPath $metadataNewPath
+            $sourcePath = if ($null -ne $metadataNewPath) {
+                $metadataNewPath
+            }
+            else {
+                $header.NewPath
+            }
             continue
         }
         if ($line -match '^@@ -\d+(?:,\d+)? \+(?<start>\d+)(?:,\d+)? @@') {

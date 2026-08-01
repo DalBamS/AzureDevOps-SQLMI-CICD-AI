@@ -96,6 +96,31 @@ function Invoke-SqlPackageAction {
     }
 }
 
+function New-ManifestArtifact {
+    param(
+        [Parameter(Mandatory)][string]$Kind,
+        [AllowEmptyString()][string]$Database,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $reviewRoot = [IO.Path]::GetFullPath($ReviewPath)
+    $artifactPath = [IO.Path]::GetFullPath($Path)
+    $relativePath = [IO.Path]::GetRelativePath($reviewRoot, $artifactPath).Replace('\', '/')
+    if (
+        [IO.Path]::IsPathRooted($relativePath) -or
+        $relativePath -eq '..' -or
+        $relativePath.StartsWith('../')
+    ) {
+        throw "Manifest artifact path must remain under ReviewPath: $Path"
+    }
+    return [ordered]@{
+        kind = $Kind
+        database = $Database
+        path = $relativePath
+        sha256 = (Get-FileHash -Path $artifactPath -Algorithm SHA256).Hash
+    }
+}
+
 $targets = @(
     Resolve-DatabaseNames `
         -DatabaseNames $DatabaseNames `
@@ -197,8 +222,29 @@ if ($DatabasePlanDriftPolicy -eq 'Fail' -and $drifted.Count -gt 0) {
     throw "All-database plan validation failed for: $($drifted -join ', ')"
 }
 
+$manifestArtifacts = [System.Collections.Generic.List[object]]::new()
+$manifestArtifacts.Add((New-ManifestArtifact -Kind 'representativeReport' -Database $representative -Path $approvedReportPath))
+$manifestArtifacts.Add((New-ManifestArtifact -Kind 'representativeScript' -Database $representative -Path $scriptPath))
+$manifestArtifacts.Add((New-ManifestArtifact -Kind 'representativePolicy' -Database $representative -Path $policyReportPath))
+if ($ValidateAllDatabasePlans) {
+    foreach ($database in $targets) {
+        $manifestArtifacts.Add((New-ManifestArtifact `
+            -Kind 'databaseReport' `
+            -Database $database `
+            -Path (Join-Path $allReportsPath "$database.deploy-report.xml")))
+        $manifestArtifacts.Add((New-ManifestArtifact `
+            -Kind 'databaseScript' `
+            -Database $database `
+            -Path (Join-Path $allScriptsPath "$database.deploy.sql")))
+        $manifestArtifacts.Add((New-ManifestArtifact `
+            -Kind 'databasePolicy' `
+            -Database $database `
+            -Path (Join-Path $allPolicyReportsPath "$database.deployment-script-policy.md")))
+    }
+}
+
 $targetMetadata = [ordered]@{
-    manifestVersion = 2
+    manifestVersion = 3
     environment = $EnvironmentName
     representativeDatabase = $representative
     targetDatabases = $targets
@@ -206,9 +252,11 @@ $targetMetadata = [ordered]@{
     allDatabaseScriptsGated = [bool]$ValidateAllDatabasePlans
     gatedDatabases = if ($ValidateAllDatabasePlans) { $targets } else { @($representative) }
     driftPolicy = $DatabasePlanDriftPolicy
+    dacpacSha256 = (Get-FileHash -Path $DacpacPath -Algorithm SHA256).Hash
+    artifacts = $manifestArtifacts.ToArray()
 }
 $targetMetadata |
-    ConvertTo-Json -Depth 4 |
+    ConvertTo-Json -Depth 6 |
     Set-Content -Path $targetMetadataPath -Encoding utf8
 
 $summary = @(

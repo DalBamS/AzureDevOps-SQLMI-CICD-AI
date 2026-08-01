@@ -1,0 +1,13 @@
+{
+  "risk": "low",
+  "summary": "Path parser fixture.",
+  "blockingFindings": [
+    {
+      "file": "docs/new.md",
+      "line": 2,
+      "reason": "Parser accepted the header.",
+      "recommendation": "Require strict path syntax."
+    }
+  ],
+  "advisories": []
+}

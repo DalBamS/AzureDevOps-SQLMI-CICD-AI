@@ -52,6 +52,69 @@ function Assert-Throws {
     }
 }
 
+function Write-TestDeploymentManifest {
+    param(
+        [Parameter(Mandatory)][string]$ReviewPath,
+        [Parameter(Mandatory)][string]$DacpacPath,
+        [Parameter(Mandatory)][string[]]$DatabaseNames,
+        [Parameter(Mandatory)][bool]$ValidateAllDatabasePlans
+    )
+
+    $representative = $DatabaseNames[0]
+    $artifactDefinitions = [System.Collections.Generic.List[object]]::new()
+    foreach ($definition in @(
+        @('representativeReport', 'deploy-report.xml'),
+        @('representativeScript', 'deploy.sql'),
+        @('representativePolicy', 'deployment-script-policy.md')
+    )) {
+        $artifactDefinitions.Add([pscustomobject]@{
+            Kind = $definition[0]
+            Database = $representative
+            Path = $definition[1]
+        })
+    }
+    if ($ValidateAllDatabasePlans) {
+        foreach ($database in $DatabaseNames) {
+            foreach ($definition in @(
+                @('databaseReport', "all-database-reports/$database.deploy-report.xml"),
+                @('databaseScript', "all-database-scripts/$database.deploy.sql"),
+                @('databasePolicy', "all-database-policy-reports/$database.deployment-script-policy.md")
+            )) {
+                $artifactDefinitions.Add([pscustomobject]@{
+                    Kind = $definition[0]
+                    Database = $database
+                    Path = $definition[1]
+                })
+            }
+        }
+    }
+    $artifacts = @(
+        foreach ($definition in $artifactDefinitions) {
+            $artifactPath = Join-Path $ReviewPath $definition.Path
+            [ordered]@{
+                kind = $definition.Kind
+                database = $definition.Database
+                path = $definition.Path
+                sha256 = (Get-FileHash -Path $artifactPath -Algorithm SHA256).Hash
+            }
+        }
+    )
+    [ordered]@{
+        manifestVersion = 3
+        environment = 'fixture'
+        representativeDatabase = $representative
+        targetDatabases = $DatabaseNames
+        allDatabasePlansValidated = $ValidateAllDatabasePlans
+        allDatabaseScriptsGated = $ValidateAllDatabasePlans
+        gatedDatabases = if ($ValidateAllDatabasePlans) { $DatabaseNames } else { @($representative) }
+        driftPolicy = 'Warn'
+        dacpacSha256 = (Get-FileHash -Path $DacpacPath -Algorithm SHA256).Hash
+        artifacts = $artifacts
+    } |
+        ConvertTo-Json -Depth 6 |
+        Set-Content -Path (Join-Path $ReviewPath 'target-databases.json') -Encoding utf8
+}
+
 try {
     $fallback = @(
         Resolve-DatabaseNames `
@@ -246,11 +309,9 @@ if ($action -eq 'DeployReport') {
     Copy-Item -Path $reportFixture -Destination $outputPath -Force
 }
 elseif ($action -eq 'Script') {
-    $script = if ($database -eq $env:PHASE2_DESTRUCTIVE_DATABASE) {
-        'DROP TABLE [app].[Danger];'
-    }
-    else {
-        'SELECT 1;'
+    $script = "/*`nDeployment script for $database`n*/`n:setvar DatabaseName `"$database`"`n:setvar DefaultFilePrefix `"$database`"`nSELECT 1;"
+    if ($database -eq $env:PHASE2_DESTRUCTIVE_DATABASE) {
+        $script += "`nDROP TABLE [app].[Danger];"
     }
     Set-Content -Path $outputPath -Value $script -Encoding utf8
 }
@@ -345,11 +406,14 @@ Add-Content -Path $env:PHASE2_PLAN_LOG -Value "TOKEN:$DatabaseName" -Encoding ut
         ConvertFrom-Json
     Assert-True `
         -Condition (
+            $successfulManifest.manifestVersion -eq 3 -and
+            $successfulManifest.dacpacSha256 -eq (Get-FileHash $fakeDacpac -Algorithm SHA256).Hash -and
+            @($successfulManifest.artifacts).Count -eq 9 -and
             $successfulManifest.allDatabasePlansValidated -and
             $successfulManifest.allDatabaseScriptsGated -and
             @($successfulManifest.gatedDatabases).Count -eq 2
         ) `
-        -Message 'A successful full Plan manifest must attest that every target script was gated.'
+        -Message 'A successful full Plan manifest must bind the DACPAC and every gated artifact with SHA-256.'
     $env:PHASE2_DRIFT_DATABASE = 'Shard02'
     $env:PHASE2_DRIFT_REPORT = Join-Path $fixtures 'deploy-report-different-operation.xml'
     Assert-Throws {
@@ -396,104 +460,145 @@ if ([string]::IsNullOrWhiteSpace($AccessToken)) {
 '@ | Set-Content -Path $fakeSmokeTest -Encoding utf8
 
     $approvedRoot = Join-Path $temporaryPath 'approved-review'
-    $staleApprovedReports = Join-Path $approvedRoot 'all-database-reports'
+    $approvedReports = Join-Path $approvedRoot 'all-database-reports'
     $approvedScripts = Join-Path $approvedRoot 'all-database-scripts'
     $approvedPolicyReports = Join-Path $approvedRoot 'all-database-policy-reports'
-    New-Item -ItemType Directory -Force -Path $staleApprovedReports | Out-Null
+    New-Item -ItemType Directory -Force -Path $approvedReports | Out-Null
     New-Item -ItemType Directory -Force -Path $approvedScripts | Out-Null
     New-Item -ItemType Directory -Force -Path $approvedPolicyReports | Out-Null
-    Copy-Item `
-        -Path (Join-Path $fixtures 'deploy-report-changed.xml') `
-        -Destination (Join-Path $approvedRoot 'deploy-report.xml')
-    foreach ($database in @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')) {
+    Copy-Item (Join-Path $fixtures 'deploy-report-changed.xml') (Join-Path $approvedRoot 'deploy-report.xml')
+    $representativeScript = "/*`nDeployment script for CanaryDb`n*/`n:setvar DatabaseName `"CanaryDb`"`n:setvar DefaultFilePrefix `"CanaryDb`"`nSELECT 1;"
+    Set-Content -Path (Join-Path $approvedRoot 'deploy.sql') -Value $representativeScript -Encoding utf8
+    Set-Content -Path (Join-Path $approvedRoot 'deployment-script-policy.md') -Value '# passed' -Encoding utf8
+    $deploymentTargets = @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')
+    foreach ($database in $deploymentTargets) {
         Copy-Item `
             -Path (Join-Path $fixtures 'deploy-report-changed.xml') `
-            -Destination (Join-Path $staleApprovedReports "$database.deploy-report.xml")
-        Set-Content -Path (Join-Path $approvedScripts "$database.deploy.sql") -Value 'SELECT 1;' -Encoding utf8
+            -Destination (Join-Path $approvedReports "$database.deploy-report.xml")
+        $databaseScript = "/*`nDeployment script for $database`n*/`n:setvar DatabaseName `"$database`"`n:setvar DefaultFilePrefix `"$database`"`nSELECT 1;"
+        Set-Content -Path (Join-Path $approvedScripts "$database.deploy.sql") -Value $databaseScript -Encoding utf8
         Set-Content -Path (Join-Path $approvedPolicyReports "$database.deployment-script-policy.md") -Value '# passed' -Encoding utf8
     }
-    [ordered]@{
-        manifestVersion = 2
-        environment = 'fixture'
-        representativeDatabase = 'CanaryDb'
-        targetDatabases = @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')
-        allDatabasePlansValidated = $true
-        allDatabaseScriptsGated = $false
-        gatedDatabases = @('CanaryDb')
-        driftPolicy = 'Warn'
-    } | ConvertTo-Json | Set-Content -Path (Join-Path $approvedRoot 'target-databases.json') -Encoding utf8
-    Assert-Throws {
-        & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') `
-            -ServerName 'sqlmi.example.test' `
-            -DatabaseNames 'CanaryDb,Shard02,Shard03,Shard04' `
-            -DacpacPath $fakeDacpac `
-            -PublishProfilePath $fakeProfile `
-            -SqlPackagePath $fakeSqlPackage `
-            -ApprovedReportPath (Join-Path $approvedRoot 'deploy-report.xml') `
-            -AccessTokenProviderPath $fakeTokenProvider `
-            -SmokeTestScriptPath $fakeSmokeTest `
-            -TestPath $fixtures `
-            -ReportDirectory (Join-Path $temporaryPath 'ungated-reports') `
-            -MaxParallel 3
-    } 'Deployment must reject a per-database report manifest unless every target script was gated.'
-    [ordered]@{
-        manifestVersion = 2
-        environment = 'fixture'
-        representativeDatabase = 'CanaryDb'
-        targetDatabases = @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')
-        allDatabasePlansValidated = $true
-        allDatabaseScriptsGated = $true
-        gatedDatabases = @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')
-        driftPolicy = 'Warn'
-    } | ConvertTo-Json | Set-Content -Path (Join-Path $approvedRoot 'target-databases.json') -Encoding utf8
-    $env:PHASE2_TOKEN_LOG_DIRECTORY = $tokenLogDirectory
-    & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') `
-        -ServerName 'sqlmi.example.test' `
-        -DatabaseNames 'CanaryDb,Shard02,Shard03,Shard04' `
-        -DacpacPath $fakeDacpac `
-        -PublishProfilePath $fakeProfile `
-        -SqlPackagePath $fakeSqlPackage `
-        -ApprovedReportPath (Join-Path $approvedRoot 'deploy-report.xml') `
-        -AccessTokenProviderPath $fakeTokenProvider `
-        -SmokeTestScriptPath $fakeSmokeTest `
-        -TestPath $fixtures `
-        -ReportDirectory (Join-Path $temporaryPath 'gated-current-reports') `
-        -MaxParallel 3
-    foreach ($database in @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')) {
-        $tokenCalls = @(Get-Content -Path (Join-Path $tokenLogDirectory "$database.log"))
-        Assert-Equal $tokenCalls.Count 3 "Gated deployment '$database' must refresh before report, publish, and smoke test."
+    $manifestPath = Join-Path $approvedRoot 'target-databases.json'
+    $deployArguments = @{
+        ServerName = 'sqlmi.example.test'
+        DatabaseNames = $deploymentTargets -join ','
+        DacpacPath = $fakeDacpac
+        PublishProfilePath = $fakeProfile
+        SqlPackagePath = $fakeSqlPackage
+        ApprovedReportPath = Join-Path $approvedRoot 'deploy-report.xml'
+        AccessTokenProviderPath = $fakeTokenProvider
+        SmokeTestScriptPath = $fakeSmokeTest
+        TestPath = $fixtures
+        MaxParallel = 3
+        EnvironmentName = 'fixture'
     }
-    Remove-Item -Path (Join-Path $tokenLogDirectory '*.log') -Force
-    Copy-Item `
-        -Path (Join-Path $fixtures 'deploy-report-empty.xml') `
-        -Destination (Join-Path $staleApprovedReports 'Shard02.deploy-report.xml') `
-        -Force
-    [ordered]@{
-        manifestVersion = 2
-        environment = 'fixture'
-        representativeDatabase = 'CanaryDb'
-        targetDatabases = @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')
-        allDatabasePlansValidated = $false
-        allDatabaseScriptsGated = $false
-        gatedDatabases = @('CanaryDb')
-        driftPolicy = 'Warn'
-    } | ConvertTo-Json | Set-Content -Path (Join-Path $approvedRoot 'target-databases.json') -Encoding utf8
 
-    & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') `
-        -ServerName 'sqlmi.example.test' `
-        -DatabaseNames 'CanaryDb,Shard02,Shard03,Shard04' `
-        -DacpacPath $fakeDacpac `
-        -PublishProfilePath $fakeProfile `
-        -SqlPackagePath $fakeSqlPackage `
-        -ApprovedReportPath (Join-Path $approvedRoot 'deploy-report.xml') `
-        -AccessTokenProviderPath $fakeTokenProvider `
-        -SmokeTestScriptPath $fakeSmokeTest `
-        -TestPath $fixtures `
-        -ReportDirectory (Join-Path $temporaryPath 'current-reports') `
-        -MaxParallel 3
-    foreach ($database in @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')) {
+    Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $true
+    Remove-Item $manifestPath -Force
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
+            -ValidateAllDatabasePlans `
+            -ReportDirectory (Join-Path $temporaryPath 'missing-manifest')
+    } 'Deployment must fail closed when the approved manifest is missing.'
+
+    $manifestMutations = @(
+        @{ Name = 'non-integral version'; Apply = { param($m) $m.manifestVersion = 3.1 } },
+        @{ Name = 'validation mode mismatch'; Apply = { param($m) $m.allDatabasePlansValidated = $false } },
+        @{ Name = 'database list mismatch'; Apply = { param($m) $m.targetDatabases[1] = 'WrongShard' } },
+        @{ Name = 'DACPAC hash mismatch'; Apply = { param($m) $m.dacpacSha256 = '0' * 64 } },
+        @{ Name = 'path traversal'; Apply = { param($m) $m.artifacts[0].path = '../deploy-report.xml' } },
+        @{
+            Name = 'case-insensitive duplicate path'
+            Apply = {
+                param($m)
+                $m.artifacts[1].path = $m.artifacts[0].path.ToUpperInvariant()
+            }
+        }
+    )
+    foreach ($mutation in $manifestMutations) {
+        Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $true
+        $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+        & $mutation.Apply $manifest
+        $manifest | ConvertTo-Json -Depth 6 | Set-Content $manifestPath -Encoding utf8
+        Assert-Throws {
+            & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
+                -ValidateAllDatabasePlans `
+                -ReportDirectory (Join-Path $temporaryPath 'invalid-manifest')
+        } "Deployment must reject manifest defect: $($mutation.Name)."
+    }
+
+    foreach ($artifactRelativePath in @(
+        'deploy-report.xml',
+        'deploy.sql',
+        'deployment-script-policy.md',
+        'all-database-reports/Shard02.deploy-report.xml',
+        'all-database-scripts/Shard02.deploy.sql',
+        'all-database-policy-reports/Shard02.deployment-script-policy.md'
+    )) {
+        Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $true
+        $artifactPath = Join-Path $approvedRoot $artifactRelativePath
+        $originalContent = Get-Content $artifactPath -Raw
+        Add-Content -Path $artifactPath -Value 'tampered' -Encoding utf8
+        Assert-Throws {
+            & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
+                -ValidateAllDatabasePlans `
+                -ReportDirectory (Join-Path $temporaryPath 'tampered-artifact')
+        } "Deployment must reject a tampered approved $artifactRelativePath artifact."
+        Set-Content -Path $artifactPath -Value $originalContent -NoNewline -Encoding utf8
+    }
+
+    Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $true
+    $originalDacpac = Get-Content $fakeDacpac -Raw
+    Add-Content -Path $fakeDacpac -Value 'tampered' -Encoding utf8
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
+            -ValidateAllDatabasePlans `
+            -ReportDirectory (Join-Path $temporaryPath 'tampered-dacpac')
+    } 'Deployment must reject a downloaded DACPAC that differs from the approved hash.'
+    Set-Content -Path $fakeDacpac -Value $originalDacpac -NoNewline -Encoding utf8
+
+    Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $true
+    $env:PHASE2_TOKEN_LOG_DIRECTORY = $tokenLogDirectory
+    Remove-Item -Path $planLog -Force -ErrorAction SilentlyContinue
+    & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
+        -ValidateAllDatabasePlans `
+        -ReportDirectory (Join-Path $temporaryPath 'gated-current-reports')
+    foreach ($database in $deploymentTargets) {
         $tokenCalls = @(Get-Content -Path (Join-Path $tokenLogDirectory "$database.log"))
-        Assert-Equal $tokenCalls.Count 3 "Database '$database' must refresh its token before report, publish, and smoke test."
+        Assert-Equal $tokenCalls.Count 4 "Deployment '$database' must refresh before report, script, publish, and smoke test."
+    }
+    $canaryActions = @(
+        Get-Content $planLog |
+            Where-Object { $_ -like '*:CanaryDb' } |
+            ForEach-Object { ($_ -split ':')[1] }
+    )
+    Assert-Equal ($canaryActions -join '|') 'DeployReport|Script|Publish' 'Deployment must regenerate report then script immediately before publish.'
+
+    Remove-Item -Path (Join-Path $tokenLogDirectory '*.log') -Force
+    Remove-Item -Path $planLog -Force
+    $env:PHASE2_DESTRUCTIVE_DATABASE = 'CanaryDb'
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
+            -ValidateAllDatabasePlans `
+            -ReportDirectory (Join-Path $temporaryPath 'aba-current-reports')
+    } 'A destructive current script must stop publish even when the current report matches approval.'
+    $abaActions = @(Get-Content $planLog)
+    Assert-True `
+        -Condition (
+            ($abaActions -join '|') -match 'ACTION:DeployReport:CanaryDb\|ACTION:Script:CanaryDb' -and
+            @($abaActions | Where-Object { $_ -eq 'ACTION:Publish:CanaryDb' }).Count -eq 0
+        ) `
+        -Message 'The ABA regression must fail after current script generation and before Publish.'
+    Remove-Item Env:PHASE2_DESTRUCTIVE_DATABASE
+
+    Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $false
+    Remove-Item -Path (Join-Path $tokenLogDirectory '*.log') -Force -ErrorAction SilentlyContinue
+    & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
+        -ReportDirectory (Join-Path $temporaryPath 'representative-current-reports')
+    foreach ($database in $deploymentTargets) {
+        $tokenCalls = @(Get-Content -Path (Join-Path $tokenLogDirectory "$database.log"))
+        Assert-Equal $tokenCalls.Count 4 "Representative deployment '$database' must refresh before report, script, publish, and smoke test."
     }
 
     Write-Host 'All Phase 2 fixture and static tests passed.'
