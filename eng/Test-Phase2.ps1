@@ -1131,6 +1131,18 @@ END;
             [int]$ConnectionTimeout
         )
 
+        $null = @(
+            $ServerInstance,
+            $Database,
+            $AccessToken,
+            $DisableCommands,
+            $DisableVariables,
+            $AbortOnError,
+            $Encrypt,
+            $TrustServerCertificate,
+            $QueryTimeout,
+            $ConnectionTimeout
+        )
         Add-Content -Path $env:PHASE2_BLOCKED_SQLCMD_MOCK_PATH -Value $Query -Encoding utf8
     }
     try {
