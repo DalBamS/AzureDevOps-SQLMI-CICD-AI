@@ -62,6 +62,9 @@ function Write-TestDeploymentManifest {
 
     $representative = $DatabaseNames[0]
     $postDeployment = Get-DacFxPostDeploymentPayload -Path (Join-Path $ReviewPath 'deploy.sql')
+    $postDeploymentSemantics = Get-DacFxPostDeploymentSemantic `
+        -Path (Join-Path $ReviewPath 'deploy.sql') `
+        -TargetDatabase $representative
     $artifactDefinitions = [System.Collections.Generic.List[object]]::new()
     foreach ($definition in @(
         @('representativeReport', 'deploy-report.xml'),
@@ -101,7 +104,7 @@ function Write-TestDeploymentManifest {
         }
     )
     [ordered]@{
-        manifestVersion = 4
+        manifestVersion = 5
         environment = 'fixture'
         representativeDatabase = $representative
         targetDatabases = $DatabaseNames
@@ -112,9 +115,12 @@ function Write-TestDeploymentManifest {
         dacpacSha256 = (Get-FileHash -Path $DacpacPath -Algorithm SHA256).Hash
         postDeploymentContract = $postDeployment.Contract
         postDeploymentPayloadSha256 = $postDeployment.Sha256
+        postDeploymentSemanticSha256 = $postDeploymentSemantics.SemanticPayloadSha256
+        postDeploymentCanonicalVariableMapSha256 = $postDeploymentSemantics.CanonicalVariableMapSha256
+        postDeploymentRuntimeVariables = $postDeploymentSemantics.RuntimeVariableContract
         artifacts = $artifacts
     } |
-        ConvertTo-Json -Depth 6 |
+        ConvertTo-Json -Depth 8 |
         Set-Content -Path (Join-Path $ReviewPath 'target-databases.json') -Encoding utf8
 }
 
@@ -122,7 +128,7 @@ function Get-TestDeploymentScript {
     param(
         [Parameter(Mandatory)][string]$DatabaseName,
         [switch]$PostDeploymentOnly,
-        [string]$PostDeploymentSql = 'SELECT 1;'
+        [string]$PostDeploymentSql = "IF N'`$(Predicate)' = N'1=1' SELECT 1;"
     )
 
     $lines = @(
@@ -137,6 +143,7 @@ function Get-TestDeploymentScript {
         ":setvar DefaultFilePrefix `"$DatabaseName`"",
         ':setvar DefaultDataPath "/var/opt/mssql/data/"',
         ':setvar DefaultLogPath "/var/opt/mssql/data/"',
+        ':setvar Predicate "1=1"',
         'GO',
         ':on error exit',
         'GO',
@@ -278,8 +285,18 @@ try {
         @{ Name = 'comment-concat'; Sql = "EXEC (N'DR'/* split */ + N'OP TABLE [dbo].[O''Brien];');" },
         @{ Name = 'nested-dynamic'; Sql = "EXEC(N'EXEC(N''DROP TABLE [dbo].[Danger];'')');" },
         @{ Name = 'database-qualified'; Sql = "EXEC AppDb.sys.sp_executesql N'DROP TABLE [dbo].[Danger];';" },
+        @{ Name = 'omitted-schema-sp-executesql'; Sql = "EXEC master..sp_executesql N'DROP TABLE [dbo].[Danger];';" },
+        @{ Name = 'quoted-omitted-schema-sp-executesql'; Sql = "EXEC [master]..[sp_executesql] N'DROP TABLE [dbo].[Danger];';" },
+        @{ Name = 'leading-omitted-sp-executesql'; Sql = "EXEC .sys.sp_executesql N'DROP TABLE [dbo].[Danger];';" },
+        @{ Name = 'double-leading-omitted-sp-executesql'; Sql = "EXEC ..sp_executesql N'DROP TABLE [dbo].[Danger];';" },
+        @{ Name = 'double-middle-omitted-sp-executesql'; Sql = "EXEC server...sp_executesql N'DROP TABLE [dbo].[Danger];';" },
+        @{ Name = 'four-part-omitted-sp-executesql'; Sql = "EXEC [server].[master]..`"sp_executesql`" N'DROP TABLE [dbo].[Danger];';" },
         @{ Name = 'quoted-sp-rename'; Sql = 'EXEC "sys"."sp_rename" N''dbo.OldName'', N''NewName'';' },
-        @{ Name = 'qualified-quoted-sp-rename'; Sql = 'EXEC [AppDb]."sys".[sp_rename] N''dbo.OldName'', N''NewName'';' }
+        @{ Name = 'qualified-quoted-sp-rename'; Sql = 'EXEC [AppDb]."sys".[sp_rename] N''dbo.OldName'', N''NewName'';' },
+        @{ Name = 'omitted-schema-sp-rename'; Sql = 'EXEC master..sp_rename N''dbo.OldName'', N''NewName'';' },
+        @{ Name = 'malformed-trailing-dot'; Sql = 'EXEC master..benignProc.;' },
+        @{ Name = 'malformed-five-part'; Sql = 'EXEC server.database.schema.extra.benignProc @p=1;' },
+        @{ Name = 'malformed-missing-final'; Sql = 'EXEC master..;' }
     )
     foreach ($case in $dynamicPolicyCases) {
         $casePath = Join-Path $temporaryPath "$($case.Name).sql"
@@ -305,6 +322,9 @@ try {
         @{ Name = 'nested-comment'; Sql = '/* outer /* nested */ EXEC(N''DROP TABLE dbo.Hidden''); */ SELECT 1;' },
         @{ Name = 'bracket-apostrophe'; Sql = 'CREATE TABLE [dbo].[O''Brien] ([Id] int NOT NULL);' },
         @{ Name = 'quoted-user-procedure'; Sql = 'EXEC "dbo"."sp_executesql_safe" @p = 1;' },
+        @{ Name = 'omitted-schema-user-procedure'; Sql = 'EXEC master..benignProc @p = 1;' },
+        @{ Name = 'quoted-omitted-user-procedure'; Sql = 'EXEC [master]..[benignProc] @p = 1;' },
+        @{ Name = 'four-part-omitted-user-procedure'; Sql = 'EXEC server.master..benignProc @p = 1;' },
         @{ Name = 'sqlcmd-dacfx-variables'; Sql = @'
 :setvar DatabaseName "AppDb"
 :setvar DefaultFilePrefix "AppDb"
@@ -337,12 +357,35 @@ PRINT N'`$(NotAVariable)';
         @{ Name = 'sqlcmd-malformed'; Sql = ":setvar Name unquoted`nSELECT 1;" },
         @{ Name = 'sqlcmd-nested-value'; Sql = ":setvar Name `"`$(Other)`"`nSELECT N'`$(Name)';" },
         @{ Name = 'sqlcmd-semicolon-value'; Sql = ":setvar Name `"value;DROP`"`nSELECT N'`$(Name)';" },
+        @{ Name = 'sqlcmd-after-line-comment-block-opener'; Sql = "-- /*`n!! whoami`n*/`nSELECT 1;" },
+        @{ Name = 'sqlcmd-after-line-comment-quote'; Sql = "-- '`n:quit`nSELECT 1;" },
+        @{ Name = 'sqlcmd-after-line-comment-bracket'; Sql = "-- [`n:exit`nSELECT 1;" },
+        @{ Name = 'sqlcmd-after-line-comment-double-quote'; Sql = "-- `"`n:connect tcp:other.example.test`nSELECT 1;" },
         @{ Name = 'alter-long-whitespace'; Sql = "ALTER TABLE [dbo].[T] $(' ' * 1001) DROP COLUMN [C];" },
         @{ Name = 'alter-very-long-whitespace'; Sql = "ALTER TABLE [dbo].[T] $(' ' * 10000) DROP CONSTRAINT [DF_T_C];" },
         @{ Name = 'alter-nested-comment'; Sql = "ALTER TABLE [dbo].[T] /* outer /* $('x' * 1500) */ outer */ DROP COLUMN [C];" },
         @{ Name = 'alter-line-comment'; Sql = "ALTER TABLE [dbo].[T] -- $('x' * 1500)`nDROP CONSTRAINT [DF_T_C];" },
         @{ Name = 'alter-second-statement'; Sql = "SELECT 1;`nGO`nALTER TABLE [dbo].[T] $(' ' * 1500) DROP COLUMN [C];" }
     )
+    $commandIndex = 0
+    foreach ($command in @(
+        ':quit',
+        ':exit',
+        ':connect tcp:other.example.test',
+        ':r .\other.sql',
+        ':on error ignore',
+        ':out output.txt',
+        ':error error.txt',
+        '!! whoami',
+        ':unknown value',
+        '   :QuIt'
+    )) {
+        $commandIndex++
+        $sqlCmdAndAlterPolicyCases += @{
+            Name = "sqlcmd-command-$commandIndex"
+            Sql = "$command`nSELECT 1;"
+        }
+    }
     foreach ($case in $sqlCmdAndAlterPolicyCases) {
         $casePath = Join-Path $temporaryPath "$($case.Name).sql"
         $caseReportPath = Join-Path $temporaryPath "$($case.Name).md"
@@ -365,6 +408,17 @@ PRINT N'`$(NotAVariable)';
     Assert-True `
         -Condition ((Get-Content -Path $longAlterColumnReport -Raw) -match 'DEPLOY006') `
         -Message 'A long ALTER COLUMN statement must retain its compatibility warning.'
+    foreach ($case in @(
+        @{ Name = 'sqlcmd-command-in-string'; Sql = "PRINT N':quit';" },
+        @{ Name = 'sqlcmd-command-in-multiline-string'; Sql = "PRINT N'first`n:quit`nlast';" },
+        @{ Name = 'sqlcmd-command-in-comment'; Sql = "/*`n:quit`n*/`nSELECT 1;" }
+    )) {
+        $casePath = Join-Path $temporaryPath "$($case.Name).sql"
+        Set-Content -Path $casePath -Value $case.Sql -Encoding utf8
+        & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+            -ScriptPath $casePath `
+            -ReportPath (Join-Path $temporaryPath "$($case.Name).md")
+    }
     $lexicalRecoveryBypassPath = Join-Path $temporaryPath 'postdeploy-lexical-confusion.sql'
     (
         Get-TestDeploymentScript -DatabaseName CanaryDb -PostDeploymentOnly
@@ -408,8 +462,13 @@ PRINT N'`$(NotAVariable)';
         -Condition ($templateText -match 'DeployInstanceObjects[\s\S]+dependsOn:\s*DeployDacpac') `
         -Message 'Instance object deployment must depend on successful DACPAC rollout.'
     Assert-True `
-        -Condition ($templateText -match 'deployment-review-\$\{\{\s*parameters\.environmentName\s*\}\}-pitr-marker') `
+        -Condition ($templateText -match 'artifactName:\s*deployment-review-\$\{\{\s*parameters\.environmentName\s*\}\}-pitr-marker') `
         -Message 'The deployment review PITR marker artifact is missing.'
+    Assert-True `
+        -Condition (
+            $templateText -match "(?s)condition:\s*and\(always\(\),\s*eq\(variables\['pitrMarkerCreated'\],\s*'true'\)\).*?artifactName:\s*deployment-review-\$\{\{\s*parameters\.environmentName\s*\}\}-pitr-marker"
+        ) `
+        -Message 'PITR marker publishing must run under cancellation with condition always().'
     Assert-True `
         -Condition ($pipelineText -match '(?m)^\s*default:\s*4\s*$') `
         -Message 'The maxParallel default of 4 is missing.'
@@ -424,7 +483,7 @@ PRINT N'`$(NotAVariable)';
         -Message 'Queue-supplied warning values must cross the pipeline boundary through an environment variable.'
     $rolloutTask = [regex]::Match(
         $templateText,
-        '(?s)- task: AzureCLI@2\s+displayName: Deploy canary, test, then fan out(?<task>.*?)(?=\r?\n\s+- publish:)'
+        '(?s)- task: AzureCLI@2\s+displayName: Deploy canary, test, then fan out(?<task>.*?)(?=\r?\n\s+- task: PublishPipelineArtifact@1)'
     ).Groups['task'].Value
     Assert-True `
         -Condition ($rolloutTask -match '(?m)^\s+keepAzSessionActive:\s*true\s*$') `
@@ -440,14 +499,26 @@ PRINT N'`$(NotAVariable)';
     Assert-True `
         -Condition (
             $deploymentExecutorText -match 'Invoke-Sqlcmd' -and
-            $deploymentExecutorText -match 'InputFile\s*=\s*\(Resolve-Path \$ScriptPath\)\.Path' -and
+            $deploymentExecutorText -match 'InputFile\s*=\s*\$sanitizedPath' -and
             $deploymentExecutorText -match 'AccessToken\s*=\s*\$AccessToken' -and
             $deploymentExecutorText -match 'AbortOnError\s*=\s*\$true' -and
+            $deploymentExecutorText -match 'DisableCommands\s*=\s*\$true' -and
+            $deploymentExecutorText -match 'DisableVariables\s*=\s*\$true' -and
+            $deploymentExecutorText -match 'ExpectedSanitizedSha256' -and
+            $deploymentExecutorText -match 'SanitizedSha256\s+-cne' -and
             $deploymentExecutorText -match "Encrypt\s*=\s*'Mandatory'" -and
             $deploymentExecutorText -match 'TrustServerCertificate\s*=\s*\$false' -and
-            $deploymentExecutorText -match 'Variable\s*=\s*\$sqlCmdVariables'
+            $deploymentExecutorText -match 'finally\s*\{[\s\S]*?Remove-Item\s+-Path\s+\$sanitizedPath'
         ) `
-        -Message 'Exact execution must use the gated SQLCMD variable map and secure fail-fast InputFile options.'
+        -Message 'Exact execution must use sanitized SQL, disable secondary SQLCMD parsing, and delete its temporary file.'
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'Invoke-ValidatedDeploymentScript.ps1') `
+            -ServerName 'sqlmi.example.test' `
+            -DatabaseName 'AppDb' `
+            -AccessToken 'fixture-token' `
+            -ScriptPath (Join-Path $fixtures 'deployment-safe.sql') `
+            -ExpectedSanitizedSha256 ('0' * 64)
+    } 'Exact execution must reject a sanitized SQL hash that differs from the policy gate output.'
 
     $injectionMarker = Join-Path $temporaryPath 'pipeline-parameter-injection.txt'
     $env:PHASE2_WARNING_PAYLOAD = "46010`"; Set-Content -Path '$injectionMarker' -Value injected; #"
@@ -497,6 +568,7 @@ elseif ($action -eq 'Script') {
         ":setvar DefaultFilePrefix `"$database`"",
         ':setvar DefaultDataPath "/var/opt/mssql/data/"',
         ':setvar DefaultLogPath "/var/opt/mssql/data/"',
+        ':setvar Predicate "1=1"',
         'GO',
         ':on error exit',
         'GO',
@@ -531,7 +603,29 @@ elseif ($action -eq 'Script') {
     if ($env:PHASE2_POSTDEPLOY_MARKER_MODE -eq 'duplicate') {
         $lines += '-- SQLMI-CICD POSTDEPLOY START v1'
     }
-    $lines += $(if ($env:PHASE2_POSTDEPLOY_PAYLOAD) { $env:PHASE2_POSTDEPLOY_PAYLOAD } else { 'SELECT 1;' })
+    switch ($env:PHASE2_SQLCMD_MUTATION) {
+        'predicate' {
+            $predicateIndex = $lines.IndexOf(':setvar Predicate "1=1"')
+            $lines[$predicateIndex] = ':setvar Predicate "1=0"'
+        }
+        'extra' {
+            $predicateIndex = $lines.IndexOf(':setvar Predicate "1=1"')
+            $lines = @(
+                $lines[0..$predicateIndex]
+                ':setvar Extra "unexpected"'
+                $lines[($predicateIndex + 1)..($lines.Count - 1)]
+            )
+        }
+        'removed' {
+            $lines = @($lines | Where-Object { $_ -cne ':setvar Predicate "1=1"' })
+        }
+    }
+    $lines += $(if ($env:PHASE2_POSTDEPLOY_PAYLOAD) {
+        $env:PHASE2_POSTDEPLOY_PAYLOAD
+    }
+    else {
+        "IF N'`$(Predicate)' = N'1=1' SELECT 1;"
+    })
     $lines += @(
         '-- SQLMI-CICD POSTDEPLOY END v1',
         'GO',
@@ -636,10 +730,13 @@ Add-Content -Path $env:PHASE2_PLAN_LOG -Value "TOKEN:$DatabaseName" -Encoding ut
         ConvertFrom-Json
     Assert-True `
         -Condition (
-            $successfulManifest.manifestVersion -eq 4 -and
+            $successfulManifest.manifestVersion -eq 5 -and
             $successfulManifest.dacpacSha256 -eq (Get-FileHash $fakeDacpac -Algorithm SHA256).Hash -and
             $successfulManifest.postDeploymentContract -eq 'sqlmi-cicd-postdeploy-v1' -and
             $successfulManifest.postDeploymentPayloadSha256 -match '^[A-F0-9]{64}$' -and
+            $successfulManifest.postDeploymentSemanticSha256 -match '^[A-F0-9]{64}$' -and
+            $successfulManifest.postDeploymentCanonicalVariableMapSha256 -match '^[A-F0-9]{64}$' -and
+            @($successfulManifest.postDeploymentRuntimeVariables).Count -eq 4 -and
             @($successfulManifest.artifacts).Count -eq 9 -and
             $successfulManifest.allDatabasePlansValidated -and
             $successfulManifest.allDatabaseScriptsGated -and
@@ -704,6 +801,7 @@ param(
     [string]$DatabaseName,
     [string]$AccessToken,
     [string]$ScriptPath,
+    [string]$ExpectedSanitizedSha256,
     [int]$CommandTimeout
 )
 if ([string]::IsNullOrWhiteSpace($AccessToken)) {
@@ -711,6 +809,9 @@ if ([string]::IsNullOrWhiteSpace($AccessToken)) {
 }
 if (-not (Test-Path $ScriptPath -PathType Leaf)) {
     throw 'The deployment script executor did not receive the generated script path.'
+}
+if ($ExpectedSanitizedSha256 -notmatch '^[A-F0-9]{64}$') {
+    throw 'The deployment script executor did not receive the policy-gated sanitized SQL hash.'
 }
 Add-Content `
     -Path (Join-Path $env:PHASE2_ACTION_LOG_DIRECTORY "$DatabaseName.log") `
@@ -771,6 +872,9 @@ if ($DatabaseName -eq $env:PHASE2_EXECUTION_FAIL_DATABASE) {
         @{ Name = 'database list mismatch'; Apply = { param($m) $m.targetDatabases[1] = 'WrongShard' } },
         @{ Name = 'DACPAC hash mismatch'; Apply = { param($m) $m.dacpacSha256 = '0' * 64 } },
         @{ Name = 'post-deployment hash mismatch'; Apply = { param($m) $m.postDeploymentPayloadSha256 = '0' * 64 } },
+        @{ Name = 'post-deployment semantic hash mismatch'; Apply = { param($m) $m.postDeploymentSemanticSha256 = '0' * 64 } },
+        @{ Name = 'post-deployment variable map mismatch'; Apply = { param($m) $m.postDeploymentCanonicalVariableMapSha256 = '0' * 64 } },
+        @{ Name = 'post-deployment runtime mapping mismatch'; Apply = { param($m) $m.postDeploymentRuntimeVariables[0].mapping = 'approvedValue' } },
         @{ Name = 'path traversal'; Apply = { param($m) $m.artifacts[0].path = '../deploy-report.xml' } },
         @{
             Name = 'case-insensitive duplicate path'
@@ -784,7 +888,7 @@ if ($DatabaseName -eq $env:PHASE2_EXECUTION_FAIL_DATABASE) {
         Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $true
         $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
         & $mutation.Apply $manifest
-        $manifest | ConvertTo-Json -Depth 6 | Set-Content $manifestPath -Encoding utf8
+        $manifest | ConvertTo-Json -Depth 8 | Set-Content $manifestPath -Encoding utf8
         Assert-Throws {
             & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
                 -ValidateAllDatabasePlans `
@@ -926,18 +1030,22 @@ if ($DatabaseName -eq $env:PHASE2_EXECUTION_FAIL_DATABASE) {
     }
 
     foreach ($recoveryFailure in @(
-        @{ Name = 'payload changed'; Report = 'deploy-report-empty.xml'; Payload = 'SELECT 2;'; Marker = '' },
-        @{ Name = 'schema operation remains'; Report = 'deploy-report-changed.xml'; Payload = ''; Marker = '' },
-        @{ Name = 'marker missing'; Report = 'deploy-report-empty.xml'; Payload = ''; Marker = 'missing' },
-        @{ Name = 'marker duplicated'; Report = 'deploy-report-empty.xml'; Payload = ''; Marker = 'duplicate' },
-        @{ Name = 'predeploy SQL mixed'; Report = 'deploy-report-empty.xml'; Payload = ''; Marker = 'predeploy' },
-        @{ Name = 'string comment confusion'; Report = 'deploy-report-empty.xml'; Payload = ''; Marker = 'lexical-confusion' }
+        @{ Name = 'payload changed'; Report = 'deploy-report-empty.xml'; Payload = 'SELECT 2;'; Marker = ''; SqlCmd = '' },
+        @{ Name = 'schema operation remains'; Report = 'deploy-report-changed.xml'; Payload = ''; Marker = ''; SqlCmd = '' },
+        @{ Name = 'marker missing'; Report = 'deploy-report-empty.xml'; Payload = ''; Marker = 'missing'; SqlCmd = '' },
+        @{ Name = 'marker duplicated'; Report = 'deploy-report-empty.xml'; Payload = ''; Marker = 'duplicate'; SqlCmd = '' },
+        @{ Name = 'predeploy SQL mixed'; Report = 'deploy-report-empty.xml'; Payload = ''; Marker = 'predeploy'; SqlCmd = '' },
+        @{ Name = 'string comment confusion'; Report = 'deploy-report-empty.xml'; Payload = ''; Marker = 'lexical-confusion'; SqlCmd = '' },
+        @{ Name = 'SQLCMD predicate changed'; Report = 'deploy-report-empty.xml'; Payload = ''; Marker = ''; SqlCmd = 'predicate' },
+        @{ Name = 'SQLCMD variable added'; Report = 'deploy-report-empty.xml'; Payload = ''; Marker = ''; SqlCmd = 'extra' },
+        @{ Name = 'SQLCMD variable removed'; Report = 'deploy-report-empty.xml'; Payload = ''; Marker = ''; SqlCmd = 'removed' }
     )) {
         Remove-Item -Path $planLog -Force -ErrorAction SilentlyContinue
         Remove-Item -Path (Join-Path $actionLogDirectory '*.log') -Force -ErrorAction SilentlyContinue
         $env:PHASE2_CHANGED_REPORT = Join-Path $fixtures $recoveryFailure.Report
         $env:PHASE2_POSTDEPLOY_PAYLOAD = $recoveryFailure.Payload
         $env:PHASE2_POSTDEPLOY_MARKER_MODE = $recoveryFailure.Marker
+        $env:PHASE2_SQLCMD_MUTATION = $recoveryFailure.SqlCmd
         Assert-Throws {
             & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
                 -ValidateAllDatabasePlans `
@@ -949,6 +1057,7 @@ if ($DatabaseName -eq $env:PHASE2_EXECUTION_FAIL_DATABASE) {
     }
     Remove-Item Env:PHASE2_POSTDEPLOY_PAYLOAD -ErrorAction SilentlyContinue
     Remove-Item Env:PHASE2_POSTDEPLOY_MARKER_MODE -ErrorAction SilentlyContinue
+    Remove-Item Env:PHASE2_SQLCMD_MUTATION -ErrorAction SilentlyContinue
     Remove-Item Env:PHASE2_POSTDEPLOY_ONLY_DATABASE -ErrorAction SilentlyContinue
     $env:PHASE2_CHANGED_REPORT = Join-Path $fixtures 'deploy-report-changed.xml'
     Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $true
@@ -980,6 +1089,16 @@ if ($DatabaseName -eq $env:PHASE2_EXECUTION_FAIL_DATABASE) {
         $tokenCalls = @(Get-Content -Path (Join-Path $tokenLogDirectory "$database.log"))
         Assert-Equal $tokenCalls.Count 4 "Representative deployment '$database' must refresh before report, script execution, and smoke test."
     }
+    $env:PHASE2_CHANGED_REPORT = Join-Path $fixtures 'deploy-report-empty.xml'
+    $env:PHASE2_POSTDEPLOY_ONLY_DATABASE = '*'
+    Remove-Item -Path (Join-Path $actionLogDirectory '*.log') -Force -ErrorAction SilentlyContinue
+    & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
+        -ReportDirectory (Join-Path $temporaryPath 'representative-recovery-current')
+    foreach ($database in $deploymentTargets) {
+        Assert-True `
+            -Condition (Test-Path (Join-Path $actionLogDirectory "$database.log")) `
+            -Message "Representative recovery must allow the approved runtime target mapping for '$database'."
+    }
 
     Write-Host 'All Phase 2 fixture and static tests passed.'
 }
@@ -996,6 +1115,7 @@ finally {
     Remove-Item Env:PHASE2_POSTDEPLOY_ONLY_DATABASE -ErrorAction SilentlyContinue
     Remove-Item Env:PHASE2_POSTDEPLOY_PAYLOAD -ErrorAction SilentlyContinue
     Remove-Item Env:PHASE2_POSTDEPLOY_MARKER_MODE -ErrorAction SilentlyContinue
+    Remove-Item Env:PHASE2_SQLCMD_MUTATION -ErrorAction SilentlyContinue
     if (Test-Path $temporaryPath) {
         Remove-Item -Path $temporaryPath -Recurse -Force
     }

@@ -105,6 +105,9 @@ foreach ($requiredProperty in @(
     'dacpacSha256',
     'postDeploymentContract',
     'postDeploymentPayloadSha256',
+    'postDeploymentSemanticSha256',
+    'postDeploymentCanonicalVariableMapSha256',
+    'postDeploymentRuntimeVariables',
     'artifacts'
 )) {
     if ($null -eq $metadata.PSObject.Properties[$requiredProperty]) {
@@ -123,7 +126,7 @@ if (
         [TypeCode]::Int64,
         [TypeCode]::UInt64
     ) -or
-    [int64]$metadata.manifestVersion -ne 4
+    [int64]$metadata.manifestVersion -ne 5
 ) {
     throw "Approved deployment manifest version '$($metadata.manifestVersion)' is not supported."
 }
@@ -164,7 +167,9 @@ if (
 }
 if (
     [string]$metadata.postDeploymentContract -cne 'sqlmi-cicd-postdeploy-v1' -or
-    [string]$metadata.postDeploymentPayloadSha256 -notmatch '^[A-Fa-f0-9]{64}$'
+    [string]$metadata.postDeploymentPayloadSha256 -notmatch '^[A-Fa-f0-9]{64}$' -or
+    [string]$metadata.postDeploymentSemanticSha256 -notmatch '^[A-Fa-f0-9]{64}$' -or
+    [string]$metadata.postDeploymentCanonicalVariableMapSha256 -notmatch '^[A-Fa-f0-9]{64}$'
 ) {
     throw 'Approved deployment manifest has an invalid post-deployment recovery contract.'
 }
@@ -231,14 +236,31 @@ if ((Resolve-Path $ApprovedReportPath).Path -cne $approvedArtifactPaths["represe
     throw 'ApprovedReportPath does not match the manifest representative report.'
 }
 $expectedPostDeploymentHash = ([string]$metadata.postDeploymentPayloadSha256).ToUpperInvariant()
+$expectedPostDeploymentSemanticHash = (
+    [string]$metadata.postDeploymentSemanticSha256
+).ToUpperInvariant()
+$expectedPostDeploymentVariableMapHash = (
+    [string]$metadata.postDeploymentCanonicalVariableMapSha256
+).ToUpperInvariant()
+$postDeploymentRuntimeVariables = @($metadata.postDeploymentRuntimeVariables)
 $approvedScriptKeys = @(
     $approvedArtifactPaths.Keys |
         Where-Object { $_ -like 'representativeScript|*' -or $_ -like 'databaseScript|*' }
 )
 foreach ($scriptKey in $approvedScriptKeys) {
-    $approvedPostDeployment = Get-DacFxPostDeploymentPayload -Path $approvedArtifactPaths[$scriptKey]
-    if ($approvedPostDeployment.Sha256 -cne $expectedPostDeploymentHash) {
-        throw "Approved script '$scriptKey' does not match the manifest post-deployment payload hash."
+    $scriptDatabase = $scriptKey.Substring($scriptKey.IndexOf('|') + 1)
+    $approvedPostDeployment = Get-DacFxPostDeploymentPayload `
+        -Path $approvedArtifactPaths[$scriptKey]
+    $approvedSemantics = Get-DacFxPostDeploymentSemantic `
+        -Path $approvedArtifactPaths[$scriptKey] `
+        -TargetDatabase $scriptDatabase `
+        -RuntimeVariableContract $postDeploymentRuntimeVariables
+    if (
+        $approvedPostDeployment.Sha256 -cne $expectedPostDeploymentHash -or
+        $approvedSemantics.SemanticPayloadSha256 -cne $expectedPostDeploymentSemanticHash -or
+        $approvedSemantics.CanonicalVariableMapSha256 -cne $expectedPostDeploymentVariableMapHash
+    ) {
+        throw "Approved script '$scriptKey' does not match the manifest post-deployment semantic contract."
     }
 }
 $usePerDatabaseApprovedReports = [bool]$ValidateAllDatabasePlans
@@ -259,6 +281,9 @@ $context = [pscustomobject]@{
     ReportDirectory = (Resolve-Path $ReportDirectory).Path
     RepresentativeDatabase = $rollout.Canary
     PostDeploymentPayloadSha256 = $expectedPostDeploymentHash
+    PostDeploymentSemanticSha256 = $expectedPostDeploymentSemanticHash
+    PostDeploymentVariableMapSha256 = $expectedPostDeploymentVariableMapHash
+    PostDeploymentRuntimeVariables = $postDeploymentRuntimeVariables
     ModulePath = $modulePath
     ConfirmScript = $confirmScript
     PolicyScript = $policyScript
@@ -380,6 +405,16 @@ $worker = {
         & $WorkerContext.PolicyScript `
             -ScriptPath $scriptPath `
             -ReportPath $policyReportPath
+        $sanitizedHashMatches = @(
+            [regex]::Matches(
+                (Get-Content -Path $policyReportPath -Raw),
+                '(?m)^- Sanitized SQL SHA-256: (?<hash>[A-F0-9]{64})\s*$'
+            )
+        )
+        if ($sanitizedHashMatches.Count -ne 1) {
+            throw 'Deployment policy report does not contain exactly one sanitized SQL hash.'
+        }
+        $validatedSanitizedSha256 = $sanitizedHashMatches[0].Groups['hash'].Value
 
         $approvedScript = if ($WorkerContext.UsePerDatabaseApprovedReports) {
             Join-Path $WorkerContext.ApprovedScriptsDirectory "$Database.deploy.sql"
@@ -417,11 +452,33 @@ $worker = {
                 -Path $scriptPath `
                 -RequirePostDeploymentOnly
             $approvedPostDeployment = Get-DacFxPostDeploymentPayload -Path $approvedScript
+            $currentPostDeploymentSemantics = Get-DacFxPostDeploymentSemantic `
+                -Path $scriptPath `
+                -TargetDatabase $Database `
+                -RuntimeVariableContract $WorkerContext.PostDeploymentRuntimeVariables
+            $approvedSemanticsTarget = if ($WorkerContext.UsePerDatabaseApprovedReports) {
+                $Database
+            }
+            else {
+                $WorkerContext.RepresentativeDatabase
+            }
+            $approvedPostDeploymentSemantics = Get-DacFxPostDeploymentSemantic `
+                -Path $approvedScript `
+                -TargetDatabase $approvedSemanticsTarget `
+                -RuntimeVariableContract $WorkerContext.PostDeploymentRuntimeVariables
             if (
                 $currentPostDeployment.Sha256 -cne $WorkerContext.PostDeploymentPayloadSha256 -or
-                $approvedPostDeployment.Sha256 -cne $WorkerContext.PostDeploymentPayloadSha256
+                $approvedPostDeployment.Sha256 -cne $WorkerContext.PostDeploymentPayloadSha256 -or
+                $currentPostDeploymentSemantics.SemanticPayloadSha256 -cne
+                    $WorkerContext.PostDeploymentSemanticSha256 -or
+                $approvedPostDeploymentSemantics.SemanticPayloadSha256 -cne
+                    $WorkerContext.PostDeploymentSemanticSha256 -or
+                $currentPostDeploymentSemantics.CanonicalVariableMapSha256 -cne
+                    $WorkerContext.PostDeploymentVariableMapSha256 -or
+                $approvedPostDeploymentSemantics.CanonicalVariableMapSha256 -cne
+                    $WorkerContext.PostDeploymentVariableMapSha256
             ) {
-                throw 'Post-deployment recovery payload does not match the approved manifest.'
+                throw 'Post-deployment recovery SQLCMD semantics do not match the approved manifest.'
             }
         }
 
@@ -432,6 +489,7 @@ $worker = {
             -DatabaseName $Database `
             -AccessToken $executionAccessToken `
             -ScriptPath $scriptPath `
+            -ExpectedSanitizedSha256 $validatedSanitizedSha256 `
             -CommandTimeout $WorkerContext.CommandTimeout
 
         $smokeTestAccessToken = Get-WorkerAccessToken

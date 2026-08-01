@@ -1,5 +1,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot 'SqlCmd.Common.psm1') -Force
 
 function Test-UnresolvedPipelineValue {
     param([AllowNull()][AllowEmptyString()][string]$Value)
@@ -179,20 +180,30 @@ function ConvertFrom-NestedSqlBlockComment {
 function Get-DacFxPostDeploymentPayload {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory, ParameterSetName = 'Path')]
         [ValidateScript({ Test-Path $_ -PathType Leaf })]
         [string]$Path,
+        [Parameter(Mandatory, ParameterSetName = 'Text')]
+        [AllowEmptyString()]
+        [string]$Text,
         [switch]$RequirePostDeploymentOnly
     )
 
     $startMarker = '-- SQLMI-CICD POSTDEPLOY START v1'
     $endMarker = '-- SQLMI-CICD POSTDEPLOY END v1'
-    $text = (Get-Content -Path $Path -Raw) -replace "`r`n", "`n"
+    $text = if ($PSCmdlet.ParameterSetName -eq 'Path') {
+        Get-Content -Path $Path -Raw
+    }
+    else {
+        $Text
+    }
+    $text = $text.Replace("`r`n", "`n").Replace("`r", "`n")
     $startMatches = @([regex]::Matches($text, "(?m)^$([regex]::Escape($startMarker))$"))
     $endMatches = @([regex]::Matches($text, "(?m)^$([regex]::Escape($endMarker))$"))
     if ($startMatches.Count -ne 1 -or $endMatches.Count -ne 1) {
         throw 'DacFx script must contain exactly one approved post-deployment marker pair.'
     }
+
     $start = $startMatches[0]
     $end = $endMatches[0]
     if ($end.Index -le $start.Index) {
@@ -217,6 +228,7 @@ GO\s*
 :setvar\s+DefaultFilePrefix\s+"[^"\r\n]+"\s*
 :setvar\s+DefaultDataPath\s+"[^"\r\n]+"\s*
 :setvar\s+DefaultLogPath\s+"[^"\r\n]+"\s*
+(?::setvar\s+[A-Za-z_][A-Za-z0-9_]*\s+"[^"\r\n]*"\s*)*
 GO\s*
 :on\s+error\s+exit\s*
 GO\s*
@@ -248,6 +260,114 @@ GO\s*\z
         Contract = 'sqlmi-cicd-postdeploy-v1'
         Payload = $payload
         Sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+    }
+}
+
+function Get-DacFxPostDeploymentSemantic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateScript({ Test-Path $_ -PathType Leaf })]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z0-9_-]+$')]
+        [string]$TargetDatabase,
+        [AllowNull()]
+        [object[]]$RuntimeVariableContract
+    )
+
+    $resolution = Resolve-SqlCmdScript -Path $Path
+    $values = [ordered]@{}
+    foreach ($variable in $resolution.Variables) {
+        $values[[string]$variable.Name] = [string]$variable.Value
+    }
+    $requiredRuntimeVariables = [ordered]@{
+        DatabaseName = 'targetDatabase'
+        DefaultFilePrefix = 'targetDatabase'
+        DefaultDataPath = 'approvedValue'
+        DefaultLogPath = 'approvedValue'
+    }
+    if ($null -eq $RuntimeVariableContract) {
+        $RuntimeVariableContract = @(
+            foreach ($name in $requiredRuntimeVariables.Keys) {
+                $entry = [ordered]@{
+                    name = $name
+                    mapping = $requiredRuntimeVariables[$name]
+                }
+                if ($entry.mapping -eq 'approvedValue') {
+                    $entry.approvedValue = [string]$values[$name]
+                }
+                $entry
+            }
+        )
+    }
+
+    if (@($RuntimeVariableContract).Count -ne $requiredRuntimeVariables.Count) {
+        throw 'The SQLCMD runtime variable contract must contain exactly the four supported DacFx identity variables.'
+    }
+    $contractByName = @{}
+    foreach ($entry in @($RuntimeVariableContract)) {
+        foreach ($property in @('name', 'mapping')) {
+            $hasProperty = if ($entry -is [Collections.IDictionary]) {
+                $entry.Contains($property)
+            }
+            else {
+                $null -ne $entry.PSObject.Properties[$property]
+            }
+            if (-not $hasProperty) {
+                throw "The SQLCMD runtime variable contract is missing '$property'."
+            }
+        }
+        $name = [string]$entry.name
+        $mapping = [string]$entry.mapping
+        if (
+            -not $requiredRuntimeVariables.Contains($name) -or
+            $mapping -cne $requiredRuntimeVariables[$name] -or
+            $contractByName.ContainsKey($name)
+        ) {
+            throw "The SQLCMD runtime variable contract entry '$name' is unsupported or duplicated."
+        }
+        $contractByName[$name] = $entry
+    }
+
+    $canonicalVariables = [ordered]@{}
+    foreach ($name in $requiredRuntimeVariables.Keys) {
+        if (-not $values.Contains($name)) {
+            throw "DacFx script is missing required SQLCMD runtime variable '$name'."
+        }
+        $entry = $contractByName[$name]
+        if (
+            $entry.mapping -eq 'targetDatabase' -and
+            [string]$values[$name] -cne $TargetDatabase
+        ) {
+            throw "SQLCMD runtime variable '$name' does not map to target database '$TargetDatabase'."
+        }
+        if ($entry.mapping -eq 'approvedValue') {
+            $hasApprovedValue = if ($entry -is [Collections.IDictionary]) {
+                $entry.Contains('approvedValue')
+            }
+            else {
+                $null -ne $entry.PSObject.Properties['approvedValue']
+            }
+            if (-not $hasApprovedValue) {
+                throw "SQLCMD runtime variable '$name' is missing its approved value."
+            }
+            if ([string]$values[$name] -cne [string]$entry.approvedValue) {
+                throw "SQLCMD runtime variable '$name' differs from its approved value."
+            }
+        }
+        $canonicalVariables[$name] = "__SQLCMD_RUNTIME_$($name.ToUpperInvariant())__"
+    }
+
+    $canonicalResolution = Resolve-SqlCmdScript `
+        -Path $Path `
+        -CanonicalVariables $canonicalVariables
+    $semanticPayload = Get-DacFxPostDeploymentPayload -Text $canonicalResolution.CanonicalText
+    return [pscustomobject]@{
+        RuntimeVariableContract = @($RuntimeVariableContract)
+        SemanticPayloadSha256 = $semanticPayload.Sha256
+        CanonicalVariableMapSha256 = $canonicalResolution.VariableMapSha256
+        SanitizedSha256 = $resolution.SanitizedSha256
     }
 }
 
@@ -372,6 +492,7 @@ Export-ModuleMember -Function @(
     'Get-DatabaseRollout',
     'Test-DeployReportHasChanges',
     'Get-DacFxPostDeploymentPayload',
+    'Get-DacFxPostDeploymentSemantic',
     'Invoke-DatabaseFanOut',
     'Write-DatabaseDeploymentSummary'
 )

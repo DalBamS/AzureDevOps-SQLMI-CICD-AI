@@ -213,6 +213,8 @@ stages:
                   displayName: Prepare pinned SQL test module
 
                 - pwsh: |
+                    $markerDirectory = "$(Pipeline.Workspace)/deployment-review-pitr/${{ parameters.environmentName }}"
+                    New-Item -ItemType Directory -Path $markerDirectory -Force | Out-Null
                     ./eng/New-PitrMarker.ps1 `
                       -DatabaseName $env:databaseName `
                       -DatabaseNames $env:databaseNames `
@@ -221,6 +223,7 @@ stages:
                       -OutputPath "$(Pipeline.Workspace)/deployment-review-pitr/${{ parameters.environmentName }}/pitr-marker.json" `
                       -BuildId "$(Build.BuildId)" `
                       -SourceVersion "$(Build.SourceVersion)"
+                    Write-Host "##vso[task.setvariable variable=pitrMarkerCreated]true"
                   displayName: Capture pre-deployment UTC PITR marker
                   env:
                     databaseName: $(databaseName)
@@ -268,10 +271,12 @@ stages:
                     databaseNames: $(databaseNames)
                     validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
 
-                - publish: $(Pipeline.Workspace)/deployment-review-pitr/${{ parameters.environmentName }}
-                  artifact: deployment-review-${{ parameters.environmentName }}-pitr-marker
+                - task: PublishPipelineArtifact@1
                   displayName: Publish PITR marker
-                  condition: succeededOrFailed()
+                  condition: and(always(), eq(variables['pitrMarkerCreated'], 'true'))
+                  inputs:
+                    targetPath: $(Pipeline.Workspace)/deployment-review-pitr/${{ parameters.environmentName }}
+                    artifactName: deployment-review-${{ parameters.environmentName }}-pitr-marker
 
       - job: DeployInstanceObjects
         displayName: Deploy SQL MI instance objects

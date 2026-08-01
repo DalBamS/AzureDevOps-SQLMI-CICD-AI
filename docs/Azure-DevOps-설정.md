@@ -148,7 +148,7 @@ Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제
 - `deploy-report.xml`: DacFx 변경 계획
 - `deployment-script-policy.md`: 결정론적 위험 DDL 검사와 allowlist 결과
 - `target-databases.json`: 대표 DB, 전체 대상, 검사 모드, gated DB 목록, DACPAC·승인
-  artifact·post-deployment payload의 SHA-256
+  artifact·post-deployment raw/semantic payload·canonical SQLCMD variable map의 SHA-256
 - `all-database-reports`: 전수 검사 시 DB별 DacFx 변경 계획
 - `all-database-scripts`: 전수 검사 시 DB별 실제 실행 예정 SQL
 - `all-database-policy-reports`: 전수 검사 시 DB별 결정론적 정책 결과
@@ -156,8 +156,8 @@ Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제
 각 환경은 `pipelines/profiles/sqlmi-<environment>.publish.xml`을 사용합니다. 세 profile의
 내용은 완전히 동일하며 연결 정보는 포함하지 않습니다. Plan과 승인 후 재검증의 `Script`,
 `DeployReport`는 같은 환경 profile과 같은 timeout override를 사용합니다. 실제 실행은
-SqlPackage가 계획을 다시 계산하는 `Publish`가 아니라 검증을 마친 현재 Script 파일을
-`Invoke-Sqlcmd -InputFile`로 그대로 실행합니다.
+SqlPackage가 계획을 다시 계산하는 `Publish`가 아니라 검증을 마친 현재 Script를 deterministic
+sanitized SQL로 변환해 `Invoke-Sqlcmd -InputFile`로 실행합니다.
 
 공통 게시 옵션:
 
@@ -198,19 +198,26 @@ advisory 단계입니다.
 증명할 수 없는 동적 표현식은 fail closed 오류로 차단합니다. `EXEC dbo.StoredProcedure
 @p=...` 형태의 정적 stored procedure 호출은 허용합니다.
 
-`sp_executesql`과 `sp_rename`은 bare, bracket, double-quote와 최대 4-part qualified
-identifier를 같은 canonical procedure 이름으로 해석합니다. `ALTER TABLE`의 `DROP
+`sp_executesql`과 `sp_rename`은 bare, bracket, double-quote, 생략된 multipart component를
+포함한 최대 4-part qualified identifier를 같은 canonical procedure 이름으로 해석합니다.
+완전히 소비되지 않거나 잘못된 `EXEC` procedure path는 fail closed입니다. `ALTER TABLE`의 `DROP
 COLUMN`, `DROP CONSTRAINT`, `ALTER COLUMN`은 문자열·주석·quoted identifier를 제외한
 token stream에서 statement 길이 제한 없이 검사합니다.
 
-Gate는 `:setvar Name "value"`를 중복 없이 엄격하게 읽고 실제 SQLCMD 순서대로 모든
-`$(Name)`을 확장한 결과를 검사합니다. 미선언·잘못된 이름, 중복·잘못된 directive,
-중첩 치환과 quote·semicolon·제어 문자가 포함된 값은 fail closed입니다. DacFx의
+Gate는 line-leading SQLCMD command 중 `:setvar Name "value"`와 정확한 `:on error exit`만
+허용합니다. `:quit`, `:exit`, `:connect`, `:r`, `!!` shell, output/error redirect,
+`:on error ignore`와
+unknown command는 fail closed입니다. 허용 directive를 제거하고 실제 SQLCMD 순서대로 모든
+`$(Name)`을 확장한 deterministic sanitized SQL을 정책 검사와 실행에 함께 사용합니다.
+미선언·잘못된 이름, 중복·잘못된 directive, 중첩 치환과 quote·semicolon·제어 문자가 포함된
+값도 fail closed입니다. DacFx의
 `DatabaseName`, `DefaultFilePrefix`, `DefaultDataPath`, `DefaultLogPath`,
 `__IsSqlCmdEnabled`는 같은 규칙으로 처리합니다. escaped `` `$(``만 literal로 보존합니다.
-정책 보고서는 variable map hash를 기록하고 exact Script와 정책 보고서의 artifact hash가
-manifest에 결합됩니다. 실행기는 같은 `SqlCmd.Common.psm1` parser가 만든 map만
-`Invoke-Sqlcmd -Variable`에 전달하므로 gate와 실행의 치환 의미가 달라지지 않습니다.
+정책 보고서는 canonical variable map과 sanitized SQL hash를 기록하고 exact Script와 정책
+보고서의 artifact hash가 manifest에 결합됩니다. 실행기는 같은 `SqlCmd.Common.psm1` 변환
+결과를 임시 파일에 기록하고 `Invoke-Sqlcmd -DisableCommands -DisableVariables`로 실행한 뒤
+파일을 삭제하므로 gate 이후 2차 SQLCMD 해석이 발생하지 않습니다. executor는 정책 보고서의
+sanitized SQL hash를 입력받아 실행 직전 재변환 hash와 일치하는지도 확인합니다.
 
 승인자는 대기 중인 `Deploy*` stage를 승인하기 전에 완료된 `Plan*` stage의 artifact를 검토합니다. 초기 도입 기간에는 Dev 자동 배포만 허용하고 Test/Prod에서 `deploy.sql`을 DBA가 승인하도록 운영합니다. `DropObjectsNotInSource=False`로 인해 제거가 자동 반영되지 않으므로, 승인된 제거는 별도 expand/contract 절차와 명시적 스크립트로 처리합니다.
 
@@ -224,10 +231,14 @@ Script에 결정론적 정책 gate를 적용합니다. 보고서, script, 정책
 따라서 전수 검사는 대상 DB마다 DeployReport 1회와 Script 1회를 실행해 기본 대표 검사보다
 SQL MI 부하와 pipeline 시간이 증가합니다.
 
-`target-databases.json` manifest v4는 대표/전수 모드 모두 필수입니다. 배포는 manifest
+`target-databases.json` manifest v5는 대표/전수 모드 모두 필수입니다. 배포는 manifest
 version, 환경, 검사 모드, 순서가 보존된 대상/gated DB 목록을 pipeline runtime 값과
 대조하고, ReviewPath 하위 상대 경로만 허용한 뒤 DACPAC, 보고서, script, 정책 보고서의
-SHA-256과 marker 사이 approved post-deployment payload hash를 모두 확인합니다. 누락,
+SHA-256, marker 사이 approved raw/semantic post-deployment payload hash, canonical SQLCMD
+variable map hash를 모두 확인합니다. `DatabaseName`, `DefaultFilePrefix`는 대상 DB mapping,
+`DefaultDataPath`, `DefaultLogPath`는 승인 값으로 manifest에 기록합니다. 이 네 runtime
+identity 값만 명시적 placeholder로 canonicalize하며 다른 변수의 추가·삭제·값 변경은
+허용하지 않습니다. 누락,
 중복·대소문자 충돌, 경로 이탈, hash 불일치는 즉시
 실패합니다. manifest 자체에는 별도 서명이 없으므로 이 계약은 승인 후 같은 실행의 Azure
 DevOps pipeline artifact가 변경되지 않는 경계를 신뢰합니다. 승인 후 artifact를 교체하거나
@@ -241,8 +252,9 @@ Script와 정확히 같아야 합니다. 대표 모드의 비대표 DB 비교에
 `:setvar DefaultFilePrefix "<database>"`의 대상 DB 값을 고정 placeholder로 바꿉니다. 그
 밖의 주석, SQLCMD 변수, DDL은 정규화하지 않습니다. 보고서
 또는 Script가 달라지거나 현재 Script가 위험하면 해당 DB를 배포하지 않습니다. 비교가
-끝난 동일 파일을 pinned SqlServer module 22.4.5.1의 `Invoke-Sqlcmd -InputFile`로
-`AbortOnError`, `Encrypt Mandatory`, `TrustServerCertificate=False` 조건에서 실행합니다.
+끝난 동일 Script의 sanitized SQL을 pinned SqlServer module 22.4.5.1의 `Invoke-Sqlcmd
+-InputFile`로 `DisableCommands`, `DisableVariables`, `AbortOnError`, `Encrypt Mandatory`,
+`TrustServerCertificate=False` 조건에서 실행합니다.
 Deploy 경로는 `/Action:Publish`를 호출하지 않습니다. 첫 DB는 카나리로 exact script 실행과
 smoke test까지 통과해야 나머지를 최대 `maxParallel`로 배포합니다. 장시간 rollout에서 토큰
 만료를 피하도록 각 DB의 DeployReport, Script 생성, Script 실행, smoke test 직전에
@@ -253,9 +265,10 @@ schema operation이 없어도 post-deployment data script는
 별도로 필요할 수 있으므로 current Script 생성, gate, 승인 비교, 실행, smoke를 생략하지
 않습니다. schema 성공 후 postdeploy가 실패한 재시도에서만 strict equality 예외를
 허용합니다. 현재 report의 schema operation이 0이고, current Script가 DacFx shell과
-`SQLMI-CICD POSTDEPLOY START/END v1` marker 사이 payload만 포함하며, 그 payload hash가
-manifest와 승인 Script의 hash에 모두 같아야 합니다. marker 누락·중복, payload 변경,
-pre/schema SQL 혼입은 실행 전에 실패합니다. 완전한 no-op script도 실행하므로 소량의
+`SQLMI-CICD POSTDEPLOY START/END v1` marker 사이 payload만 포함하며, raw payload와 SQLCMD
+확장 후 semantic payload 및 canonical variable map hash가 manifest와 승인 Script에 모두
+같아야 합니다. marker 누락·중복, payload 변경, 비-runtime 변수 변경, pre/schema SQL 혼입은
+실행 전에 실패합니다. 완전한 no-op script도 실행하므로 소량의
 연결·실행 비용이 들지만 data-only DACPAC과 부분 성공 재시도의 정확성을 우선합니다.
 
 Plan도 각 DeployReport와 Script 직전에 같은 token provider를 호출합니다. Azure DevOps의
@@ -270,6 +283,9 @@ manifest에서 WIF 전용 experimental 기능으로 정의되어 있으므로 pr
 `deployment-review-<environment>-pitr-marker/pitr-marker.json`에 게시됩니다. timeout,
 부분 성공, smoke 실패, 승인 후 drift와 COPY_ONLY backup 절차는
 [SQL MI 배포 롤백 런북](롤백-런북.md)을 따릅니다.
+marker 생성 성공 여부를 변수로 기록하고 publish task는 `always()`에서 그 값을 확인하므로,
+rollout cancellation 뒤에도 생성된 marker를 게시하되 없는 파일의 게시 오류로 원래 실패를
+가리지 않습니다.
 
 ## 7. AI 품질 게이트
 

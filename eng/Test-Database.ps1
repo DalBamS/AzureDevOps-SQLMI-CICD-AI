@@ -144,11 +144,41 @@ try {
     Import-Module ([IO.Path]::Combine($PSScriptRoot, 'Phase2.Common.psm1')) -Force
     Import-Module ([IO.Path]::Combine($PSScriptRoot, 'SqlCmd.Common.psm1')) -Force
     $approvedPostDeployment = Get-DacFxPostDeploymentPayload -Path $initialScriptPath
-    $initialResolution = Resolve-SqlCmdScript -Path $initialScriptPath
-    $initialVariables = @(
-        $initialResolution.Variables |
-            ForEach-Object { "$($_.Name)=$($_.Value)" }
-    )
+    $approvedPostDeploymentSemantics = Get-DacFxPostDeploymentSemantic `
+        -Path $initialScriptPath `
+        -TargetDatabase AppDb_Test
+    function Invoke-LocalSanitizedScript {
+        param([Parameter(Mandatory)][string]$Path)
+
+        $resolution = Resolve-SqlCmdScript -Path $Path
+        $sanitizedPath = Join-Path `
+            $exactScriptTestPath `
+            "sanitized-$([guid]::NewGuid().ToString('N')).sql"
+        try {
+            Set-Content `
+                -Path $sanitizedPath `
+                -Value $resolution.SanitizedText `
+                -Encoding utf8 `
+                -NoNewline
+            Invoke-Sqlcmd `
+                -ServerInstance "tcp:localhost,$HostPort" `
+                -Database AppDb_Test `
+                -Username sa `
+                -Password $password `
+                -InputFile $sanitizedPath `
+                -DisableCommands `
+                -DisableVariables `
+                -AbortOnError `
+                -Encrypt Mandatory `
+                -TrustServerCertificate `
+                -ConnectionTimeout 30 `
+                -QueryTimeout $SqlCommandTimeout `
+                -ErrorAction Stop
+        }
+        finally {
+            Remove-Item -Path $sanitizedPath -Force -ErrorAction SilentlyContinue
+        }
+    }
     $failedPostDeploymentScript = [regex]::Replace(
         (Get-Content -Path $initialScriptPath -Raw),
         '(?ms)(^-- SQLMI-CICD POSTDEPLOY START v1[ \t]*\r?\n).*?(^-- SQLMI-CICD POSTDEPLOY END v1[ \t]*\r?$)',
@@ -167,19 +197,7 @@ try {
         -Encoding utf8
     $postDeploymentFailed = $false
     try {
-        Invoke-Sqlcmd `
-            -ServerInstance "tcp:localhost,$HostPort" `
-            -Database AppDb_Test `
-            -Username sa `
-            -Password $password `
-            -InputFile $failedPostDeploymentScriptPath `
-            -Variable $initialVariables `
-            -AbortOnError `
-            -Encrypt Mandatory `
-            -TrustServerCertificate `
-            -ConnectionTimeout 30 `
-            -QueryTimeout $SqlCommandTimeout `
-            -ErrorAction Stop
+        Invoke-LocalSanitizedScript -Path $failedPostDeploymentScriptPath
     }
     catch {
         $postDeploymentFailed = $true
@@ -245,24 +263,19 @@ WHERE [FlagName] = N'database-cicd-ready';
     if ($retryPostDeployment.Sha256 -cne $approvedPostDeployment.Sha256) {
         throw 'The post-deployment-only retry payload differs from the approved initial payload.'
     }
-    $retryResolution = Resolve-SqlCmdScript -Path $retryScriptPath
-    $retryVariables = @(
-        $retryResolution.Variables |
-            ForEach-Object { "$($_.Name)=$($_.Value)" }
-    )
-    Invoke-Sqlcmd `
-        -ServerInstance "tcp:localhost,$HostPort" `
-        -Database AppDb_Test `
-        -Username sa `
-        -Password $password `
-        -InputFile $retryScriptPath `
-        -Variable $retryVariables `
-        -AbortOnError `
-        -Encrypt Mandatory `
-        -TrustServerCertificate `
-        -ConnectionTimeout 30 `
-        -QueryTimeout $SqlCommandTimeout `
-        -ErrorAction Stop
+    $retryPostDeploymentSemantics = Get-DacFxPostDeploymentSemantic `
+        -Path $retryScriptPath `
+        -TargetDatabase AppDb_Test `
+        -RuntimeVariableContract $approvedPostDeploymentSemantics.RuntimeVariableContract
+    if (
+        $retryPostDeploymentSemantics.SemanticPayloadSha256 -cne
+            $approvedPostDeploymentSemantics.SemanticPayloadSha256 -or
+        $retryPostDeploymentSemantics.CanonicalVariableMapSha256 -cne
+            $approvedPostDeploymentSemantics.CanonicalVariableMapSha256
+    ) {
+        throw 'The post-deployment-only retry SQLCMD semantics differ from the approved initial script.'
+    }
+    Invoke-LocalSanitizedScript -Path $retryScriptPath
     $retrySeedCount = (
         Invoke-Sqlcmd @seedQueryArguments -Query @'
 SELECT COUNT_BIG(*) AS [SeedCount]

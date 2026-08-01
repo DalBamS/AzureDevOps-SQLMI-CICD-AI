@@ -163,6 +163,9 @@ Invoke-SqlPackageAction -Action Script -TargetDatabase $representative -OutputPa
     -ScriptPath $scriptPath `
     -ReportPath $policyReportPath
 $representativePostDeployment = Get-DacFxPostDeploymentPayload -Path $scriptPath
+$representativePostDeploymentSemantics = Get-DacFxPostDeploymentSemantic `
+    -Path $scriptPath `
+    -TargetDatabase $representative
 
 $drifted = [System.Collections.Generic.List[string]]::new()
 if ($ValidateAllDatabasePlans) {
@@ -195,8 +198,18 @@ if ($ValidateAllDatabasePlans) {
             -ScriptPath $databaseScriptPath `
             -ReportPath $databasePolicyReportPath
         $databasePostDeployment = Get-DacFxPostDeploymentPayload -Path $databaseScriptPath
-        if ($databasePostDeployment.Sha256 -cne $representativePostDeployment.Sha256) {
-            throw "Database '$database' has a post-deployment payload that differs from representative '$representative'."
+        $databasePostDeploymentSemantics = Get-DacFxPostDeploymentSemantic `
+            -Path $databaseScriptPath `
+            -TargetDatabase $database `
+            -RuntimeVariableContract $representativePostDeploymentSemantics.RuntimeVariableContract
+        if (
+            $databasePostDeployment.Sha256 -cne $representativePostDeployment.Sha256 -or
+            $databasePostDeploymentSemantics.SemanticPayloadSha256 -cne
+                $representativePostDeploymentSemantics.SemanticPayloadSha256 -or
+            $databasePostDeploymentSemantics.CanonicalVariableMapSha256 -cne
+                $representativePostDeploymentSemantics.CanonicalVariableMapSha256
+        ) {
+            throw "Database '$database' has post-deployment SQLCMD semantics that differ from representative '$representative'."
         }
         try {
             & $confirmScript `
@@ -249,7 +262,7 @@ if ($ValidateAllDatabasePlans) {
 }
 
 $targetMetadata = [ordered]@{
-    manifestVersion = 4
+    manifestVersion = 5
     environment = $EnvironmentName
     representativeDatabase = $representative
     targetDatabases = $targets
@@ -260,6 +273,9 @@ $targetMetadata = [ordered]@{
     dacpacSha256 = (Get-FileHash -Path $DacpacPath -Algorithm SHA256).Hash
     postDeploymentContract = $representativePostDeployment.Contract
     postDeploymentPayloadSha256 = $representativePostDeployment.Sha256
+    postDeploymentSemanticSha256 = $representativePostDeploymentSemantics.SemanticPayloadSha256
+    postDeploymentCanonicalVariableMapSha256 = $representativePostDeploymentSemantics.CanonicalVariableMapSha256
+    postDeploymentRuntimeVariables = $representativePostDeploymentSemantics.RuntimeVariableContract
     artifacts = $manifestArtifacts.ToArray()
 }
 $targetMetadata |

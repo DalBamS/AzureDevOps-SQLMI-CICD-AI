@@ -223,13 +223,43 @@ function Read-SqlIdentifierPath {
 
         $cursor = $StartIndex
         $parts = [System.Collections.Generic.List[string]]::new()
+        $expectComponent = $true
+        $consumedSyntax = $false
+        $hasBoundaryWhitespace = $false
         while ($true) {
+            $whitespaceStart = $cursor
             while ($cursor -lt $Text.Length -and [char]::IsWhiteSpace($Text[$cursor])) {
                 $cursor++
             }
+            $hadWhitespace = $cursor -gt $whitespaceStart
             if ($cursor -ge $Text.Length) {
                 break
             }
+            if ($expectComponent -and $Text[$cursor] -eq '.') {
+                $parts.Add('')
+                $consumedSyntax = $true
+                $cursor++
+                if ($parts.Count -ge 4) {
+                    return [pscustomobject]@{
+                        Success = $false
+                        Malformed = $true
+                        Parts = @()
+                        EndIndex = $cursor
+                    }
+                }
+                continue
+            }
+            if (-not $expectComponent) {
+                if ($Text[$cursor] -ne '.') {
+                    $hasBoundaryWhitespace = $hadWhitespace
+                    break
+                }
+                $cursor++
+                $expectComponent = $true
+                $consumedSyntax = $true
+                continue
+            }
+
             $value = $null
             if ($Text[$cursor] -eq '[') {
                 $cursor++
@@ -251,7 +281,12 @@ function Read-SqlIdentifierPath {
                     break
                 }
                 if (-not $closed) {
-                    return [pscustomobject]@{ Success = $false; Parts = @(); EndIndex = $StartIndex }
+                    return [pscustomobject]@{
+                        Success = $false
+                        Malformed = $true
+                        Parts = @()
+                        EndIndex = $cursor
+                    }
                 }
                 $value = $builder.ToString()
             }
@@ -275,7 +310,12 @@ function Read-SqlIdentifierPath {
                     break
                 }
                 if (-not $closed) {
-                    return [pscustomobject]@{ Success = $false; Parts = @(); EndIndex = $StartIndex }
+                    return [pscustomobject]@{
+                        Success = $false
+                        Malformed = $true
+                        Parts = @()
+                        EndIndex = $cursor
+                    }
                 }
                 $value = $builder.ToString()
             }
@@ -291,19 +331,41 @@ function Read-SqlIdentifierPath {
                 $cursor += $identifier.Length
             }
             $parts.Add($value)
-            while ($cursor -lt $Text.Length -and [char]::IsWhiteSpace($Text[$cursor])) {
-                $cursor++
-            }
-            if ($cursor -ge $Text.Length -or $Text[$cursor] -ne '.') {
-                break
-            }
-            $cursor++
+            $consumedSyntax = $true
+            $expectComponent = $false
             if ($parts.Count -ge 4) {
-                return [pscustomobject]@{ Success = $false; Parts = @(); EndIndex = $StartIndex }
+                $lookAhead = $cursor
+                while ($lookAhead -lt $Text.Length -and [char]::IsWhiteSpace($Text[$lookAhead])) {
+                    $lookAhead++
+                }
+                if ($lookAhead -lt $Text.Length -and $Text[$lookAhead] -eq '.') {
+                    return [pscustomobject]@{
+                        Success = $false
+                        Malformed = $true
+                        Parts = @()
+                        EndIndex = $lookAhead
+                    }
+                }
             }
         }
+        $malformed = (
+            $consumedSyntax -and
+            (
+                $expectComponent -or
+                $parts.Count -eq 0 -or
+                [string]::IsNullOrEmpty($parts[-1])
+            )
+        )
+        if (-not $malformed -and $parts.Count -gt 0 -and $cursor -lt $Text.Length) {
+            $malformed = (
+                -not $hasBoundaryWhitespace -and
+                -not [char]::IsWhiteSpace($Text[$cursor]) -and
+                $Text[$cursor] -ne ';'
+            )
+        }
         return [pscustomobject]@{
-            Success = $parts.Count -gt 0
+            Success = $parts.Count -gt 0 -and -not $malformed
+            Malformed = $malformed
             Parts = $parts.ToArray()
             EndIndex = $cursor
         }
@@ -605,7 +667,34 @@ function Add-DynamicExecutionFinding {
                 $cursor++
             }
         }
-        $procedure = Read-SqlIdentifierPath -Text $statement -StartIndex $cursor
+        $startsWithLiteral = (
+            $cursor -lt $statement.Length -and $statement[$cursor] -eq "'"
+        ) -or (
+            $cursor + 1 -lt $statement.Length -and
+            ($statement[$cursor] -eq 'N' -or $statement[$cursor] -eq 'n') -and
+            $statement[$cursor + 1] -eq "'"
+        )
+        $startsWithVariable = $cursor -lt $statement.Length -and $statement[$cursor] -eq '@'
+        $procedure = [pscustomobject]@{
+            Success = $false
+            Malformed = $false
+            Parts = @()
+            EndIndex = $cursor
+        }
+        if (-not $parenthesized -and -not $startsWithLiteral -and -not $startsWithVariable) {
+            $procedure = Read-SqlIdentifierPath -Text $statement -StartIndex $cursor
+            if (-not $procedure.Success) {
+                $Findings.Add([pscustomobject]@{
+                    Rule = 'DEPLOY009'
+                    Severity = 'error'
+                    Line = $findingLine
+                    Message = 'EXEC procedure path is malformed or cannot be reviewed deterministically.'
+                    Statement = ($statement -replace '\s+', ' ').Trim()
+                    AllowedBy = $null
+                })
+                continue
+            }
+        }
         $procedureName = if ($procedure.Success) {
             $procedure.Parts[-1].ToLowerInvariant()
         }
@@ -638,14 +727,6 @@ function Add-DynamicExecutionFinding {
                 $cursor += $namedStatement.Length
             }
         }
-        $startsWithLiteral = (
-            $cursor -lt $statement.Length -and $statement[$cursor] -eq "'"
-        ) -or (
-            $cursor + 1 -lt $statement.Length -and
-            ($statement[$cursor] -eq 'N' -or $statement[$cursor] -eq 'n') -and
-            $statement[$cursor + 1] -eq "'"
-        )
-        $startsWithVariable = $cursor -lt $statement.Length -and $statement[$cursor] -eq '@'
         if (
             -not $parenthesized -and
             -not $isSpExecuteSql -and
@@ -772,7 +853,7 @@ foreach ($entry in $allowlist) {
 }
 
 $sqlCmdResolution = Resolve-SqlCmdScript -Path $ScriptPath
-$scriptLines = @([regex]::Split($sqlCmdResolution.ExpandedText, '\r?\n'))
+$scriptLines = @([regex]::Split($sqlCmdResolution.SanitizedText, '\r?\n'))
 $batches = [System.Collections.Generic.List[object]]::new()
 $batchLines = [System.Collections.Generic.List[string]]::new()
 $batchStartLine = 1
@@ -854,6 +935,7 @@ $reportLines = @(
     "- Script: ``$(ConvertTo-MarkdownText ([IO.Path]::GetFullPath($ScriptPath)))``",
     "- GO-delimited batches: $($batches.Count)",
     "- SQLCMD variable map SHA-256: $($sqlCmdResolution.VariableMapSha256)",
+    "- Sanitized SQL SHA-256: $($sqlCmdResolution.SanitizedSha256)",
     "- Errors: $errorCount",
     "- Warnings: $warningCount",
     "- Allowlisted findings: $allowedCount",

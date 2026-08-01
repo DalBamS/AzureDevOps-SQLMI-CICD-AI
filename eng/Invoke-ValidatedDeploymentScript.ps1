@@ -14,6 +14,9 @@ param(
     [Parameter(Mandatory)]
     [ValidateScript({ Test-Path $_ -PathType Leaf })]
     [string]$ScriptPath,
+    [Parameter(Mandatory)]
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')]
+    [string]$ExpectedSanitizedSha256,
     [ValidateRange(1, 2147483647)]
     [int]$CommandTimeout = 3600
 )
@@ -24,10 +27,12 @@ $ErrorActionPreference = 'Stop'
 $sqlCmdModulePath = Join-Path $PSScriptRoot 'SqlCmd.Common.psm1'
 Import-Module $sqlCmdModulePath -Force
 $sqlCmdResolution = Resolve-SqlCmdScript -Path $ScriptPath
-$sqlCmdVariables = @(
-    $sqlCmdResolution.Variables |
-        ForEach-Object { "$($_.Name)=$($_.Value)" }
-)
+if (
+    $sqlCmdResolution.SanitizedSha256 -cne
+        $ExpectedSanitizedSha256.ToUpperInvariant()
+) {
+    throw 'The sanitized deployment script changed after the policy gate.'
+}
 
 $requiredVersion = '22.4.5.1'
 $installedModule = Get-Module -ListAvailable -Name SqlServer |
@@ -40,19 +45,31 @@ Import-Module SqlServer -RequiredVersion $requiredVersion -Force
 
 $serverInstance = "tcp:$ServerName,$Port"
 Write-Information "Executing validated deployment script for '$DatabaseName'." -InformationAction Continue
-$invokeArguments = @{
-    ServerInstance = $serverInstance
-    Database = $DatabaseName
-    AccessToken = $AccessToken
-    InputFile = (Resolve-Path $ScriptPath).Path
-    AbortOnError = $true
-    Encrypt = 'Mandatory'
-    TrustServerCertificate = $false
-    ConnectionTimeout = 30
-    QueryTimeout = $CommandTimeout
-    ErrorAction = 'Stop'
+$sanitizedPath = Join-Path `
+    ([IO.Path]::GetTempPath()) `
+    "sqlmi-sanitized-$([guid]::NewGuid().ToString('N')).sql"
+try {
+    Set-Content `
+        -Path $sanitizedPath `
+        -Value $sqlCmdResolution.SanitizedText `
+        -Encoding utf8 `
+        -NoNewline
+    $invokeArguments = @{
+        ServerInstance = $serverInstance
+        Database = $DatabaseName
+        AccessToken = $AccessToken
+        InputFile = $sanitizedPath
+        AbortOnError = $true
+        DisableCommands = $true
+        DisableVariables = $true
+        Encrypt = 'Mandatory'
+        TrustServerCertificate = $false
+        ConnectionTimeout = 30
+        QueryTimeout = $CommandTimeout
+        ErrorAction = 'Stop'
+    }
+    Invoke-Sqlcmd @invokeArguments
 }
-if ($sqlCmdVariables.Count -gt 0) {
-    $invokeArguments.Variable = $sqlCmdVariables
+finally {
+    Remove-Item -Path $sanitizedPath -Force -ErrorAction SilentlyContinue
 }
-Invoke-Sqlcmd @invokeArguments
