@@ -154,9 +154,10 @@ Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제
 - `all-database-policy-reports`: 전수 검사 시 DB별 결정론적 정책 결과
 
 각 환경은 `pipelines/profiles/sqlmi-<environment>.publish.xml`을 사용합니다. 세 profile의
-내용은 완전히 동일하며 연결 정보는 포함하지 않습니다. `Script`, `DeployReport`,
-승인 직전 재생성 `DeployReport`, `Publish`는 같은 환경 profile과 같은 timeout override를
-사용해야 하므로 계획과 실행의 옵션 차이를 허용하지 않습니다.
+내용은 완전히 동일하며 연결 정보는 포함하지 않습니다. Plan과 승인 후 재검증의 `Script`,
+`DeployReport`는 같은 환경 profile과 같은 timeout override를 사용합니다. 실제 실행은
+SqlPackage가 계획을 다시 계산하는 `Publish`가 아니라 검증을 마친 현재 Script 파일을
+`Invoke-Sqlcmd -InputFile`로 그대로 실행합니다.
 
 공통 게시 옵션:
 
@@ -185,11 +186,17 @@ role membership을 배포 비교에서 제외합니다. 이 보안 오브젝트�
 - [SQL MI endpoint 유형](https://learn.microsoft.com/azure/azure-sql/managed-instance/connectivity-architecture-overview)
 
 `eng/Test-DeploymentScript.ps1`은 `deploy.sql`을 GO batch로 나누고 파괴 DDL,
-축소 가능 `ALTER COLUMN`, `sp_rename`, `sp_executesql` 동적 DDL, `SET NOEXEC` 조작을
+축소 가능 `ALTER COLUMN`, `sp_rename`, 동적 SQL, `SET NOEXEC` 조작을
 결정론적으로 검사합니다. 오류는 Plan stage를 즉시 실패시키며 경고는 보고서에 남습니다.
 예외는 `eng/policy/deploy-allowlist.json`의 `rule`, `pattern`, `ticket`, `expiresOn`
 네 필드가 모두 필요하고 만료된 항목은 자동 무효입니다. AI 검토는 이 게이트 이후의
 advisory 단계입니다.
+
+`EXEC`/`EXECUTE`와 `sp_executesql`의 첫 SQL 표현식이 문자열 literal과 `+` 연결만으로
+구성되면 상수로 계산한 뒤 같은 직접 DDL rule을 다시 적용합니다. 상수 동적 `SELECT`는
+허용하지만 동적 DDL은 오류입니다. 변수, 함수, `FORMAT`, `REPLACE` 등 정적으로 결과를
+증명할 수 없는 동적 표현식은 fail closed 오류로 차단합니다. `EXEC dbo.StoredProcedure
+@p=...` 형태의 정적 stored procedure 호출은 허용합니다.
 
 승인자는 대기 중인 `Deploy*` stage를 승인하기 전에 완료된 `Plan*` stage의 artifact를 검토합니다. 초기 도입 기간에는 Dev 자동 배포만 허용하고 Test/Prod에서 `deploy.sql`을 DBA가 승인하도록 운영합니다. `DropObjectsNotInSource=False`로 인해 제거가 자동 반영되지 않으므로, 승인된 제거는 별도 expand/contract 절차와 명시적 스크립트로 처리합니다.
 
@@ -211,20 +218,25 @@ SHA-256을 모두 확인합니다. 누락, 중복·대소문자 충돌, 경로 �
 DevOps pipeline artifact가 변경되지 않는 경계를 신뢰합니다. 승인 후 artifact를 교체하거나
 다른 실행의 DACPAC/review artifact를 혼합해서는 안 됩니다.
 
-승인 이후 Publish 직전에 각 DB의 DeployReport와 deployment Script를 순서대로 다시
+승인 이후 실행 직전에 각 DB의 DeployReport와 deployment Script를 순서대로 다시
 생성합니다. 대표 전용 Plan은 작업 집합을 대표 보고서와 비교하고, 전수 Plan은 각 DB별 승인
 보고서와 비교합니다. 현재 Script는 결정론적 정책 gate를 다시 통과하고 승인된 gated
 Script와 정확히 같아야 합니다. 대표 모드의 비대표 DB 비교에서만 DacFx가 삽입하는
 `Deployment script for <database>`, `:setvar DatabaseName "<database>"`,
 `:setvar DefaultFilePrefix "<database>"`의 대상 DB 값을 고정 placeholder로 바꿉니다. 그
 밖의 주석, SQLCMD 변수, DDL은 정규화하지 않습니다. 보고서
-또는 Script가 달라지거나 현재 Script가 위험하면 해당 DB를 배포하지 않습니다. 첫
-DB는 카나리로 publish 후 smoke test까지 통과해야 나머지를 최대 `maxParallel`로 배포합니다.
-장시간 rollout에서 토큰 만료를 피하도록 변경이 있는 각 DB의 DeployReport, Script, Publish,
-smoke test 직전에
+또는 Script가 달라지거나 현재 Script가 위험하면 해당 DB를 배포하지 않습니다. 비교가
+끝난 동일 파일을 pinned SqlServer module 22.4.5.1의 `Invoke-Sqlcmd -InputFile`로
+`AbortOnError`, `Encrypt Mandatory`, `TrustServerCertificate=False` 조건에서 실행합니다.
+Deploy 경로는 `/Action:Publish`를 호출하지 않습니다. 첫 DB는 카나리로 exact script 실행과
+smoke test까지 통과해야 나머지를 최대 `maxParallel`로 배포합니다. 장시간 rollout에서 토큰
+만료를 피하도록 각 DB의 DeployReport, Script 생성, Script 실행, smoke test 직전에
 `eng/Get-AzureSqlAccessToken.ps1`로 Azure SQL access token을 새로 가져옵니다.
 각 DB 실패는 모두 수집되며 성공/실패 요약과 실패 DB 목록을 Azure DevOps summary에
-게시합니다. 이미 목표 상태인 DB는 재시도에서 publish를 생략하고 smoke를 재실행합니다.
+게시합니다. DeployReport에 schema operation이 없어도 post-deployment data script는
+별도로 필요할 수 있으므로 current Script 생성, gate, 승인 비교, 실행, smoke를 생략하지
+않습니다. 완전한 no-op script도 실행하므로 소량의 연결·실행 비용이 들지만 data-only DACPAC과
+schema 성공/postdeploy 실패 재시도의 정확성을 우선합니다.
 
 Plan도 각 DeployReport와 Script 직전에 같은 token provider를 호출합니다. Azure DevOps의
 장시간 Plan과 rollout `AzureCLI@2` 작업은 WIF IdToken 만료 이후 재로그인을 위해
@@ -295,8 +307,8 @@ PR 코멘트가 필요하면 Azure DevOps의 GitHub 서비스 연결을 지정�
 4. 환경별 `Script`/`DeployReport` 생성과 deterministic 배포 SQL gate
 5. 선택적 advisory AI `deploy.sql` 검토
 6. Azure DevOps Environment 사람 승인
-7. 대상별 `DeployReport` 재생성과 승인 계획 비교
-8. SQL MI publish와 integration smoke test
+7. 대상별 `DeployReport`/Script 재생성, gate와 승인 계획 비교
+8. 검증한 exact Script 파일 실행과 integration smoke test
 
 AI 결과는 기본적으로 advisory로만 게시하며 LLM 호출 실패도 `SucceededWithIssues`로
 표시합니다. `-FailOnBlockingFindings` 승격은 다음 조건을 **모두** 만족할 때만 승인합니다.

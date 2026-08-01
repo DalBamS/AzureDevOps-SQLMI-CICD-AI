@@ -22,8 +22,10 @@ else {
 }
 $toolDirectory = Join-Path $toolCacheRoot "sqlpackage-$sqlPackageVersion"
 $publishProfile = [IO.Path]::Combine($repoRoot, 'pipelines', 'profiles', 'sqlmi-dev.publish.xml')
+$sqlServerModuleVersion = '22.4.5.1'
 $containerId = $null
 $sqlcmdPath = $null
+$exactScriptTestPath = Join-Path ([IO.Path]::GetTempPath()) "sqlmi-exact-script-$PID"
 
 if ($env:sqlCommandTimeout) {
     $parsedTimeout = 0
@@ -38,6 +40,19 @@ foreach ($command in @('dotnet', 'docker')) {
         throw "$command is required. See docs/환경-구성-및-테스트.md."
     }
 }
+$sqlServerModule = Get-Module -ListAvailable -Name SqlServer |
+    Where-Object Version -eq $sqlServerModuleVersion |
+    Select-Object -First 1
+if (-not $sqlServerModule) {
+    Install-Module `
+        -Name SqlServer `
+        -RequiredVersion $sqlServerModuleVersion `
+        -Scope CurrentUser `
+        -Repository PSGallery `
+        -Force `
+        -AllowClobber
+}
+Import-Module SqlServer -RequiredVersion $sqlServerModuleVersion -Force
 
 if (-not $SkipBuild) {
     & ([IO.Path]::Combine($PSScriptRoot, 'Build.ps1'))
@@ -109,15 +124,116 @@ try {
     }
 
     $connectionString = "Server=localhost,$HostPort;Initial Catalog=AppDb_Test;User ID=sa;Password=$password;Encrypt=True;TrustServerCertificate=True;Connection Timeout=30;"
+    New-Item -ItemType Directory -Force -Path $exactScriptTestPath | Out-Null
+    $initialScriptPath = Join-Path $exactScriptTestPath 'initial.deploy.sql'
+    $initialPolicyPath = Join-Path $exactScriptTestPath 'initial.policy.md'
     & $sqlPackage `
-        /Action:Publish `
+        /Action:Script `
         "/SourceFile:$dacpac" `
         "/TargetConnectionString:$connectionString" `
+        "/OutputPath:$initialScriptPath" `
         "/Profile:$publishProfile" `
         "/p:CommandTimeout=$SqlCommandTimeout"
     if ($LASTEXITCODE -ne 0) {
-        throw 'DACPAC deployment to the integration test database failed.'
+        throw 'Initial exact deployment script generation failed.'
     }
+    & ([IO.Path]::Combine($PSScriptRoot, 'Test-DeploymentScript.ps1')) `
+        -ScriptPath $initialScriptPath `
+        -ReportPath $initialPolicyPath
+    Invoke-Sqlcmd `
+        -ServerInstance "tcp:localhost,$HostPort" `
+        -Database AppDb_Test `
+        -Username sa `
+        -Password $password `
+        -InputFile $initialScriptPath `
+        -AbortOnError `
+        -Encrypt Mandatory `
+        -TrustServerCertificate `
+        -ConnectionTimeout 30 `
+        -QueryTimeout $SqlCommandTimeout `
+        -ErrorAction Stop
+
+    $seedQueryArguments = @{
+        ServerInstance = "tcp:localhost,$HostPort"
+        Database = 'AppDb_Test'
+        Username = 'sa'
+        Password = $password
+        Encrypt = 'Mandatory'
+        TrustServerCertificate = $true
+        ConnectionTimeout = 30
+        QueryTimeout = $SqlCommandTimeout
+        ErrorAction = 'Stop'
+    }
+    $initialSeedCount = (
+        Invoke-Sqlcmd @seedQueryArguments -Query @'
+SELECT COUNT_BIG(*) AS [SeedCount]
+FROM [app].[FeatureFlag]
+WHERE [FlagName] = N'database-cicd-ready';
+'@
+    ).SeedCount
+    if ($initialSeedCount -ne 1) {
+        throw 'The initial exact deployment script did not execute the post-deployment seed.'
+    }
+
+    $retryReportPath = Join-Path $exactScriptTestPath 'retry.deploy-report.xml'
+    $retryScriptPath = Join-Path $exactScriptTestPath 'retry.deploy.sql'
+    $retryPolicyPath = Join-Path $exactScriptTestPath 'retry.policy.md'
+    & $sqlPackage `
+        /Action:DeployReport `
+        "/SourceFile:$dacpac" `
+        "/TargetConnectionString:$connectionString" `
+        "/OutputPath:$retryReportPath" `
+        "/Profile:$publishProfile" `
+        "/p:CommandTimeout=$SqlCommandTimeout"
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Retry DeployReport generation failed.'
+    }
+    Import-Module ([IO.Path]::Combine($PSScriptRoot, 'Phase2.Common.psm1')) -Force
+    if (Test-DeployReportHasChanges -Path $retryReportPath) {
+        throw 'The retry DeployReport should contain no schema operations.'
+    }
+    Invoke-Sqlcmd @seedQueryArguments -Query @'
+DELETE FROM [app].[FeatureFlag]
+WHERE [FlagName] = N'database-cicd-ready';
+'@
+    & $sqlPackage `
+        /Action:Script `
+        "/SourceFile:$dacpac" `
+        "/TargetConnectionString:$connectionString" `
+        "/OutputPath:$retryScriptPath" `
+        "/Profile:$publishProfile" `
+        "/p:CommandTimeout=$SqlCommandTimeout"
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Retry exact deployment script generation failed.'
+    }
+    & ([IO.Path]::Combine($PSScriptRoot, 'Test-DeploymentScript.ps1')) `
+        -ScriptPath $retryScriptPath `
+        -ReportPath $retryPolicyPath
+    Invoke-Sqlcmd `
+        -ServerInstance "tcp:localhost,$HostPort" `
+        -Database AppDb_Test `
+        -Username sa `
+        -Password $password `
+        -InputFile $retryScriptPath `
+        -AbortOnError `
+        -Encrypt Mandatory `
+        -TrustServerCertificate `
+        -ConnectionTimeout 30 `
+        -QueryTimeout $SqlCommandTimeout `
+        -ErrorAction Stop
+    $retrySeedCount = (
+        Invoke-Sqlcmd @seedQueryArguments -Query @'
+SELECT COUNT_BIG(*) AS [SeedCount]
+FROM [app].[FeatureFlag]
+WHERE [FlagName] = N'database-cicd-ready';
+'@
+    ).SeedCount
+    if ($retrySeedCount -ne 1) {
+        throw 'The empty-report retry script did not restore post-deployment seed data.'
+    }
+    Write-Information `
+        'SqlPackage exact-script execution and empty-report retry passed.' `
+        -InformationAction Continue
 
     $tests = Get-ChildItem -Path ([IO.Path]::Combine($repoRoot, 'tests', 'integration')) -File -Filter '*.sql' |
         Sort-Object Name
@@ -137,5 +253,8 @@ try {
 finally {
     if ($containerId -and -not $KeepContainer) {
         & docker rm --force $containerId | Out-Null
+    }
+    if (Test-Path $exactScriptTestPath) {
+        Remove-Item -Path $exactScriptTestPath -Recurse -Force
     }
 }

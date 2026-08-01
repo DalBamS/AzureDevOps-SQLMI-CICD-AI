@@ -21,18 +21,210 @@ if (-not (Test-Path $AllowlistPath -PathType Leaf)) {
     throw "Deployment allowlist not found: $AllowlistPath"
 }
 
-function ConvertTo-CodeOnly {
-    param([Parameter(Mandatory)][string]$Text)
-
-    $pattern = "(?s)/\*.*?\*/|--[^\r\n]*|N?'(?:''|[^'])*'"
-    return [regex]::Replace(
-        $Text,
-        $pattern,
-        [System.Text.RegularExpressions.MatchEvaluator] {
-            param($match)
-            return [regex]::Replace($match.Value, '[^\r\n]', ' ')
-        }
+function ConvertTo-SqlLexicalView {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [switch]$MaskString
     )
+
+    $result = [Text.StringBuilder]::new($Text.Length)
+    for ($index = 0; $index -lt $Text.Length; $index++) {
+        if (
+            $Text[$index] -eq '-' -and
+            $index + 1 -lt $Text.Length -and
+            $Text[$index + 1] -eq '-'
+        ) {
+            while ($index -lt $Text.Length -and $Text[$index] -notin "`r", "`n") {
+                [void]$result.Append(' ')
+                $index++
+            }
+            if ($index -lt $Text.Length) {
+                [void]$result.Append($Text[$index])
+            }
+            continue
+        }
+        if (
+            $Text[$index] -eq '/' -and
+            $index + 1 -lt $Text.Length -and
+            $Text[$index + 1] -eq '*'
+        ) {
+            $depth = 1
+            [void]$result.Append('  ')
+            $index += 2
+            while ($index -lt $Text.Length -and $depth -gt 0) {
+                if (
+                    $Text[$index] -eq '/' -and
+                    $index + 1 -lt $Text.Length -and
+                    $Text[$index + 1] -eq '*'
+                ) {
+                    $depth++
+                    [void]$result.Append('  ')
+                    $index += 2
+                    continue
+                }
+                if (
+                    $Text[$index] -eq '*' -and
+                    $index + 1 -lt $Text.Length -and
+                    $Text[$index + 1] -eq '/'
+                ) {
+                    $depth--
+                    [void]$result.Append('  ')
+                    $index += 2
+                    continue
+                }
+                [void]$result.Append($(if ($Text[$index] -in "`r", "`n") { $Text[$index] } else { ' ' }))
+                $index++
+            }
+            if ($depth -ne 0) {
+                throw 'Deployment script contains an unterminated block comment.'
+            }
+            $index--
+            continue
+        }
+        if ($Text[$index] -eq '[') {
+            [void]$result.Append('[')
+            $index++
+            $closed = $false
+            while ($index -lt $Text.Length) {
+                [void]$result.Append($Text[$index])
+                if ($Text[$index] -ne ']') {
+                    $index++
+                    continue
+                }
+                if ($index + 1 -lt $Text.Length -and $Text[$index + 1] -eq ']') {
+                    [void]$result.Append(']')
+                    $index += 2
+                    continue
+                }
+                $closed = $true
+                break
+            }
+            if (-not $closed) {
+                throw 'Deployment script contains an unterminated bracket-quoted identifier.'
+            }
+            continue
+        }
+        if ($Text[$index] -eq "'") {
+            [void]$result.Append($(if ($MaskString) { ' ' } else { "'" }))
+            $index++
+            $closed = $false
+            while ($index -lt $Text.Length) {
+                if ($Text[$index] -ne "'") {
+                    [void]$result.Append($(if ($MaskString -and $Text[$index] -notin "`r", "`n") { ' ' } else { $Text[$index] }))
+                    $index++
+                    continue
+                }
+                if ($index + 1 -lt $Text.Length -and $Text[$index + 1] -eq "'") {
+                    [void]$result.Append($(if ($MaskString) { '  ' } else { "''" }))
+                    $index += 2
+                    continue
+                }
+                [void]$result.Append($(if ($MaskString) { ' ' } else { "'" }))
+                $closed = $true
+                break
+            }
+            if (-not $closed) {
+                throw 'Deployment script contains an unterminated string literal.'
+            }
+            continue
+        }
+        [void]$result.Append($Text[$index])
+    }
+    return $result.ToString()
+}
+
+function ConvertTo-CodeOnly {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+    return ConvertTo-SqlLexicalView -Text $Text -MaskString
+}
+
+function ConvertTo-CommentFreeSql {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+    return ConvertTo-SqlLexicalView -Text $Text
+}
+
+function Get-SqlStatement {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][int]$StartIndex
+    )
+
+    $inString = $false
+    for ($index = $StartIndex; $index -lt $Text.Length; $index++) {
+        if ($Text[$index] -eq "'") {
+            if ($inString -and $index + 1 -lt $Text.Length -and $Text[$index + 1] -eq "'") {
+                $index++
+                continue
+            }
+            $inString = -not $inString
+            continue
+        }
+        if (-not $inString -and $Text[$index] -eq ';') {
+            return $Text.Substring($StartIndex, $index - $StartIndex + 1)
+        }
+    }
+    return $Text.Substring($StartIndex)
+}
+
+function ConvertFrom-ConstantSqlExpression {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][int]$StartIndex
+    )
+
+    $cursor = $StartIndex
+    $value = [Text.StringBuilder]::new()
+    $literalCount = 0
+    while ($true) {
+        while ($cursor -lt $Text.Length -and [char]::IsWhiteSpace($Text[$cursor])) {
+            $cursor++
+        }
+        if (
+            $cursor + 1 -lt $Text.Length -and
+            ($Text[$cursor] -eq 'N' -or $Text[$cursor] -eq 'n') -and
+            $Text[$cursor + 1] -eq "'"
+        ) {
+            $cursor++
+        }
+        if ($cursor -ge $Text.Length -or $Text[$cursor] -ne "'") {
+            return [pscustomobject]@{ Success = $false; Value = ''; EndIndex = $cursor }
+        }
+        $cursor++
+        $closed = $false
+        while ($cursor -lt $Text.Length) {
+            if ($Text[$cursor] -ne "'") {
+                [void]$value.Append($Text[$cursor])
+                $cursor++
+                continue
+            }
+            if ($cursor + 1 -lt $Text.Length -and $Text[$cursor + 1] -eq "'") {
+                [void]$value.Append("'")
+                $cursor += 2
+                continue
+            }
+            $cursor++
+            $closed = $true
+            break
+        }
+        if (-not $closed) {
+            return [pscustomobject]@{ Success = $false; Value = ''; EndIndex = $cursor }
+        }
+        $literalCount++
+        while ($cursor -lt $Text.Length -and [char]::IsWhiteSpace($Text[$cursor])) {
+            $cursor++
+        }
+        if ($cursor -ge $Text.Length -or $Text[$cursor] -ne '+') {
+            break
+        }
+        $cursor++
+    }
+    return [pscustomobject]@{
+        Success = $literalCount -gt 0
+        Value = $value.ToString()
+        EndIndex = $cursor
+    }
 }
 
 function Get-LineNumber {
@@ -101,6 +293,158 @@ $rules = @(
         Message = 'SET NOEXEC changes execution flow; confirm it is DacFx-generated guard logic.'
     }
 )
+
+function Add-DynamicExecutionFinding {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][int]$StartLine,
+        [Parameter(Mandatory)][int]$Depth,
+        [Parameter(Mandatory)][object[]]$Rules,
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$Findings
+    )
+
+    if ($Depth -gt 8) {
+        $Findings.Add([pscustomobject]@{
+            Rule = 'DEPLOY008'
+            Severity = 'error'
+            Line = $StartLine
+            Message = 'Dynamic SQL nesting exceeds the deterministic review limit.'
+            Statement = ($Text -replace '\s+', ' ').Trim()
+            AllowedBy = $null
+        })
+        return
+    }
+
+    $codeOnly = ConvertTo-CodeOnly -Text $Text
+    $commentFree = ConvertTo-CommentFreeSql -Text $Text
+    foreach ($executeMatch in [regex]::Matches($codeOnly, '(?is)\bEXEC(?:UTE)?\b')) {
+        $statement = Get-SqlStatement -Text $commentFree -StartIndex $executeMatch.Index
+        $findingLine = if ($Depth -eq 0) {
+            Get-LineNumber -Text $Text -Index $executeMatch.Index -StartLine $StartLine
+        }
+        else {
+            $StartLine
+        }
+        $cursor = $executeMatch.Length
+        while ($cursor -lt $statement.Length -and [char]::IsWhiteSpace($statement[$cursor])) {
+            $cursor++
+        }
+        $returnAssignment = [regex]::Match(
+            $statement.Substring($cursor),
+            '^(?is)@[A-Za-z_][A-Za-z0-9_]*\s*=\s*'
+        )
+        if ($returnAssignment.Success) {
+            $cursor += $returnAssignment.Length
+        }
+        $parenthesized = $cursor -lt $statement.Length -and $statement[$cursor] -eq '('
+        if ($parenthesized) {
+            $cursor++
+            while ($cursor -lt $statement.Length -and [char]::IsWhiteSpace($statement[$cursor])) {
+                $cursor++
+            }
+        }
+        $spExecuteSql = [regex]::Match(
+            $statement.Substring($cursor),
+            '^(?is)(?:(?:\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_@$#]*)\s*\.\s*){0,3}\[?sp_executesql\]?\b'
+        )
+        if ($spExecuteSql.Success) {
+            $cursor += $spExecuteSql.Length
+            while ($cursor -lt $statement.Length -and [char]::IsWhiteSpace($statement[$cursor])) {
+                $cursor++
+            }
+            $namedStatement = [regex]::Match(
+                $statement.Substring($cursor),
+                '^(?is)@stmt\s*=\s*'
+            )
+            if ($namedStatement.Success) {
+                $cursor += $namedStatement.Length
+            }
+        }
+        $startsWithLiteral = (
+            $cursor -lt $statement.Length -and $statement[$cursor] -eq "'"
+        ) -or (
+            $cursor + 1 -lt $statement.Length -and
+            ($statement[$cursor] -eq 'N' -or $statement[$cursor] -eq 'n') -and
+            $statement[$cursor + 1] -eq "'"
+        )
+        $startsWithVariable = $cursor -lt $statement.Length -and $statement[$cursor] -eq '@'
+        if (
+            -not $parenthesized -and
+            -not $spExecuteSql.Success -and
+            -not $startsWithLiteral -and
+            -not $startsWithVariable
+        ) {
+            continue
+        }
+
+        $expression = ConvertFrom-ConstantSqlExpression -Text $statement -StartIndex $cursor
+        if (-not $expression.Success) {
+            $Findings.Add([pscustomobject]@{
+                Rule = 'DEPLOY008'
+                Severity = 'error'
+                Line = $findingLine
+                Message = 'Dynamic SQL execution is not a constant string expression and is blocked.'
+                Statement = ($statement -replace '\s+', ' ').Trim()
+                AllowedBy = $null
+            })
+            continue
+        }
+        $afterExpression = $expression.EndIndex
+        while ($afterExpression -lt $statement.Length -and [char]::IsWhiteSpace($statement[$afterExpression])) {
+            $afterExpression++
+        }
+        if (
+            $parenthesized -and
+            ($afterExpression -ge $statement.Length -or $statement[$afterExpression] -ne ')')
+        ) {
+            $Findings.Add([pscustomobject]@{
+                Rule = 'DEPLOY008'
+                Severity = 'error'
+                Line = $findingLine
+                Message = 'Dynamic SQL execution contains an unsupported expression and is blocked.'
+                Statement = ($statement -replace '\s+', ' ').Trim()
+                AllowedBy = $null
+            })
+            continue
+        }
+
+        $dynamicSql = $expression.Value
+        $dynamicCodeOnly = ConvertTo-CodeOnly -Text $dynamicSql
+        foreach ($rule in $Rules) {
+            foreach ($match in [regex]::Matches($dynamicCodeOnly, $rule.Pattern)) {
+                $dynamicStatement = (
+                    $dynamicSql.Substring($match.Index, $match.Length) -replace '\s+', ' '
+                ).Trim()
+                $Findings.Add([pscustomobject]@{
+                    Rule = $rule.Id
+                    Severity = $rule.Severity
+                    Line = $findingLine
+                    Message = "Dynamic SQL: $($rule.Message)"
+                    Statement = $dynamicStatement
+                    AllowedBy = $null
+                })
+            }
+        }
+        if ($dynamicCodeOnly -match '(?is)\b(?:(?:CREATE|ALTER|DROP)\s+(?:TABLE|VIEW|PROCEDURE|PROC|FUNCTION|INDEX|SCHEMA|TRIGGER|TYPE|SEQUENCE|SYNONYM|DATABASE|ROLE|USER|LOGIN)|TRUNCATE\s+TABLE|EXEC(?:UTE)?\s+(?:sys\.)?sp_rename)\b') {
+            $Findings.Add([pscustomobject]@{
+                Rule = 'DEPLOY008'
+                Severity = 'error'
+                Line = $findingLine
+                Message = 'Constant dynamic DDL requires explicit deployment review.'
+                Statement = ($dynamicSql -replace '\s+', ' ').Trim()
+                AllowedBy = $null
+            })
+        }
+        Add-DynamicExecutionFinding `
+            -Text $dynamicSql `
+            -StartLine $findingLine `
+            -Depth ($Depth + 1) `
+            -Rules $Rules `
+            -Findings $Findings
+    }
+}
 
 $knownRuleIds = @($rules.Id) + 'DEPLOY008'
 $allowlist = @(Get-Content -Path $AllowlistPath -Raw | ConvertFrom-Json)
@@ -187,27 +531,12 @@ foreach ($batch in $batches) {
         }
     }
 
-    $executeMatches = [regex]::Matches(
-        $codeOnly,
-        '(?is)\bEXEC(?:UTE)?\s+(?:\[?sys\]?\.)?\[?sp_executesql\]?\b'
-    )
-    foreach ($executeMatch in $executeMatches) {
-        $dynamicStrings = [regex]::Matches($batch.Text, "(?is)N?'((?:''|[^'])*)'")
-        foreach ($dynamicString in $dynamicStrings) {
-            $dynamicSql = $dynamicString.Groups[1].Value -replace "''", "'"
-            if ($dynamicSql -notmatch '(?is)\b(?:(?:CREATE|ALTER|DROP)\s+(?:TABLE|VIEW|PROCEDURE|PROC|FUNCTION|INDEX|SCHEMA|TRIGGER|TYPE|SEQUENCE|SYNONYM|DATABASE|ROLE|USER|LOGIN)|TRUNCATE\s+TABLE|EXEC(?:UTE)?\s+(?:sys\.)?sp_rename)\b') {
-                continue
-            }
-            $findings.Add([pscustomobject]@{
-                Rule = 'DEPLOY008'
-                Severity = 'error'
-                Line = Get-LineNumber -Text $batch.Text -Index $executeMatch.Index -StartLine $batch.StartLine
-                Message = 'Dynamic DDL executed through sp_executesql cannot be reviewed reliably.'
-                Statement = ($dynamicSql -replace '\s+', ' ').Trim()
-                AllowedBy = $null
-            })
-        }
-    }
+    Add-DynamicExecutionFinding `
+        -Text $batch.Text `
+        -StartLine $batch.StartLine `
+        -Depth 0 `
+        -Rules $rules `
+        -Findings $findings
 }
 
 foreach ($finding in $findings) {

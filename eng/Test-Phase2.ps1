@@ -215,6 +215,46 @@ try {
             -ScriptPath (Join-Path $fixtures 'deployment-destructive.sql') `
             -ReportPath (Join-Path $temporaryPath 'destructive-report.md')
     } 'The Phase 1 destructive deployment regression fixture should fail.'
+    $dynamicPolicyCases = @(
+        @{ Name = 'direct-exec'; Sql = "EXEC(N'DROP TABLE [dbo].[Danger];');" },
+        @{ Name = 'execute-concat'; Sql = "EXECUTE ( N'DR' + N'OP TABLE [dbo].[Danger];' );" },
+        @{ Name = 'sp-executesql-concat'; Sql = "EXEC sys.sp_executesql N'DROP ' + N'TABLE [dbo].[Danger];';" },
+        @{ Name = 'variable-exec'; Sql = "DECLARE @sql nvarchar(max) = N'DROP TABLE [dbo].[Danger];'; EXEC(@sql);" },
+        @{ Name = 'function-expression'; Sql = "EXEC sp_executesql REPLACE(N'DRXP TABLE [dbo].[Danger];', N'X', N'O');" },
+        @{ Name = 'comment-concat'; Sql = "EXEC (N'DR'/* split */ + N'OP TABLE [dbo].[O''Brien];');" },
+        @{ Name = 'nested-dynamic'; Sql = "EXEC(N'EXEC(N''DROP TABLE [dbo].[Danger];'')');" },
+        @{ Name = 'database-qualified'; Sql = "EXEC AppDb.sys.sp_executesql N'DROP TABLE [dbo].[Danger];';" }
+    )
+    foreach ($case in $dynamicPolicyCases) {
+        $casePath = Join-Path $temporaryPath "$($case.Name).sql"
+        $caseReportPath = Join-Path $temporaryPath "$($case.Name).md"
+        Set-Content -Path $casePath -Value $case.Sql -Encoding utf8
+        Assert-Throws {
+            & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+                -ScriptPath $casePath `
+                -ReportPath $caseReportPath
+        } "Dynamic SQL policy case '$($case.Name)' must fail closed."
+        Assert-True `
+            -Condition (Test-Path $caseReportPath -PathType Leaf) `
+            -Message "Dynamic SQL policy case '$($case.Name)' must produce a policy report."
+        Assert-True `
+            -Condition ((Get-Content -Path $caseReportPath -Raw) -match 'DEPLOY00[89]') `
+            -Message "Dynamic SQL policy case '$($case.Name)' must fail through a dynamic execution rule."
+    }
+    foreach ($case in @(
+        @{ Name = 'static-procedure'; Sql = 'EXEC dbo.StoredProcedure @p = 1;' },
+        @{ Name = 'static-return-procedure'; Sql = 'EXEC @rc = dbo.StoredProcedure @p = 1;' },
+        @{ Name = 'constant-select'; Sql = "EXEC(N'SELECT 1;');" },
+        @{ Name = 'named-constant-select'; Sql = "EXEC sys.sp_executesql @stmt = N'SELECT 1;';" },
+        @{ Name = 'nested-comment'; Sql = '/* outer /* nested */ EXEC(N''DROP TABLE dbo.Hidden''); */ SELECT 1;' },
+        @{ Name = 'bracket-apostrophe'; Sql = 'CREATE TABLE [dbo].[O''Brien] ([Id] int NOT NULL);' }
+    )) {
+        $casePath = Join-Path $temporaryPath "$($case.Name).sql"
+        Set-Content -Path $casePath -Value $case.Sql -Encoding utf8
+        & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+            -ScriptPath $casePath `
+            -ReportPath (Join-Path $temporaryPath "$($case.Name).md")
+    }
 
     $parseFailures = [System.Collections.Generic.List[string]]::new()
     $powerShellFiles = @(
@@ -272,6 +312,19 @@ try {
             $templateText -match '(?s)displayName: Run advisory AI review of deployment SQL.*?Remove-Item.*?ai-review\.json.*?ai-review\.md.*?Invoke-AiDatabaseReview'
         ) `
         -Message 'The AI review task must remove known stale outputs before the current review.'
+    $deploymentExecutorText = Get-Content `
+        -Path (Join-Path $PSScriptRoot 'Invoke-ValidatedDeploymentScript.ps1') `
+        -Raw
+    Assert-True `
+        -Condition (
+            $deploymentExecutorText -match 'Invoke-Sqlcmd' -and
+            $deploymentExecutorText -match '-InputFile\s+\(Resolve-Path \$ScriptPath\)\.Path' -and
+            $deploymentExecutorText -match '-AccessToken\s+\$AccessToken' -and
+            $deploymentExecutorText -match '-AbortOnError' -and
+            $deploymentExecutorText -match '-Encrypt\s+Mandatory' -and
+            $deploymentExecutorText -match '-TrustServerCertificate:\$false'
+        ) `
+        -Message 'Exact deployment execution must use the validated InputFile with secure fail-fast Invoke-Sqlcmd options.'
 
     $injectionMarker = Join-Path $temporaryPath 'pipeline-parameter-injection.txt'
     $env:PHASE2_WARNING_PAYLOAD = "46010`"; Set-Content -Path '$injectionMarker' -Value injected; #"
@@ -436,6 +489,8 @@ Add-Content -Path $env:PHASE2_PLAN_LOG -Value "TOKEN:$DatabaseName" -Encoding ut
 
     $tokenLogDirectory = Join-Path $temporaryPath 'token-refresh'
     New-Item -ItemType Directory -Force -Path $tokenLogDirectory | Out-Null
+    $actionLogDirectory = Join-Path $temporaryPath 'deployment-actions'
+    New-Item -ItemType Directory -Force -Path $actionLogDirectory | Out-Null
     $fakeTokenProvider = Join-Path $temporaryPath 'fake-token-provider.ps1'
     @'
 param([Parameter(Mandatory)][string]$DatabaseName)
@@ -457,7 +512,35 @@ param(
 if ([string]::IsNullOrWhiteSpace($AccessToken)) {
     throw 'The smoke test did not receive a refreshed access token.'
 }
+Add-Content `
+    -Path (Join-Path $env:PHASE2_ACTION_LOG_DIRECTORY "$DatabaseName.log") `
+    -Value 'SMOKE' `
+    -Encoding utf8
 '@ | Set-Content -Path $fakeSmokeTest -Encoding utf8
+    $fakeDeploymentScriptExecutor = Join-Path $temporaryPath 'fake-deployment-script-executor.ps1'
+    @'
+param(
+    [string]$ServerName,
+    [int]$Port,
+    [string]$DatabaseName,
+    [string]$AccessToken,
+    [string]$ScriptPath,
+    [int]$CommandTimeout
+)
+if ([string]::IsNullOrWhiteSpace($AccessToken)) {
+    throw 'The deployment script executor did not receive a refreshed access token.'
+}
+if (-not (Test-Path $ScriptPath -PathType Leaf)) {
+    throw 'The deployment script executor did not receive the generated script path.'
+}
+Add-Content `
+    -Path (Join-Path $env:PHASE2_ACTION_LOG_DIRECTORY "$DatabaseName.log") `
+    -Value "EXECUTE:$ScriptPath" `
+    -Encoding utf8
+if ($DatabaseName -eq $env:PHASE2_EXECUTION_FAIL_DATABASE) {
+    throw "Fixture deployment script execution failed for '$DatabaseName'."
+}
+'@ | Set-Content -Path $fakeDeploymentScriptExecutor -Encoding utf8
 
     $approvedRoot = Join-Path $temporaryPath 'approved-review'
     $approvedReports = Join-Path $approvedRoot 'all-database-reports'
@@ -489,6 +572,7 @@ if ([string]::IsNullOrWhiteSpace($AccessToken)) {
         ApprovedReportPath = Join-Path $approvedRoot 'deploy-report.xml'
         AccessTokenProviderPath = $fakeTokenProvider
         SmokeTestScriptPath = $fakeSmokeTest
+        DeploymentScriptExecutorPath = $fakeDeploymentScriptExecutor
         TestPath = $fixtures
         MaxParallel = 3
         EnvironmentName = 'fixture'
@@ -560,22 +644,37 @@ if ([string]::IsNullOrWhiteSpace($AccessToken)) {
 
     Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $true
     $env:PHASE2_TOKEN_LOG_DIRECTORY = $tokenLogDirectory
+    $env:PHASE2_ACTION_LOG_DIRECTORY = $actionLogDirectory
     Remove-Item -Path $planLog -Force -ErrorAction SilentlyContinue
     & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
         -ValidateAllDatabasePlans `
         -ReportDirectory (Join-Path $temporaryPath 'gated-current-reports')
     foreach ($database in $deploymentTargets) {
         $tokenCalls = @(Get-Content -Path (Join-Path $tokenLogDirectory "$database.log"))
-        Assert-Equal $tokenCalls.Count 4 "Deployment '$database' must refresh before report, script, publish, and smoke test."
+        Assert-Equal $tokenCalls.Count 4 "Deployment '$database' must refresh before report, script execution, and smoke test."
     }
-    $canaryActions = @(
+    $canarySqlPackageActions = @(
         Get-Content $planLog |
-            Where-Object { $_ -like '*:CanaryDb' } |
+            Where-Object { $_ -match '^(?:ACTION:[^:]+|EXECUTE|SMOKE):CanaryDb' } |
             ForEach-Object { ($_ -split ':')[1] }
     )
-    Assert-Equal ($canaryActions -join '|') 'DeployReport|Script|Publish' 'Deployment must regenerate report then script immediately before publish.'
+    Assert-Equal ($canarySqlPackageActions -join '|') `
+        'DeployReport|Script' `
+        'Deployment must not recalculate a plan after current Script generation.'
+    $canaryExecutionActions = @(Get-Content (Join-Path $actionLogDirectory 'CanaryDb.log'))
+    Assert-True `
+        -Condition (
+            $canaryExecutionActions.Count -eq 2 -and
+            $canaryExecutionActions[0] -like 'EXECUTE:*CanaryDb.deploy.sql' -and
+            $canaryExecutionActions[1] -eq 'SMOKE'
+        ) `
+        -Message 'Deployment must execute the generated current script path and then run smoke.'
+    Assert-True `
+        -Condition ((Get-Content $planLog -Raw) -notmatch 'ACTION:Publish:') `
+        -Message 'The Deploy path must not invoke SqlPackage Publish after validating the generated script.'
 
     Remove-Item -Path (Join-Path $tokenLogDirectory '*.log') -Force
+    Remove-Item -Path (Join-Path $actionLogDirectory '*.log') -Force
     Remove-Item -Path $planLog -Force
     $env:PHASE2_DESTRUCTIVE_DATABASE = 'CanaryDb'
     Assert-Throws {
@@ -587,10 +686,70 @@ if ([string]::IsNullOrWhiteSpace($AccessToken)) {
     Assert-True `
         -Condition (
             ($abaActions -join '|') -match 'ACTION:DeployReport:CanaryDb\|ACTION:Script:CanaryDb' -and
-            @($abaActions | Where-Object { $_ -eq 'ACTION:Publish:CanaryDb' }).Count -eq 0
+            -not (Test-Path (Join-Path $actionLogDirectory 'CanaryDb.log'))
         ) `
-        -Message 'The ABA regression must fail after current script generation and before Publish.'
+        -Message 'The ABA regression must fail after current script generation and before exact execution.'
     Remove-Item Env:PHASE2_DESTRUCTIVE_DATABASE
+
+    foreach ($database in $deploymentTargets) {
+        Copy-Item `
+            -Path (Join-Path $fixtures 'deploy-report-empty.xml') `
+            -Destination (Join-Path $approvedReports "$database.deploy-report.xml") `
+            -Force
+    }
+    Copy-Item `
+        -Path (Join-Path $fixtures 'deploy-report-empty.xml') `
+        -Destination (Join-Path $approvedRoot 'deploy-report.xml') `
+        -Force
+    $env:PHASE2_CHANGED_REPORT = Join-Path $fixtures 'deploy-report-empty.xml'
+    Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $true
+    Remove-Item -Path $planLog -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path (Join-Path $tokenLogDirectory '*.log') -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path (Join-Path $actionLogDirectory '*.log') -Force -ErrorAction SilentlyContinue
+    & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
+        -ValidateAllDatabasePlans `
+        -ReportDirectory (Join-Path $temporaryPath 'empty-report-current')
+    foreach ($database in $deploymentTargets) {
+        $emptyReportActions = @(Get-Content (Join-Path $actionLogDirectory "$database.log"))
+        Assert-True `
+            -Condition (
+                @($emptyReportActions | Where-Object { $_ -like 'EXECUTE:*' }).Count -eq 1 -and
+                @($emptyReportActions | Where-Object { $_ -eq 'SMOKE' }).Count -eq 1
+            ) `
+            -Message "Empty DeployReport must still execute the exact script and smoke test for '$database'."
+    }
+
+    foreach ($database in $deploymentTargets) {
+        Copy-Item `
+            -Path (Join-Path $fixtures 'deploy-report-changed.xml') `
+            -Destination (Join-Path $approvedReports "$database.deploy-report.xml") `
+            -Force
+    }
+    Copy-Item `
+        -Path (Join-Path $fixtures 'deploy-report-changed.xml') `
+        -Destination (Join-Path $approvedRoot 'deploy-report.xml') `
+        -Force
+    $env:PHASE2_CHANGED_REPORT = Join-Path $fixtures 'deploy-report-changed.xml'
+    Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $true
+    Remove-Item -Path $planLog -Force
+    Remove-Item -Path (Join-Path $actionLogDirectory '*.log') -Force
+    $env:PHASE2_EXECUTION_FAIL_DATABASE = 'CanaryDb'
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') @deployArguments `
+            -ValidateAllDatabasePlans `
+            -ReportDirectory (Join-Path $temporaryPath 'execution-failure-current')
+    } 'Exact script execution failure must stop smoke and the remaining shard rollout.'
+    $executionFailureActions = @(Get-Content (Join-Path $actionLogDirectory 'CanaryDb.log'))
+    Assert-True `
+        -Condition (
+            @($executionFailureActions | Where-Object { $_ -like 'EXECUTE:*' }).Count -eq 1 -and
+            @($executionFailureActions | Where-Object { $_ -eq 'SMOKE' }).Count -eq 0 -and
+            -not (Test-Path (Join-Path $actionLogDirectory 'Shard02.log')) -and
+            -not (Test-Path (Join-Path $actionLogDirectory 'Shard03.log')) -and
+            -not (Test-Path (Join-Path $actionLogDirectory 'Shard04.log'))
+        ) `
+        -Message 'Execution failure must stop before smoke and prevent the parallel shard rollout.'
+    Remove-Item Env:PHASE2_EXECUTION_FAIL_DATABASE
 
     Write-TestDeploymentManifest $approvedRoot $fakeDacpac $deploymentTargets $false
     Remove-Item -Path (Join-Path $tokenLogDirectory '*.log') -Force -ErrorAction SilentlyContinue
@@ -598,7 +757,7 @@ if ([string]::IsNullOrWhiteSpace($AccessToken)) {
         -ReportDirectory (Join-Path $temporaryPath 'representative-current-reports')
     foreach ($database in $deploymentTargets) {
         $tokenCalls = @(Get-Content -Path (Join-Path $tokenLogDirectory "$database.log"))
-        Assert-Equal $tokenCalls.Count 4 "Representative deployment '$database' must refresh before report, script, publish, and smoke test."
+        Assert-Equal $tokenCalls.Count 4 "Representative deployment '$database' must refresh before report, script execution, and smoke test."
     }
 
     Write-Host 'All Phase 2 fixture and static tests passed.'
@@ -611,6 +770,8 @@ finally {
     Remove-Item Env:PHASE2_DRIFT_DATABASE -ErrorAction SilentlyContinue
     Remove-Item Env:PHASE2_DRIFT_REPORT -ErrorAction SilentlyContinue
     Remove-Item Env:PHASE2_TOKEN_LOG_DIRECTORY -ErrorAction SilentlyContinue
+    Remove-Item Env:PHASE2_ACTION_LOG_DIRECTORY -ErrorAction SilentlyContinue
+    Remove-Item Env:PHASE2_EXECUTION_FAIL_DATABASE -ErrorAction SilentlyContinue
     if (Test-Path $temporaryPath) {
         Remove-Item -Path $temporaryPath -Recurse -Force
     }

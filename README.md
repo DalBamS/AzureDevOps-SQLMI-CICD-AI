@@ -57,5 +57,6 @@ Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 - `eng/Test-DeploymentScript.ps1`: 생성된 배포 SQL의 파괴 DDL, 동적 DDL, rename 검사
 - `eng/Test-FailureLabs.ps1`: Lab B~D 오프라인 차단과 선택적 Lab A Docker 회귀
 - `eng/Deploy-Databases.ps1`: 카나리, 제한 병렬 fan-out, 실패 집계와 재시도 안전 배포
+- `eng/Invoke-ValidatedDeploymentScript.ps1`: 승인 직전 검증한 SQLCMD script 원문 실행
 - `eng/Deploy-InstanceObjects.ps1`: Entra token/SQLCMD 변수 기반 인스턴스 오브젝트 배포
 - `pipelines/drift-report.yml`: 매일 02:00 UTC 대표 DB에 읽기 전용 DeployReport 실행

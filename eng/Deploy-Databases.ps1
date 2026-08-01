@@ -31,6 +31,7 @@ param(
     [switch]$ValidateAllDatabasePlans,
     [string]$TestPath,
     [string]$SmokeTestScriptPath,
+    [string]$DeploymentScriptExecutorPath,
     [string]$ReportDirectory,
     [string]$SummaryPath,
     [string]$EnvironmentName = 'unknown'
@@ -43,6 +44,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $modulePath = Join-Path $PSScriptRoot 'Phase2.Common.psm1'
 $confirmScript = Join-Path $PSScriptRoot 'Confirm-DeploymentPlan.ps1'
 $policyScript = Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1'
+$defaultDeploymentScriptExecutor = Join-Path $PSScriptRoot 'Invoke-ValidatedDeploymentScript.ps1'
 $testScript = Join-Path $PSScriptRoot 'Test-DeployedDatabase.ps1'
 Import-Module $modulePath -Force
 
@@ -60,6 +62,12 @@ if (-not $SmokeTestScriptPath) {
 }
 if (-not (Test-Path $SmokeTestScriptPath -PathType Leaf)) {
     throw "Smoke test script not found: $SmokeTestScriptPath"
+}
+if (-not $DeploymentScriptExecutorPath) {
+    $DeploymentScriptExecutorPath = $defaultDeploymentScriptExecutor
+}
+if (-not (Test-Path $DeploymentScriptExecutorPath -PathType Leaf)) {
+    throw "Deployment script executor not found: $DeploymentScriptExecutorPath"
 }
 New-Item -ItemType Directory -Force -Path $ReportDirectory | Out-Null
 
@@ -234,6 +242,7 @@ $context = [pscustomobject]@{
     ModulePath = $modulePath
     ConfirmScript = $confirmScript
     PolicyScript = $policyScript
+    DeploymentScriptExecutor = (Resolve-Path $DeploymentScriptExecutorPath).Path
     TestScript = (Resolve-Path $SmokeTestScriptPath).Path
 }
 
@@ -304,93 +313,80 @@ $worker = {
             throw "Current deployment report generation failed with exit code $LASTEXITCODE."
         }
 
-        $status = 'AlreadyCurrent'
-        if (Test-DeployReportHasChanges -Path $reportPath) {
-            $databaseApprovedReport = Join-Path `
-                $WorkerContext.ApprovedReportsDirectory `
-                "$Database.deploy-report.xml"
-            $comparisonReport = if ($WorkerContext.UsePerDatabaseApprovedReports) {
-                $databaseApprovedReport
-            }
-            else {
-                $WorkerContext.ApprovedReportPath
-            }
-            & $WorkerContext.ConfirmScript `
-                -ApprovedReportPath $comparisonReport `
-                -CurrentReportPath $reportPath `
-                -CompareOperationsOnly:(
-                    $comparisonReport -eq $WorkerContext.ApprovedReportPath -and
-                    $Database -ne $WorkerContext.RepresentativeDatabase
-                )
-
-            $scriptAccessToken = Get-WorkerAccessToken
-            $scriptArguments = @(
-                '/Action:Script',
-                "/SourceFile:$($WorkerContext.DacpacPath)",
-                "/TargetConnectionString:$connection",
-                "/AccessToken:$scriptAccessToken",
-                "/OutputPath:$scriptPath",
-                "/Profile:$($WorkerContext.PublishProfilePath)",
-                "/p:CommandTimeout=$($WorkerContext.CommandTimeout)"
-            )
-            & $WorkerContext.SqlPackagePath @scriptArguments 2>&1 |
-                ForEach-Object { Write-Host "[$Database] $_" }
-            if ($LASTEXITCODE -ne 0) {
-                throw "Current deployment script generation failed with exit code $LASTEXITCODE."
-            }
-            & $WorkerContext.PolicyScript `
-                -ScriptPath $scriptPath `
-                -ReportPath $policyReportPath
-
-            $approvedScript = if ($WorkerContext.UsePerDatabaseApprovedReports) {
-                Join-Path $WorkerContext.ApprovedScriptsDirectory "$Database.deploy.sql"
-            }
-            else {
-                Join-Path (Split-Path -Parent $WorkerContext.ApprovedReportPath) 'deploy.sql'
-            }
-            $approvedScriptContent = if (
-                -not $WorkerContext.UsePerDatabaseApprovedReports -and
-                $Database -ne $WorkerContext.RepresentativeDatabase
-            ) {
-                Get-ComparableDeploymentScript `
-                    -Path $approvedScript `
-                    -TargetDatabase $WorkerContext.RepresentativeDatabase
-            }
-            else {
-                Get-Content -Path $approvedScript -Raw
-            }
-            $currentScriptContent = if (
-                -not $WorkerContext.UsePerDatabaseApprovedReports -and
-                $Database -ne $WorkerContext.RepresentativeDatabase
-            ) {
-                Get-ComparableDeploymentScript -Path $scriptPath -TargetDatabase $Database
-            }
-            else {
-                Get-Content -Path $scriptPath -Raw
-            }
-            if ($approvedScriptContent -cne $currentScriptContent) {
-                throw 'The target deployment script changed after approval. Generate and approve a new deployment plan.'
-            }
-
-            $publishAccessToken = Get-WorkerAccessToken
-            $publishArguments = @(
-                '/Action:Publish',
-                "/SourceFile:$($WorkerContext.DacpacPath)",
-                "/TargetConnectionString:$connection",
-                "/AccessToken:$publishAccessToken",
-                "/Profile:$($WorkerContext.PublishProfilePath)",
-                "/p:CommandTimeout=$($WorkerContext.CommandTimeout)"
-            )
-            & $WorkerContext.SqlPackagePath @publishArguments 2>&1 |
-                ForEach-Object { Write-Host "[$Database] $_" }
-            if ($LASTEXITCODE -ne 0) {
-                throw "DACPAC deployment failed with exit code $LASTEXITCODE."
-            }
-            $status = 'Deployed'
+        $databaseApprovedReport = Join-Path `
+            $WorkerContext.ApprovedReportsDirectory `
+            "$Database.deploy-report.xml"
+        $comparisonReport = if ($WorkerContext.UsePerDatabaseApprovedReports) {
+            $databaseApprovedReport
         }
         else {
-            Write-Host "[$Database] Target already matches the approved DACPAC; publish is skipped."
+            $WorkerContext.ApprovedReportPath
         }
+        & $WorkerContext.ConfirmScript `
+            -ApprovedReportPath $comparisonReport `
+            -CurrentReportPath $reportPath `
+            -CompareOperationsOnly:(
+                $comparisonReport -eq $WorkerContext.ApprovedReportPath -and
+                $Database -ne $WorkerContext.RepresentativeDatabase
+            )
+
+        $scriptAccessToken = Get-WorkerAccessToken
+        $scriptArguments = @(
+            '/Action:Script',
+            "/SourceFile:$($WorkerContext.DacpacPath)",
+            "/TargetConnectionString:$connection",
+            "/AccessToken:$scriptAccessToken",
+            "/OutputPath:$scriptPath",
+            "/Profile:$($WorkerContext.PublishProfilePath)",
+            "/p:CommandTimeout=$($WorkerContext.CommandTimeout)"
+        )
+        & $WorkerContext.SqlPackagePath @scriptArguments 2>&1 |
+            ForEach-Object { Write-Host "[$Database] $_" }
+        if ($LASTEXITCODE -ne 0) {
+            throw "Current deployment script generation failed with exit code $LASTEXITCODE."
+        }
+        & $WorkerContext.PolicyScript `
+            -ScriptPath $scriptPath `
+            -ReportPath $policyReportPath
+
+        $approvedScript = if ($WorkerContext.UsePerDatabaseApprovedReports) {
+            Join-Path $WorkerContext.ApprovedScriptsDirectory "$Database.deploy.sql"
+        }
+        else {
+            Join-Path (Split-Path -Parent $WorkerContext.ApprovedReportPath) 'deploy.sql'
+        }
+        $approvedScriptContent = if (
+            -not $WorkerContext.UsePerDatabaseApprovedReports -and
+            $Database -ne $WorkerContext.RepresentativeDatabase
+        ) {
+            Get-ComparableDeploymentScript `
+                -Path $approvedScript `
+                -TargetDatabase $WorkerContext.RepresentativeDatabase
+        }
+        else {
+            Get-Content -Path $approvedScript -Raw
+        }
+        $currentScriptContent = if (
+            -not $WorkerContext.UsePerDatabaseApprovedReports -and
+            $Database -ne $WorkerContext.RepresentativeDatabase
+        ) {
+            Get-ComparableDeploymentScript -Path $scriptPath -TargetDatabase $Database
+        }
+        else {
+            Get-Content -Path $scriptPath -Raw
+        }
+        if ($approvedScriptContent -cne $currentScriptContent) {
+            throw 'The target deployment script changed after approval. Generate and approve a new deployment plan.'
+        }
+
+        $executionAccessToken = Get-WorkerAccessToken
+        & $WorkerContext.DeploymentScriptExecutor `
+            -ServerName $WorkerContext.ServerName `
+            -Port $WorkerContext.Port `
+            -DatabaseName $Database `
+            -AccessToken $executionAccessToken `
+            -ScriptPath $scriptPath `
+            -CommandTimeout $WorkerContext.CommandTimeout
 
         $smokeTestAccessToken = Get-WorkerAccessToken
         & $WorkerContext.TestScript `
@@ -403,7 +399,7 @@ $worker = {
         return [pscustomobject]@{
             DatabaseName = $Database
             Success = $true
-            Status = "$status; smoke test passed"
+            Status = 'Validated deployment script executed; smoke test passed'
             Error = ''
         }
     }
