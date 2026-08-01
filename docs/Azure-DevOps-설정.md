@@ -9,11 +9,16 @@
 | Pipeline | `Azure SQL MI CI-CD` |
 | Azure 연결 | `sc-sqlmi-wif` (Microsoft Entra issuer 기반 Workload Identity Federation) |
 | 관리 ID | `<deployer-principal-name>` |
-| Dev SQL MI | `<sql-mi-name>`, public endpoint `3342` |
-| Dev DB | `AppDb_CicdDemo` |
+| Demo SQL MI | `<sql-mi-name>`, public endpoint `3342` |
+| Dev DB | `AppDb_CicdDemo_Dev` |
+| Stg DB | `AppDb_CicdDemo_Stg` |
+| Live DB | `AppDb_CicdDemo_Live` |
+| Foundry | `<azure-openai-resource>`, `gpt-5.6-sol` |
 | Agent pool | `sqlmi-private-agents` |
 
-Dev 환경은 실제 DACPAC 배포까지 검증했습니다. `sqlmi-test`와 `sqlmi-prod` variable group은 `CONFIGURE_BEFORE_USE` placeholder이므로 실제 대상이 확정되기 전에는 배포하지 않습니다.
+Demo는 한 SQL MI 안에서 데이터베이스를 분리해 Dev → Stg → Live 승격을 보여줍니다.
+DBA 한 명이 Azure DevOps Environment 승인을 통해 순차 배포하는 전제입니다. 실제
+운영에서는 장애 및 권한 경계를 위해 Live를 별도 SQL MI로 분리합니다.
 
 현재 self-hosted agent는 이 개발 PC에서 실행하는 데모용입니다. 운영 전에는 SQL MI VNet 내부의 전용 VM 또는 Managed DevOps Pool로 교체하십시오.
 
@@ -26,14 +31,14 @@ SQL MI 시스템 ID에는 Entra principal 조회를 위해 Microsoft Graph의 `U
 3. Azure Resource Manager 서비스 연결을 Workload Identity Federation 방식으로 생성합니다.
 4. 서비스 연결의 Entra 주체를 각 대상 데이터베이스에 사용자로 생성하고 최소 권한을 부여합니다.
 
-예시 권한은 초기 구축용 기준입니다. 조직의 권한 분리 정책에 따라 사용자 지정 database role로 축소하십시오. 현재 Dev DB에서는 `<deployer-principal-name>` 관리 ID에 동일 역할을 부여했습니다.
+예시 권한은 초기 구축용 기준입니다. 조직의 권한 분리 정책에 따라 사용자 지정 database role로 축소하십시오. Demo DB에서는 `<deployer-principal-name>` 관리 ID에 동일 역할을 부여합니다.
 
 ```sql
-CREATE USER [ado-sqlmi-deployer] FROM EXTERNAL PROVIDER;
-ALTER ROLE [db_ddladmin] ADD MEMBER [ado-sqlmi-deployer];
-ALTER ROLE [db_datareader] ADD MEMBER [ado-sqlmi-deployer];
-ALTER ROLE [db_datawriter] ADD MEMBER [ado-sqlmi-deployer];
-GRANT VIEW DEFINITION TO [ado-sqlmi-deployer];
+CREATE USER [<deployer-principal-name>] FROM EXTERNAL PROVIDER;
+ALTER ROLE [db_ddladmin] ADD MEMBER [<deployer-principal-name>];
+ALTER ROLE [db_datareader] ADD MEMBER [<deployer-principal-name>];
+ALTER ROLE [db_datawriter] ADD MEMBER [<deployer-principal-name>];
+GRANT VIEW DEFINITION TO [<deployer-principal-name>];
 ```
 
 ## 2. Agent pool
@@ -45,8 +50,9 @@ GRANT VIEW DEFINITION TO [ado-sqlmi-deployer];
 - PowerShell 7
 - Azure CLI
 - .NET 10 설치 가능 또는 사전 설치
+- SqlServer PowerShell module 22.4.5.1 설치 가능
 - NuGet 및 Microsoft artifact endpoint에 대한 outbound HTTPS
-- SQL MI private endpoint/FQDN 접근
+- 대상 SQL MI endpoint/FQDN 접근
 
 ## 3. Environment와 승인
 
@@ -63,13 +69,13 @@ Test와 Prod에는 수동 Approval check가 구성되어 있습니다. 운영 �
 
 ## 4. Variable group
 
-Library에 `sqlmi-dev`, `sqlmi-test`, `sqlmi-prod` variable group을 생성합니다.
+Library의 variable group은 다음 Demo 대상으로 구성합니다.
 
-| 변수 | 예시 | 비밀 여부 |
-|---|---|---|
-| `sqlServer` | `my-mi.xxxxx.database.windows.net` | 아니요 |
-| `sqlPort` | `1433` | 아니요 |
-| `databaseName` | `AppDb` | 아니요 |
+| Variable group | `sqlServer` | `sqlPort` | `databaseName` |
+|---|---|---:|---|
+| `sqlmi-dev` | `<sql-mi-public-fqdn>` | 3342 | `AppDb_CicdDemo_Dev` |
+| `sqlmi-test` | 동일 | 3342 | `AppDb_CicdDemo_Stg` |
+| `sqlmi-prod` | 동일 | 3342 | `AppDb_CicdDemo_Live` |
 
 서비스 연결 이름은 variable group이 아니라 파이프라인의 compile-time `azureServiceConnection` parameter로 전달합니다. Azure Pipelines가 실행 전에 서비스 연결 권한을 검증하기 때문입니다.
 
@@ -77,13 +83,40 @@ Library에 `sqlmi-dev`, `sqlmi-test`, `sqlmi-prod` variable group을 생성합�
 
 ## 5. Pipeline 생성
 
-1. Pipelines에서 저장소 루트의 `azure-pipelines.yml`을 선택합니다.
-2. 첫 실행은 모든 deploy parameter를 `false`로 두고 CI만 확인합니다.
-3. Dev 배포는 `deployDev=true`로 수동 실행합니다.
-4. Test 승격은 `deployDev=true`, `deployTest=true`로 실행합니다.
-5. Prod 승격은 세 deploy parameter를 모두 `true`로 설정합니다.
+1. PR을 생성하면 Azure hosted agent가 빌드, 정책, AI 리뷰, 컨테이너 통합 테스트를 실행합니다.
+2. PR 병합 후 Demo SQL MI를 시작합니다.
+3. Azure DevOps에서 파이프라인을 수동 실행하고 세 deploy parameter를 모두 `true`로 설정합니다.
+4. Dev는 자동 배포와 SQL MI 스모크 테스트를 수행합니다.
+5. Test 승인 후 Stg DB를 배포하고 동일 테스트를 실행합니다.
+6. Prod 승인 후 Live DB를 배포하고 동일 테스트를 실행합니다.
 
 각 환경은 동일한 `database` DACPAC artifact를 사용합니다. 이전 환경이 실패하거나 승인되지 않으면 후속 환경으로 진행하지 않습니다.
+
+Demo 데이터베이스 최초 구성:
+
+```powershell
+az sql mi start -g <sql-mi-resource-group> --mi <sql-mi-name>
+$token = az account get-access-token `
+  --resource 'https://database.windows.net/' `
+  --query accessToken `
+  --output tsv
+
+& ./eng/Initialize-DemoDatabases.ps1 `
+  -ServerName '<sql-mi-public-fqdn>' `
+  -Port 3342 `
+  -DatabaseName @('AppDb_CicdDemo_Dev', 'AppDb_CicdDemo_Stg', 'AppDb_CicdDemo_Live') `
+  -DeployerPrincipalName '<deployer-principal-name>' `
+  -AccessToken $token
+```
+
+SQL MI 시작에는 일반적으로 수 분 이상 걸리며 `az sql mi start`가 완료된 후 초기화
+스크립트를 실행합니다.
+
+Demo가 끝나면 비용 절감을 위해 인스턴스를 중지합니다.
+
+```powershell
+az sql mi stop -g <sql-mi-resource-group> --mi <sql-mi-name>
+```
 
 Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제되지 않으므로 `main` 브랜치의 **Build validation** 정책에 이 파이프라인을 Required로 연결합니다. 현재 구성은 GitHub 저장소를 사용하므로 GitHub branch protection에서 Azure Pipelines 상태 검사를 Required로 설정합니다.
 
@@ -105,6 +138,8 @@ ScriptDatabaseOptions=False
 승인자는 대기 중인 `Deploy*` stage를 승인하기 전에 완료된 `Plan*` stage의 artifact를 검토합니다. 초기 도입 기간에는 Dev 자동 배포만 허용하고 Test/Prod에서 `deploy.sql`을 DBA가 승인하도록 운영합니다. `DropObjectsNotInSource=False`로 인해 제거가 자동 반영되지 않으므로, 승인된 제거는 별도 expand/contract 절차와 명시적 스크립트로 처리합니다.
 
 승인 이후 배포 직전에 DeployReport를 다시 생성해 승인된 보고서와 비교합니다. 대상 DB에 드리프트가 생기면 배포를 중단하고 새 계획과 승인을 요구합니다.
+배포가 완료되면 `Test-DeployedDatabase.ps1`이 실제 대상 DB에서 스키마, 메타데이터,
+seed data, 저장 프로시저 동작을 검증합니다.
 
 ## 7. AI 품질 게이트
 
@@ -122,15 +157,15 @@ JSON Schema를 사용해 Azure OpenAI Responses API를 호출합니다.
 - [Azure OpenAI Responses API와 지원 모델](https://learn.microsoft.com/azure/foundry/openai/how-to/responses)
 - [Foundry에서 Azure가 제공하는 모델](https://learn.microsoft.com/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure)
 
-Foundry에서 Azure OpenAI 모델을 배포한 뒤 다음 값을 파이프라인 실행 parameter로 전달합니다.
+현재 Demo pipeline의 기본 parameter는 다음과 같이 구성되어 있습니다.
 
 | Parameter | 예시 |
 |---|---|
 | `enableAiReview` | `true` |
-| `aiEndpoint` | `https://my-resource.openai.azure.com/openai/v1/` |
-| `aiDeploymentName` | `sql-review` |
-| `publishAiPrComment` | `true`(선택) |
-| `githubServiceConnection` | GitHub OAuth/PAT 서비스 연결 이름(선택) |
+| `aiEndpoint` | `https://<azure-openai-resource>.openai.azure.com/openai/v1/` |
+| `aiDeploymentName` | `gpt-5.6-sol` |
+| `publishAiPrComment` | `true` |
+| `githubServiceConnection` | `<github-service-connection>` |
 
 `sc-sqlmi-wif` 서비스 연결의 Entra 주체에 Azure OpenAI 리소스 범위의
 **Cognitive Services OpenAI User** 역할을 부여합니다. 파이프라인은
@@ -138,14 +173,6 @@ Foundry에서 Azure OpenAI 모델을 배포한 뒤 다음 값을 파이프라인
 PR 코멘트가 필요하면 Azure DevOps의 GitHub 서비스 연결을 지정하고
 `publishAiPrComment=true`로 실행합니다. 이 옵션을 사용하지 않아도 JSON artifact와
 파이프라인 실행 요약은 게시됩니다.
-
-로컬에서는 `az login` 후 다음처럼 현재 작업 트리의 SQL 변경을 검토할 수 있습니다.
-
-```powershell
-$env:AZURE_OPENAI_ENDPOINT = 'https://my-resource.openai.azure.com/openai/v1/'
-$env:AZURE_OPENAI_DEPLOYMENT = 'sql-review'
-pwsh ./eng/Invoke-AiDatabaseReview.ps1
-```
 
 권장 순서:
 

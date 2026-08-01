@@ -5,15 +5,21 @@ Azure DevOps를 활용해 **Azure SQL Managed Instance**의 데이터베이스 �
 
 ## 빠른 시작
 
+SQL 변경 브랜치를 GitHub에 push하고 `main` 대상 PR을 생성합니다.
+
 ```powershell
-pwsh ./eng/Build.ps1
-pwsh ./eng/Test-SqlPolicy.ps1
-pwsh ./eng/Test-Database.ps1  # Docker Desktop 필요
+git push --set-upstream origin <branch-name>
 ```
 
-빌드 결과는 `artifacts/dacpac/App.Database.dacpac`에 생성됩니다.
-AI 리뷰를 활성화하면 PR의 SQL diff와 환경별 `deploy.sql`을 Azure OpenAI가
-검토하고 JSON/Markdown 보고서를 파이프라인 artifact와 실행 요약에 게시합니다.
+GitHub에서 `main` 대상 PR을 생성하면 Azure DevOps가 Microsoft-hosted agent에서
+DACPAC 빌드, 정책 검사, AI PR 리뷰,
+임시 SQL Server 컨테이너 통합 테스트를 수행합니다. 개발 PC에는 Docker Desktop이
+필요하지 않습니다.
+
+PR 병합 후 Azure DevOps에서 파이프라인을 수동 실행해 `deployDev`, `deployTest`,
+`deployProd`를 선택하면 동일 DACPAC을 Dev → Stg → Live 데이터베이스로 순차 배포하고
+각 환경에서 스모크 테스트를 실행합니다. Test와 Prod는 Azure DevOps Environment
+승인을 통과해야 합니다.
 
 ## 문서
 
@@ -32,7 +38,7 @@ AI 리뷰를 활성화하면 PR의 SQL diff와 환경별 `deploy.sql`을 Azure O
 
 - `database/App.Database`: Microsoft.Build.Sql 2.2 기반 Azure SQL 프로젝트
 - `tests/integration`: 스키마·메타데이터·저장 프로시저 스모크 테스트
-- `eng`: 로컬 빌드, 정책 검사, SQL Server 컨테이너 테스트, BACPAC 도구
+- `eng`: 빌드, 정책 검사, hosted container 테스트, SQL MI 검증, BACPAC 도구
 - `azure-pipelines.yml`: build-once/deploy-many Azure Pipelines
 - `ai/database-change-review.md`: AI 리뷰 가드레일과 JSON 출력 계약
 - `eng/Invoke-AiDatabaseReview.ps1`: Azure OpenAI Responses API 기반 SQL 변경 리뷰

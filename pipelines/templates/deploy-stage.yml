@@ -178,8 +178,24 @@ stages:
                     }
                   displayName: Install pinned SqlPackage
 
+                - pwsh: |
+                    $requiredVersion = [version]"$(sqlServerModuleVersion)"
+                    $installed = Get-Module -ListAvailable -Name SqlServer |
+                      Where-Object Version -eq $requiredVersion
+                    if (-not $installed) {
+                      Install-Module `
+                        -Name SqlServer `
+                        -RequiredVersion $requiredVersion `
+                        -Repository PSGallery `
+                        -Scope CurrentUser `
+                        -Force `
+                        -AllowClobber
+                    }
+                    Import-Module SqlServer -RequiredVersion $requiredVersion -Force
+                  displayName: Prepare pinned SQL test module
+
                 - task: AzureCLI@2
-                  displayName: Deploy approved DACPAC
+                  displayName: Deploy and smoke test approved DACPAC
                   inputs:
                     azureSubscription: ${{ parameters.azureServiceConnection }}
                     scriptType: pscore
@@ -232,3 +248,9 @@ stages:
                       if ($LASTEXITCODE -ne 0) {
                         throw "DACPAC deployment failed."
                       }
+
+                      ./eng/Test-DeployedDatabase.ps1 `
+                        -ServerName "$(sqlServer)" `
+                        -Port "$(sqlPort)" `
+                        -DatabaseName "$(databaseName)" `
+                        -AccessToken $token

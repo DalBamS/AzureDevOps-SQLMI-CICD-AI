@@ -40,27 +40,28 @@ parameters:
   - name: enableAiReview
     displayName: Run advisory AI SQL review
     type: boolean
-    default: false
+    default: true
   - name: aiEndpoint
     displayName: Azure OpenAI endpoint
     type: string
-    default: ''
+    default: https://<azure-openai-resource>.openai.azure.com/openai/v1/
   - name: aiDeploymentName
     displayName: Azure OpenAI model deployment
     type: string
-    default: sql-review
+    default: gpt-5.6-sol
   - name: publishAiPrComment
     displayName: Publish AI review as a GitHub PR comment
     type: boolean
-    default: false
+    default: true
   - name: githubServiceConnection
     displayName: GitHub service connection for PR comments
     type: string
-    default: ''
+    default: <github-service-connection>
 
 variables:
   artifactName: database
   sqlPackageVersion: 170.4.83
+  sqlServerModuleVersion: 22.4.5.1
 
 stages:
   - stage: Build
@@ -143,7 +144,7 @@ stages:
             continueOnError: true
 
       - job: IntegrationTest
-        displayName: Deploy and smoke test SQL Server 2022
+        displayName: Azure hosted SQL Server container test
         dependsOn: BuildDacpac
         pool:
           vmImage: ubuntu-latest
