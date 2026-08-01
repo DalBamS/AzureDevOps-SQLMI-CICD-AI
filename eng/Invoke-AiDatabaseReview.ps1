@@ -230,12 +230,12 @@ function Get-GitDiff {
         if ($LASTEXITCODE -ne 0) {
             throw "Git base reference was not found: $normalizedReference"
         }
-        $diff = & git diff --unified=80 "$normalizedReference...HEAD" -- database/App.Database tests/integration
+        $diff = & git -c core.quotePath=false diff --unified=80 "$normalizedReference...HEAD" -- database/App.Database tests/integration
         if ($LASTEXITCODE -ne 0) {
             throw 'Unable to generate the SQL review diff.'
         }
     } else {
-        $diff = & git diff --unified=80 HEAD -- database/App.Database tests/integration
+        $diff = & git -c core.quotePath=false diff --unified=80 HEAD -- database/App.Database tests/integration
         if ($LASTEXITCODE -ne 0) {
             throw 'Unable to read the working tree SQL diff.'
         }
@@ -412,6 +412,65 @@ function Get-ReviewSourcePath {
     return [IO.Path]::GetFileName($resolvedPath)
 }
 
+function ConvertFrom-GitPathToken {
+    param([Parameter(Mandatory)][string]$Token)
+
+    $path = $Token
+    if ($Token.StartsWith('"') -and $Token.EndsWith('"')) {
+        $body = $Token.Substring(1, $Token.Length - 2)
+        $bytes = [System.Collections.Generic.List[byte]]::new()
+        for ($index = 0; $index -lt $body.Length; $index++) {
+            $character = $body[$index]
+            if ($character -ne '\') {
+                foreach ($byte in [Text.Encoding]::UTF8.GetBytes([string]$character)) {
+                    $bytes.Add($byte)
+                }
+                continue
+            }
+            $index++
+            if ($index -ge $body.Length) {
+                throw 'Git diff path ends with an incomplete escape sequence.'
+            }
+            $escaped = $body[$index]
+            if ($escaped -match '[0-7]') {
+                $octal = [string]$escaped
+                for ($digit = 1; $digit -lt 3 -and $index + 1 -lt $body.Length; $digit++) {
+                    if ($body[$index + 1] -notmatch '[0-7]') {
+                        break
+                    }
+                    $index++
+                    $octal += $body[$index]
+                }
+                $bytes.Add([Convert]::ToByte($octal, 8))
+                continue
+            }
+            $escapedByte = switch ($escaped) {
+                '"' { 34 }
+                '\' { 92 }
+                'a' { 7 }
+                'b' { 8 }
+                't' { 9 }
+                'n' { 10 }
+                'v' { 11 }
+                'f' { 12 }
+                'r' { 13 }
+                default { [byte][char]$escaped }
+            }
+            $bytes.Add([byte]$escapedByte)
+        }
+        try {
+            $path = [Text.UTF8Encoding]::new($false, $true).GetString($bytes.ToArray())
+        }
+        catch {
+            throw "Git diff path is not valid UTF-8: $($_.Exception.Message)"
+        }
+    }
+    if ($path -notmatch '^[ab]/(?<path>.+)$') {
+        throw "Git diff path must begin with 'a/' or 'b/': $path"
+    }
+    return $Matches.path
+}
+
 function ConvertFrom-GitDiff {
     param([Parameter(Mandatory)][string]$Content)
 
@@ -423,7 +482,7 @@ function ConvertFrom-GitDiff {
     $inHunk = $false
 
     foreach ($line in [regex]::Split($Content, '\r\n|\n|\r')) {
-        if ($line -match '^diff --git a/(.+) b/(?<path>.+)$') {
+        if ($line -match '^diff --git (?:(?<oldQuoted>"(?:\\.|[^"])*") (?<newQuoted>"(?:\\.|[^"])*")|a/(?<oldPath>.+) b/(?<newPath>.+))$') {
             if ($sourcePath -and $contentLines.Count -gt 0) {
                 $sections.Add([pscustomobject]@{
                     Content = $contentLines -join "`n"
@@ -432,7 +491,13 @@ function ConvertFrom-GitDiff {
                     LineMap = $lineMap.ToArray()
                 })
             }
-            $sourcePath = $Matches.path
+            $newPathToken = if ($Matches['newQuoted']) {
+                $Matches['newQuoted']
+            }
+            else {
+                "b/$($Matches['newPath'])"
+            }
+            $sourcePath = ConvertFrom-GitPathToken -Token $newPathToken
             $contentLines = [System.Collections.Generic.List[string]]::new()
             $lineMap = [System.Collections.Generic.List[int]]::new()
             $inHunk = $false
@@ -663,7 +728,11 @@ if ($ReviewInputPath) {
     }
     $reviewInput = Get-Content -Path $ReviewInputPath -Raw
     if ([IO.Path]::GetExtension($ReviewInputPath) -in @('.diff', '.patch')) {
-        foreach ($section in @(ConvertFrom-GitDiff -Content $reviewInput)) {
+        $diffSections = @(ConvertFrom-GitDiff -Content $reviewInput)
+        if ($diffSections.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($reviewInput)) {
+            throw 'The supplied Git diff did not contain a parseable file hunk.'
+        }
+        foreach ($section in $diffSections) {
             $sections.Add($section)
         }
     }

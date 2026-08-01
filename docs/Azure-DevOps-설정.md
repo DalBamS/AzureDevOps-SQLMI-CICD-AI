@@ -147,7 +147,10 @@ Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제
 - `deploy.sql`: 실제 실행 예정 SQL
 - `deploy-report.xml`: DacFx 변경 계획
 - `deployment-script-policy.md`: 결정론적 위험 DDL 검사와 allowlist 결과
-- `target-databases.json`: 대표 DB, 전체 대상, 전수 검사 여부
+- `target-databases.json`: 대표 DB, 전체 대상, 전수 검사와 모든 script gate 완료 여부
+- `all-database-reports`: 전수 검사 시 DB별 DacFx 변경 계획
+- `all-database-scripts`: 전수 검사 시 DB별 실제 실행 예정 SQL
+- `all-database-policy-reports`: 전수 검사 시 DB별 결정론적 정책 결과
 
 각 환경은 `pipelines/profiles/sqlmi-<environment>.publish.xml`을 사용합니다. 세 profile의
 내용은 완전히 동일하며 연결 정보는 포함하지 않습니다. `Script`, `DeployReport`,
@@ -190,9 +193,14 @@ advisory 단계입니다.
 승인자는 대기 중인 `Deploy*` stage를 승인하기 전에 완료된 `Plan*` stage의 artifact를 검토합니다. 초기 도입 기간에는 Dev 자동 배포만 허용하고 Test/Prod에서 `deploy.sql`을 DBA가 승인하도록 운영합니다. `DropObjectsNotInSource=False`로 인해 제거가 자동 반영되지 않으므로, 승인된 제거는 별도 expand/contract 절차와 명시적 스크립트로 처리합니다.
 
 기본 Plan은 대표 DB만 조회하며 비용/MI 부하 경고를 남깁니다.
-`validateAllDatabasePlans=true`이면 각 DB의 DeployReport를 생성해
-`all-database-reports`에 보존하고 대표 보고서와 비교합니다. 차이는
+`validateAllDatabasePlans=true`이면 각 DB의 DeployReport와 Script를 생성하고 모든
+Script에 결정론적 정책 gate를 적용합니다. 보고서, script, 정책 결과는 각각
+`all-database-reports`, `all-database-scripts`, `all-database-policy-reports`에
+보존합니다. 하나의 DB라도 script gate를 통과하지 못하면 drift 정책과 관계없이 Plan이
+실패합니다. 보고서 차이는
 `databasePlanDriftPolicy=Warn`이면 승인 경고, `Fail`이면 Plan 실패입니다.
+따라서 전수 검사는 대상 DB마다 DeployReport 1회와 Script 1회를 실행해 기본 대표 검사보다
+SQL MI 부하와 pipeline 시간이 증가합니다.
 
 승인 이후 배포 직전에 각 DB의 DeployReport를 다시 생성합니다. 대표 전용 Plan은 작업
 집합을 대표 보고서와 비교하고, 전수 Plan은 각 DB별 승인 보고서와 비교합니다. 대상 DB에
@@ -202,6 +210,14 @@ test까지 통과해야 나머지를 최대 `maxParallel`로 배포합니다. �
 `eng/Get-AzureSqlAccessToken.ps1`로 Azure SQL access token을 새로 가져옵니다.
 각 DB 실패는 모두 수집되며 성공/실패 요약과 실패 DB 목록을 Azure DevOps summary에
 게시합니다. 이미 목표 상태인 DB는 재시도에서 publish를 생략하고 smoke를 재실행합니다.
+
+Plan도 각 DeployReport와 Script 직전에 같은 token provider를 호출합니다. Azure DevOps의
+장시간 Plan과 rollout `AzureCLI@2` 작업은 WIF IdToken 만료 이후 재로그인을 위해
+`keepAzSessionActive: true`를 사용합니다. 이 input은 Microsoft의 AzureCLI@2 task
+manifest에서 WIF 전용 experimental 기능으로 정의되어 있으므로 private agent의 task
+버전이 해당 input을 지원하는지 실제 실행 전에 확인합니다.
+
+- [AzureCLI@2 공식 task manifest](https://github.com/microsoft/azure-pipelines-tasks/blob/master/Tasks/AzureCLIV2/task.json)
 
 실제 SqlPackage 실행 직전 UTC 시각은
 `deployment-review-<environment>-pitr-marker/pitr-marker.json`에 게시됩니다. timeout,

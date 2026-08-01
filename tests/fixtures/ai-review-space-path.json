@@ -1,0 +1,13 @@
+{
+  "risk": "medium",
+  "summary": "Space path mapping.",
+  "blockingFindings": [
+    {
+      "file": "database/App.Database/Sample Data.sql",
+      "line": 2,
+      "reason": "Space path finding.",
+      "recommendation": "Review the complete file path."
+    }
+  ],
+  "advisories": []
+}

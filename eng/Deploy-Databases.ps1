@@ -73,6 +73,8 @@ Write-Host "Remaining databases: $($rollout.Remaining.Count); maxParallel: $MaxP
 $resolvedApprovedReportPath = (Resolve-Path $ApprovedReportPath).Path
 $approvedReviewPath = Split-Path -Parent $resolvedApprovedReportPath
 $approvedReportsDirectory = Join-Path $approvedReviewPath 'all-database-reports'
+$approvedScriptsDirectory = Join-Path $approvedReviewPath 'all-database-scripts'
+$approvedPolicyReportsDirectory = Join-Path $approvedReviewPath 'all-database-policy-reports'
 $metadataPath = Join-Path $approvedReviewPath 'target-databases.json'
 $usePerDatabaseApprovedReports = $false
 if (Test-Path $metadataPath -PathType Leaf) {
@@ -102,13 +104,34 @@ if (Test-Path $metadataPath -PathType Leaf) {
     }
     $usePerDatabaseApprovedReports = [bool]$metadata.allDatabasePlansValidated
     if ($usePerDatabaseApprovedReports) {
+        if (
+            $null -eq $metadata.PSObject.Properties['allDatabaseScriptsGated'] -or
+            $metadata.allDatabaseScriptsGated -isnot [bool] -or
+            -not [bool]$metadata.allDatabaseScriptsGated -or
+            $null -eq $metadata.PSObject.Properties['gatedDatabases']
+        ) {
+            throw 'Approved target metadata does not confirm that every database deployment script passed the policy gate.'
+        }
+        $gatedDatabases = @($metadata.gatedDatabases | ForEach-Object { [string]$_ })
+        if (
+            $gatedDatabases.Count -ne $targets.Count -or
+            (Compare-Object -ReferenceObject $targets -DifferenceObject $gatedDatabases -SyncWindow 0)
+        ) {
+            throw 'Approved target metadata gated database list does not match the requested rollout.'
+        }
         if (-not (Test-Path $approvedReportsDirectory -PathType Container)) {
             throw 'Approved target metadata requires per-database reports, but the report directory is missing.'
         }
         foreach ($database in $targets) {
             $databaseReportPath = Join-Path $approvedReportsDirectory "$database.deploy-report.xml"
-            if (-not (Test-Path $databaseReportPath -PathType Leaf)) {
-                throw "Approved per-database report is missing for '$database'."
+            $databaseScriptPath = Join-Path $approvedScriptsDirectory "$database.deploy.sql"
+            $databasePolicyReportPath = Join-Path $approvedPolicyReportsDirectory "$database.deployment-script-policy.md"
+            if (
+                -not (Test-Path $databaseReportPath -PathType Leaf) -or
+                -not (Test-Path $databaseScriptPath -PathType Leaf) -or
+                -not (Test-Path $databasePolicyReportPath -PathType Leaf)
+            ) {
+                throw "Approved gated plan artifacts are incomplete for '$database'."
             }
         }
     }

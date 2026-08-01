@@ -99,6 +99,62 @@ try {
     Assert-Equal $diffReview.blockingFindings[1].line 203 'The second diff hunk must map local lines to new-file lines.'
     Assert-Equal $diffReview.blockingFindings[2].line 305 'The third diff hunk must map local lines to new-file lines.'
 
+    $koreanFixture = Get-Content `
+        -Path (Join-Path $fixtures 'ai-review-korean-diff.json') `
+        -Raw |
+        ConvertFrom-Json
+    $koreanPath = $koreanFixture.blockingFindings[0].file
+    $quotedPath = @(
+        foreach ($byte in [Text.Encoding]::UTF8.GetBytes($koreanPath)) {
+            if ($byte -ge 128) {
+                '\' + [Convert]::ToString($byte, 8).PadLeft(3, '0')
+            }
+            else {
+                [char]$byte
+            }
+        }
+    ) -join ''
+    $koreanDiffPath = Join-Path $temporaryPath 'korean-path.diff'
+    Set-Content -Path $koreanDiffPath -Encoding utf8 -Value @(
+        "diff --git `"a/$quotedPath`" `"b/$quotedPath`""
+        "--- `"a/$quotedPath`""
+        "+++ `"b/$quotedPath`""
+        '@@ -0,0 +10,3 @@'
+        '+first line'
+        '+second line'
+        '+third line'
+    )
+    $koreanOutputPath = Join-Path $temporaryPath 'korean-path.json'
+    & $reviewScript `
+        -ReviewInputPath $koreanDiffPath `
+        -ValidateOnlyResponsePath (Join-Path $fixtures 'ai-review-korean-diff.json') `
+        -OutputPath $koreanOutputPath
+    $koreanReview = Get-Content -Path $koreanOutputPath -Raw | ConvertFrom-Json
+    Assert-Equal $koreanReview.blockingFindings[0].file $koreanPath 'A quoted Korean diff path must not be assigned to the previous file.'
+    Assert-Equal $koreanReview.blockingFindings[0].line 11 'A quoted Korean diff path must retain its new-file line mapping.'
+    $spaceDiffPath = Join-Path $temporaryPath 'space-path.diff'
+    Set-Content -Path $spaceDiffPath -Encoding utf8 -Value @(
+        'diff --git a/database/App.Database/Sample Data.sql b/database/App.Database/Sample Data.sql'
+        '--- a/database/App.Database/Sample Data.sql'
+        '+++ b/database/App.Database/Sample Data.sql'
+        '@@ -0,0 +20,2 @@'
+        '+SELECT 1;'
+        '+DROP TABLE [app].[Danger];'
+    )
+    $spaceOutputPath = Join-Path $temporaryPath 'space-path.json'
+    & $reviewScript `
+        -ReviewInputPath $spaceDiffPath `
+        -ValidateOnlyResponsePath (Join-Path $fixtures 'ai-review-space-path.json') `
+        -OutputPath $spaceOutputPath
+    $spaceReview = Get-Content -Path $spaceOutputPath -Raw | ConvertFrom-Json
+    Assert-Equal $spaceReview.blockingFindings[0].file 'database/App.Database/Sample Data.sql' 'An unquoted Git path containing spaces must be reviewed.'
+    Assert-Equal $spaceReview.blockingFindings[0].line 20 'A path containing spaces must retain its new-file line mapping.'
+    $reviewScriptText = Get-Content -Path $reviewScript -Raw
+    Assert-Equal `
+        ([bool]($reviewScriptText -match 'git\s+-c\s+core\.quotePath=false\s+diff')) `
+        $true `
+        'Generated Git diffs must disable path quoting explicitly.'
+
     Assert-Throws {
         & $reviewScript `
             -ReviewInputPath $chunkedInputPath `

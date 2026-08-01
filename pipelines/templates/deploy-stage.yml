@@ -86,6 +86,7 @@ stages:
             displayName: Generate representative deployment plan
             inputs:
               azureSubscription: ${{ parameters.azureServiceConnection }}
+              keepAzSessionActive: true
               scriptType: pscore
               scriptLocation: inlineScript
               inlineScript: |
@@ -94,14 +95,6 @@ stages:
                 if ($IsWindows) {
                   $sqlPackage += ".exe"
                 }
-                $token = (az account get-access-token `
-                  --resource "https://database.windows.net/" `
-                  --query accessToken `
-                  --output tsv).Trim()
-                if (-not $token) {
-                  throw "Unable to acquire an Azure SQL access token."
-                }
-
                 $reviewPath = Join-Path "$(Pipeline.Workspace)" "deployment-review/${{ parameters.environmentName }}"
                 $summaryPath = Join-Path "$(Agent.TempDirectory)" "plan-summary-${{ parameters.environmentName }}.md"
                 try {
@@ -113,7 +106,7 @@ stages:
                     -DacpacPath "$(Pipeline.Workspace)/database/App.Database.dacpac" `
                     -PublishProfilePath "${{ parameters.publishProfile }}" `
                     -SqlPackagePath $sqlPackage `
-                    -AccessToken $token `
+                    -AccessTokenProviderPath "./eng/Get-AzureSqlAccessToken.ps1" `
                     -ReviewPath $reviewPath `
                     -CommandTimeout ${{ parameters.sqlCommandTimeout }} `
                     -ValidateAllDatabasePlans:([bool]::Parse($env:validateAllDatabasePlans)) `
@@ -141,6 +134,8 @@ stages:
               scriptLocation: inlineScript
               inlineScript: |
                 $reviewPath = Join-Path "$(Pipeline.Workspace)" "deployment-review/${{ parameters.environmentName }}"
+                Remove-Item -Path "$reviewPath/ai-review.json" -Force -ErrorAction SilentlyContinue
+                Remove-Item -Path "$reviewPath/ai-review.md" -Force -ErrorAction SilentlyContinue
                 ./eng/Invoke-AiDatabaseReview.ps1 `
                   -DeploymentScriptPath "$reviewPath/deploy.sql" `
                   -OutputPath "$reviewPath/ai-review.json"
@@ -235,6 +230,7 @@ stages:
                   displayName: Deploy canary, test, then fan out
                   inputs:
                     azureSubscription: ${{ parameters.azureServiceConnection }}
+                    keepAzSessionActive: true
                     scriptType: pscore
                     scriptLocation: inlineScript
                     inlineScript: |

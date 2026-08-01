@@ -197,6 +197,18 @@ try {
             $pipelineText -match 'VALIDATED_SUPPRESS_TSQL_WARNINGS:\s*\$\{\{\s*parameters\.validatedSuppressTSqlWarnings\s*\}\}'
         ) `
         -Message 'Queue-supplied warning values must cross the pipeline boundary through an environment variable.'
+    $rolloutTask = [regex]::Match(
+        $templateText,
+        '(?s)- task: AzureCLI@2\s+displayName: Deploy canary, test, then fan out(?<task>.*?)(?=\r?\n\s+- publish:)'
+    ).Groups['task'].Value
+    Assert-True `
+        -Condition ($rolloutTask -match '(?m)^\s+keepAzSessionActive:\s*true\s*$') `
+        -Message 'The long-running WIF rollout task must keep its Azure CLI session active.'
+    Assert-True `
+        -Condition (
+            $templateText -match '(?s)displayName: Run advisory AI review of deployment SQL.*?Remove-Item.*?ai-review\.json.*?ai-review\.md.*?Invoke-AiDatabaseReview'
+        ) `
+        -Message 'The AI review task must remove known stale outputs before the current review.'
 
     $injectionMarker = Join-Path $temporaryPath 'pipeline-parameter-injection.txt'
     $env:PHASE2_WARNING_PAYLOAD = "46010`"; Set-Content -Path '$injectionMarker' -Value injected; #"
@@ -221,21 +233,44 @@ param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
 
 $action = ($Arguments | Where-Object { $_ -like '/Action:*' }) -replace '^/Action:', ''
 $outputPath = ($Arguments | Where-Object { $_ -like '/OutputPath:*' }) -replace '^/OutputPath:', ''
-Add-Content -Path $env:PHASE2_PLAN_LOG -Value $action -Encoding utf8
+$connection = ($Arguments | Where-Object { $_ -like '/TargetConnectionString:*' }) -replace '^/TargetConnectionString:', ''
+$database = [regex]::Match($connection, 'Initial Catalog=(?<database>[^;]+)').Groups['database'].Value
+Add-Content -Path $env:PHASE2_PLAN_LOG -Value "ACTION:${action}:$database" -Encoding utf8
 if ($action -eq 'DeployReport') {
-    Copy-Item -Path $env:PHASE2_CHANGED_REPORT -Destination $outputPath -Force
+    $reportFixture = if ($database -eq $env:PHASE2_DRIFT_DATABASE) {
+        $env:PHASE2_DRIFT_REPORT
+    }
+    else {
+        $env:PHASE2_CHANGED_REPORT
+    }
+    Copy-Item -Path $reportFixture -Destination $outputPath -Force
 }
 elseif ($action -eq 'Script') {
-    Set-Content -Path $outputPath -Value 'SELECT 1;' -Encoding utf8
+    $script = if ($database -eq $env:PHASE2_DESTRUCTIVE_DATABASE) {
+        'DROP TABLE [app].[Danger];'
+    }
+    else {
+        'SELECT 1;'
+    }
+    Set-Content -Path $outputPath -Value $script -Encoding utf8
 }
 $global:LASTEXITCODE = 0
 '@ | Set-Content -Path $fakeSqlPackage -Encoding utf8
+    $fakePlanTokenProvider = Join-Path $temporaryPath 'fake-plan-token-provider.ps1'
+    @'
+param([Parameter(Mandatory)][string]$DatabaseName)
+
+Add-Content -Path $env:PHASE2_PLAN_LOG -Value "TOKEN:$DatabaseName" -Encoding utf8
+"plan-token-$DatabaseName"
+'@ | Set-Content -Path $fakePlanTokenProvider -Encoding utf8
 
     $reviewPath = Join-Path $temporaryPath 'deployment-review'
     $allReportsPath = Join-Path $reviewPath 'all-database-reports'
     New-Item -ItemType Directory -Force -Path $allReportsPath | Out-Null
     Set-Content -Path (Join-Path $reviewPath 'deploy.sql') -Value 'stale script' -Encoding utf8
     Set-Content -Path (Join-Path $allReportsPath 'Shard02.deploy-report.xml') -Value '<stale />' -Encoding utf8
+    Set-Content -Path (Join-Path $reviewPath 'ai-review.json') -Value '{"risk":"high"}' -Encoding utf8
+    Set-Content -Path (Join-Path $reviewPath 'ai-review.md') -Value '# stale AI review' -Encoding utf8
     $env:PHASE2_PLAN_LOG = $planLog
     $env:PHASE2_CHANGED_REPORT = Join-Path $fixtures 'deploy-report-changed.xml'
     & (Join-Path $PSScriptRoot 'New-DatabaseDeploymentPlan.ps1') `
@@ -244,14 +279,96 @@ $global:LASTEXITCODE = 0
         -DacpacPath $fakeDacpac `
         -PublishProfilePath $fakeProfile `
         -SqlPackagePath $fakeSqlPackage `
-        -AccessToken 'fixture-token' `
+        -AccessTokenProviderPath $fakePlanTokenProvider `
         -ReviewPath $reviewPath
     $planActions = @(Get-Content -Path $planLog)
-    Assert-Equal $planActions[0] 'DeployReport' 'The approved DeployReport must be captured before the gated deployment script.'
-    Assert-Equal $planActions[1] 'Script' 'The deployment script must be generated and gated after the approved DeployReport.'
+    Assert-Equal $planActions[0] 'TOKEN:CanaryDb' 'Planning must refresh the token immediately before DeployReport.'
+    Assert-Equal $planActions[1] 'ACTION:DeployReport:CanaryDb' 'The approved DeployReport must be captured first.'
+    Assert-Equal $planActions[2] 'TOKEN:CanaryDb' 'Planning must refresh the token immediately before Script.'
+    Assert-Equal $planActions[3] 'ACTION:Script:CanaryDb' 'The deployment script must be generated and gated after the approved DeployReport.'
     Assert-True `
         -Condition (-not (Test-Path $allReportsPath)) `
         -Message 'A run with all-database validation disabled must remove stale per-database reports.'
+    Assert-True `
+        -Condition (
+            -not (Test-Path (Join-Path $reviewPath 'ai-review.json')) -and
+            -not (Test-Path (Join-Path $reviewPath 'ai-review.md'))
+        ) `
+        -Message 'A new Plan must remove stale AI review outputs even when AI review is disabled.'
+
+    Remove-Item -Path $planLog -Force
+    $env:PHASE2_DESTRUCTIVE_DATABASE = 'Shard02'
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'New-DatabaseDeploymentPlan.ps1') `
+            -ServerName 'sqlmi.example.test' `
+            -DatabaseNames 'CanaryDb,Shard02' `
+            -DacpacPath $fakeDacpac `
+            -PublishProfilePath $fakeProfile `
+            -SqlPackagePath $fakeSqlPackage `
+            -AccessTokenProviderPath $fakePlanTokenProvider `
+            -ReviewPath $reviewPath `
+            -ValidateAllDatabasePlans `
+            -DatabasePlanDriftPolicy Warn
+    } 'A destructive script for a non-representative database must fail the Plan even under Warn drift policy.'
+    $fullPlanActions = @(Get-Content -Path $planLog)
+    Assert-Equal ($fullPlanActions -join '|') `
+        'TOKEN:CanaryDb|ACTION:DeployReport:CanaryDb|TOKEN:CanaryDb|ACTION:Script:CanaryDb|TOKEN:Shard02|ACTION:DeployReport:Shard02|TOKEN:Shard02|ACTION:Script:Shard02' `
+        'Full validation must refresh before each report/script and gate every database in order.'
+    Assert-True `
+        -Condition (Test-Path (Join-Path $reviewPath 'all-database-scripts/Shard02.deploy.sql')) `
+        -Message 'Full validation must retain each database deployment script in the review artifact.'
+    Assert-True `
+        -Condition (Test-Path (Join-Path $reviewPath 'all-database-policy-reports/Shard02.deployment-script-policy.md')) `
+        -Message 'Full validation must retain each database policy report in the review artifact.'
+    Assert-True `
+        -Condition (-not (Test-Path (Join-Path $reviewPath 'target-databases.json'))) `
+        -Message 'A failed shard gate must not leave a manifest that claims validation succeeded.'
+    Remove-Item Env:PHASE2_DESTRUCTIVE_DATABASE
+    Remove-Item -Path $planLog -Force
+    & (Join-Path $PSScriptRoot 'New-DatabaseDeploymentPlan.ps1') `
+        -ServerName 'sqlmi.example.test' `
+        -DatabaseNames 'CanaryDb,Shard02' `
+        -DacpacPath $fakeDacpac `
+        -PublishProfilePath $fakeProfile `
+        -SqlPackagePath $fakeSqlPackage `
+        -AccessTokenProviderPath $fakePlanTokenProvider `
+        -ReviewPath $reviewPath `
+        -ValidateAllDatabasePlans `
+        -DatabasePlanDriftPolicy Warn
+    $successfulFullPlanActions = @(Get-Content -Path $planLog)
+    Assert-Equal ($successfulFullPlanActions -join '|') `
+        'TOKEN:CanaryDb|ACTION:DeployReport:CanaryDb|TOKEN:CanaryDb|ACTION:Script:CanaryDb|TOKEN:Shard02|ACTION:DeployReport:Shard02|TOKEN:Shard02|ACTION:Script:Shard02' `
+        'A successful full Plan must refresh before all report and script actions.'
+    $successfulManifest = Get-Content `
+        -Path (Join-Path $reviewPath 'target-databases.json') `
+        -Raw |
+        ConvertFrom-Json
+    Assert-True `
+        -Condition (
+            $successfulManifest.allDatabasePlansValidated -and
+            $successfulManifest.allDatabaseScriptsGated -and
+            @($successfulManifest.gatedDatabases).Count -eq 2
+        ) `
+        -Message 'A successful full Plan manifest must attest that every target script was gated.'
+    $env:PHASE2_DRIFT_DATABASE = 'Shard02'
+    $env:PHASE2_DRIFT_REPORT = Join-Path $fixtures 'deploy-report-different-operation.xml'
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'New-DatabaseDeploymentPlan.ps1') `
+            -ServerName 'sqlmi.example.test' `
+            -DatabaseNames 'CanaryDb,Shard02' `
+            -DacpacPath $fakeDacpac `
+            -PublishProfilePath $fakeProfile `
+            -SqlPackagePath $fakeSqlPackage `
+            -AccessTokenProviderPath $fakePlanTokenProvider `
+            -ReviewPath $reviewPath `
+            -ValidateAllDatabasePlans `
+            -DatabasePlanDriftPolicy Fail
+    } 'Fail drift policy must reject a non-representative deployment plan.'
+    Assert-True `
+        -Condition (-not (Test-Path (Join-Path $reviewPath 'target-databases.json'))) `
+        -Message 'A failed drift gate must not leave a manifest that claims validation succeeded.'
+    Remove-Item Env:PHASE2_DRIFT_DATABASE
+    Remove-Item Env:PHASE2_DRIFT_REPORT
 
     $tokenLogDirectory = Join-Path $temporaryPath 'token-refresh'
     New-Item -ItemType Directory -Force -Path $tokenLogDirectory | Out-Null
@@ -280,22 +397,88 @@ if ([string]::IsNullOrWhiteSpace($AccessToken)) {
 
     $approvedRoot = Join-Path $temporaryPath 'approved-review'
     $staleApprovedReports = Join-Path $approvedRoot 'all-database-reports'
+    $approvedScripts = Join-Path $approvedRoot 'all-database-scripts'
+    $approvedPolicyReports = Join-Path $approvedRoot 'all-database-policy-reports'
     New-Item -ItemType Directory -Force -Path $staleApprovedReports | Out-Null
+    New-Item -ItemType Directory -Force -Path $approvedScripts | Out-Null
+    New-Item -ItemType Directory -Force -Path $approvedPolicyReports | Out-Null
     Copy-Item `
         -Path (Join-Path $fixtures 'deploy-report-changed.xml') `
         -Destination (Join-Path $approvedRoot 'deploy-report.xml')
+    foreach ($database in @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')) {
+        Copy-Item `
+            -Path (Join-Path $fixtures 'deploy-report-changed.xml') `
+            -Destination (Join-Path $staleApprovedReports "$database.deploy-report.xml")
+        Set-Content -Path (Join-Path $approvedScripts "$database.deploy.sql") -Value 'SELECT 1;' -Encoding utf8
+        Set-Content -Path (Join-Path $approvedPolicyReports "$database.deployment-script-policy.md") -Value '# passed' -Encoding utf8
+    }
+    [ordered]@{
+        manifestVersion = 2
+        environment = 'fixture'
+        representativeDatabase = 'CanaryDb'
+        targetDatabases = @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')
+        allDatabasePlansValidated = $true
+        allDatabaseScriptsGated = $false
+        gatedDatabases = @('CanaryDb')
+        driftPolicy = 'Warn'
+    } | ConvertTo-Json | Set-Content -Path (Join-Path $approvedRoot 'target-databases.json') -Encoding utf8
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') `
+            -ServerName 'sqlmi.example.test' `
+            -DatabaseNames 'CanaryDb,Shard02,Shard03,Shard04' `
+            -DacpacPath $fakeDacpac `
+            -PublishProfilePath $fakeProfile `
+            -SqlPackagePath $fakeSqlPackage `
+            -ApprovedReportPath (Join-Path $approvedRoot 'deploy-report.xml') `
+            -AccessTokenProviderPath $fakeTokenProvider `
+            -SmokeTestScriptPath $fakeSmokeTest `
+            -TestPath $fixtures `
+            -ReportDirectory (Join-Path $temporaryPath 'ungated-reports') `
+            -MaxParallel 3
+    } 'Deployment must reject a per-database report manifest unless every target script was gated.'
+    [ordered]@{
+        manifestVersion = 2
+        environment = 'fixture'
+        representativeDatabase = 'CanaryDb'
+        targetDatabases = @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')
+        allDatabasePlansValidated = $true
+        allDatabaseScriptsGated = $true
+        gatedDatabases = @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')
+        driftPolicy = 'Warn'
+    } | ConvertTo-Json | Set-Content -Path (Join-Path $approvedRoot 'target-databases.json') -Encoding utf8
+    $env:PHASE2_TOKEN_LOG_DIRECTORY = $tokenLogDirectory
+    & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') `
+        -ServerName 'sqlmi.example.test' `
+        -DatabaseNames 'CanaryDb,Shard02,Shard03,Shard04' `
+        -DacpacPath $fakeDacpac `
+        -PublishProfilePath $fakeProfile `
+        -SqlPackagePath $fakeSqlPackage `
+        -ApprovedReportPath (Join-Path $approvedRoot 'deploy-report.xml') `
+        -AccessTokenProviderPath $fakeTokenProvider `
+        -SmokeTestScriptPath $fakeSmokeTest `
+        -TestPath $fixtures `
+        -ReportDirectory (Join-Path $temporaryPath 'gated-current-reports') `
+        -MaxParallel 3
+    foreach ($database in @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')) {
+        $tokenCalls = @(Get-Content -Path (Join-Path $tokenLogDirectory "$database.log"))
+        Assert-Equal $tokenCalls.Count 3 "Gated deployment '$database' must refresh before report, publish, and smoke test."
+    }
+    Remove-Item -Path (Join-Path $tokenLogDirectory '*.log') -Force
     Copy-Item `
         -Path (Join-Path $fixtures 'deploy-report-empty.xml') `
-        -Destination (Join-Path $staleApprovedReports 'Shard02.deploy-report.xml')
+        -Destination (Join-Path $staleApprovedReports 'Shard02.deploy-report.xml') `
+        -Force
     [ordered]@{
+        manifestVersion = 2
         environment = 'fixture'
         representativeDatabase = 'CanaryDb'
         targetDatabases = @('CanaryDb', 'Shard02', 'Shard03', 'Shard04')
         allDatabasePlansValidated = $false
+        allDatabaseScriptsGated = $false
+        gatedDatabases = @('CanaryDb')
         driftPolicy = 'Warn'
     } | ConvertTo-Json | Set-Content -Path (Join-Path $approvedRoot 'target-databases.json') -Encoding utf8
 
-    $env:PHASE2_TOKEN_LOG_DIRECTORY = $tokenLogDirectory
     & (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') `
         -ServerName 'sqlmi.example.test' `
         -DatabaseNames 'CanaryDb,Shard02,Shard03,Shard04' `
@@ -319,6 +502,9 @@ finally {
     Remove-Item Env:PHASE2_WARNING_PAYLOAD -ErrorAction SilentlyContinue
     Remove-Item Env:PHASE2_PLAN_LOG -ErrorAction SilentlyContinue
     Remove-Item Env:PHASE2_CHANGED_REPORT -ErrorAction SilentlyContinue
+    Remove-Item Env:PHASE2_DESTRUCTIVE_DATABASE -ErrorAction SilentlyContinue
+    Remove-Item Env:PHASE2_DRIFT_DATABASE -ErrorAction SilentlyContinue
+    Remove-Item Env:PHASE2_DRIFT_REPORT -ErrorAction SilentlyContinue
     Remove-Item Env:PHASE2_TOKEN_LOG_DIRECTORY -ErrorAction SilentlyContinue
     if (Test-Path $temporaryPath) {
         Remove-Item -Path $temporaryPath -Recurse -Force
