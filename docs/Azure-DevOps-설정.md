@@ -108,7 +108,44 @@ ScriptDatabaseOptions=False
 
 ## 7. AI 품질 게이트
 
-`ai/database-change-review.md`는 PR diff와 `deploy.sql`을 AI 리뷰에 전달할 때 사용하는 출력 계약입니다.
+`eng/Invoke-AiDatabaseReview.ps1`은 `ai/database-change-review.md`의 가드레일과
+JSON Schema를 사용해 Azure OpenAI Responses API를 호출합니다.
+
+- PR 검증: `database/App.Database`와 `tests/integration`의 변경 diff 검토
+- 배포 계획: 환경별로 생성된 `deploy.sql` 검토
+- 결과: JSON artifact와 Azure Pipelines 실행 요약용 Markdown
+
+2026년 8월 기준 기본 권장 모델은 `gpt-5.6-sol`입니다. 비용을 낮춘 PR 대량 검토에는
+`gpt-5.4-mini`를 사용할 수 있습니다. 모델 제공 지역과 할당량은 Foundry에서 확인하고,
+모델 배포 이름은 예를 들어 `sql-review`로 지정합니다.
+
+- [Azure OpenAI Responses API와 지원 모델](https://learn.microsoft.com/azure/foundry/openai/how-to/responses)
+- [Foundry에서 Azure가 제공하는 모델](https://learn.microsoft.com/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure)
+
+Foundry에서 Azure OpenAI 모델을 배포한 뒤 다음 값을 파이프라인 실행 parameter로 전달합니다.
+
+| Parameter | 예시 |
+|---|---|
+| `enableAiReview` | `true` |
+| `aiEndpoint` | `https://my-resource.openai.azure.com/openai/v1/` |
+| `aiDeploymentName` | `sql-review` |
+| `publishAiPrComment` | `true`(선택) |
+| `githubServiceConnection` | GitHub OAuth/PAT 서비스 연결 이름(선택) |
+
+`sc-sqlmi-wif` 서비스 연결의 Entra 주체에 Azure OpenAI 리소스 범위의
+**Cognitive Services OpenAI User** 역할을 부여합니다. 파이프라인은
+`https://ai.azure.com/.default` scope의 토큰을 사용하므로 API key를 저장할 필요가 없습니다.
+PR 코멘트가 필요하면 Azure DevOps의 GitHub 서비스 연결을 지정하고
+`publishAiPrComment=true`로 실행합니다. 이 옵션을 사용하지 않아도 JSON artifact와
+파이프라인 실행 요약은 게시됩니다.
+
+로컬에서는 `az login` 후 다음처럼 현재 작업 트리의 SQL 변경을 검토할 수 있습니다.
+
+```powershell
+$env:AZURE_OPENAI_ENDPOINT = 'https://my-resource.openai.azure.com/openai/v1/'
+$env:AZURE_OPENAI_DEPLOYMENT = 'sql-review'
+pwsh ./eng/Invoke-AiDatabaseReview.ps1
+```
 
 권장 순서:
 
@@ -119,7 +156,10 @@ ScriptDatabaseOptions=False
 5. 사람 승인
 6. SQL MI publish
 
-AI 결과는 초기에는 advisory comment로만 게시합니다. 충분한 정밀도와 오탐 기준을 확보한 후 `blockingFindings`가 있을 때만 배포를 차단합니다. SQL 본문에 운영 데이터나 connection string을 포함하지 않으며, 승인된 Azure OpenAI 또는 조직이 허용한 Copilot 서비스만 사용합니다.
+AI 결과는 초기에는 advisory로만 게시하며 LLM 호출 실패도 `SucceededWithIssues`로 표시합니다.
+충분한 정밀도와 오탐 기준을 확보한 후 `-FailOnBlockingFindings`를 사용해
+`blockingFindings`가 있을 때만 배포를 차단합니다. SQL 본문에 운영 데이터나 connection
+string을 포함하지 않으며, 승인된 Azure OpenAI 리소스만 사용합니다.
 
 ## 8. 운영 점검
 

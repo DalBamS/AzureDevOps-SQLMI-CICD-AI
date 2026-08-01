@@ -8,6 +8,7 @@ trigger:
       - eng/**
       - tests/**
       - pipelines/**
+      - ai/**
       - azure-pipelines.yml
 
 pr:
@@ -36,6 +37,26 @@ parameters:
     displayName: Azure workload identity service connection
     type: string
     default: sc-sqlmi-wif
+  - name: enableAiReview
+    displayName: Run advisory AI SQL review
+    type: boolean
+    default: false
+  - name: aiEndpoint
+    displayName: Azure OpenAI endpoint
+    type: string
+    default: ''
+  - name: aiDeploymentName
+    displayName: Azure OpenAI model deployment
+    type: string
+    default: sql-review
+  - name: publishAiPrComment
+    displayName: Publish AI review as a GitHub PR comment
+    type: boolean
+    default: false
+  - name: githubServiceConnection
+    displayName: GitHub service connection for PR comments
+    type: string
+    default: ''
 
 variables:
   artifactName: database
@@ -50,6 +71,9 @@ stages:
         pool:
           vmImage: ubuntu-latest
         steps:
+          - checkout: self
+            fetchDepth: 0
+
           - task: UseDotNet@2
             displayName: Use .NET 10 SDK
             inputs:
@@ -62,6 +86,43 @@ stages:
           - pwsh: ./eng/Test-SqlPolicy.ps1
             displayName: Run deterministic SQL policy
 
+          - task: AzureCLI@2
+            displayName: Run advisory AI review of PR SQL changes
+            condition: |
+              and(
+                succeeded(),
+                eq('${{ parameters.enableAiReview }}', 'True'),
+                eq(variables['Build.Reason'], 'PullRequest')
+              )
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                ./eng/Invoke-AiDatabaseReview.ps1 `
+                  -BaseRef "HEAD^1" `
+                  -OutputPath "artifacts/ai-review/pr-review.json"
+            env:
+              AZURE_OPENAI_ENDPOINT: ${{ parameters.aiEndpoint }}
+              AZURE_OPENAI_DEPLOYMENT: ${{ parameters.aiDeploymentName }}
+
+          - ${{ if eq(parameters.publishAiPrComment, true) }}:
+              - task: GitHubComment@0
+                displayName: Publish AI review to GitHub PR
+                condition: |
+                  and(
+                    succeededOrFailed(),
+                    eq('${{ parameters.enableAiReview }}', 'True'),
+                    eq(variables['Build.Reason'], 'PullRequest'),
+                    ne(variables['aiReviewComment'], '')
+                  )
+                continueOnError: true
+                inputs:
+                  gitHubConnection: ${{ parameters.githubServiceConnection }}
+                  repositoryName: $(Build.Repository.Name)
+                  comment: $(aiReviewComment)
+
           - publish: artifacts/dacpac
             artifact: $(artifactName)
             displayName: Publish immutable DACPAC
@@ -69,6 +130,17 @@ stages:
           - publish: artifacts/sql-policy-report.md
             artifact: sql-policy-report
             displayName: Publish policy report
+
+          - publish: artifacts/ai-review
+            artifact: ai-pr-review
+            displayName: Publish AI PR review
+            condition: |
+              and(
+                succeededOrFailed(),
+                eq('${{ parameters.enableAiReview }}', 'True'),
+                eq(variables['Build.Reason'], 'PullRequest')
+              )
+            continueOnError: true
 
       - job: IntegrationTest
         displayName: Deploy and smoke test SQL Server 2022
@@ -99,6 +171,9 @@ stages:
       variableGroup: sqlmi-dev
       agentPool: ${{ parameters.privateAgentPool }}
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      enableAiReview: ${{ parameters.enableAiReview }}
+      aiEndpoint: ${{ parameters.aiEndpoint }}
+      aiDeploymentName: ${{ parameters.aiDeploymentName }}
       enabled: ${{ parameters.deployDev }}
       dependsOn: Build
 
@@ -110,6 +185,9 @@ stages:
       variableGroup: sqlmi-test
       agentPool: ${{ parameters.privateAgentPool }}
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      enableAiReview: ${{ parameters.enableAiReview }}
+      aiEndpoint: ${{ parameters.aiEndpoint }}
+      aiDeploymentName: ${{ parameters.aiDeploymentName }}
       enabled: ${{ and(parameters.deployDev, parameters.deployTest) }}
       dependsOn: DeployDev
 
@@ -121,5 +199,8 @@ stages:
       variableGroup: sqlmi-prod
       agentPool: ${{ parameters.privateAgentPool }}
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      enableAiReview: ${{ parameters.enableAiReview }}
+      aiEndpoint: ${{ parameters.aiEndpoint }}
+      aiDeploymentName: ${{ parameters.aiDeploymentName }}
       enabled: ${{ and(parameters.deployDev, parameters.deployTest, parameters.deployProd) }}
       dependsOn: DeployTest

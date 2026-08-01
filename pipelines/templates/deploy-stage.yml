@@ -11,6 +11,12 @@ parameters:
     type: string
   - name: azureServiceConnection
     type: string
+  - name: enableAiReview
+    type: boolean
+  - name: aiEndpoint
+    type: string
+  - name: aiDeploymentName
+    type: string
   - name: enabled
     type: boolean
   - name: dependsOn
@@ -33,6 +39,8 @@ stages:
         pool:
           name: ${{ parameters.agentPool }}
         steps:
+          - checkout: self
+
           - download: current
             artifact: database
 
@@ -105,6 +113,23 @@ stages:
                 if ($LASTEXITCODE -ne 0) {
                   throw "Deployment report generation failed."
                 }
+
+          - task: AzureCLI@2
+            displayName: Run advisory AI review of deployment SQL
+            condition: and(succeeded(), eq('${{ parameters.enableAiReview }}', 'True'))
+            continueOnError: true
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $reviewPath = Join-Path "$(Pipeline.Workspace)" "deployment-review/${{ parameters.environmentName }}"
+                ./eng/Invoke-AiDatabaseReview.ps1 `
+                  -DeploymentScriptPath "$reviewPath/deploy.sql" `
+                  -OutputPath "$reviewPath/ai-review.json"
+            env:
+              AZURE_OPENAI_ENDPOINT: ${{ parameters.aiEndpoint }}
+              AZURE_OPENAI_DEPLOYMENT: ${{ parameters.aiDeploymentName }}
 
           - publish: $(Pipeline.Workspace)/deployment-review/${{ parameters.environmentName }}
             artifact: deployment-review-${{ parameters.environmentName }}

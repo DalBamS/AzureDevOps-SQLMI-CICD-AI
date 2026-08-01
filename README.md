@@ -12,6 +12,8 @@ pwsh ./eng/Test-Database.ps1  # Docker Desktop 필요
 ```
 
 빌드 결과는 `artifacts/dacpac/App.Database.dacpac`에 생성됩니다.
+AI 리뷰를 활성화하면 PR의 SQL diff와 환경별 `deploy.sql`을 Azure OpenAI가
+검토하고 JSON/Markdown 보고서를 파이프라인 artifact와 실행 요약에 게시합니다.
 
 ## 문서
 
@@ -33,3 +35,4 @@ pwsh ./eng/Test-Database.ps1  # Docker Desktop 필요
 - `eng`: 로컬 빌드, 정책 검사, SQL Server 컨테이너 테스트, BACPAC 도구
 - `azure-pipelines.yml`: build-once/deploy-many Azure Pipelines
 - `ai/database-change-review.md`: AI 리뷰 가드레일과 JSON 출력 계약
+- `eng/Invoke-AiDatabaseReview.ps1`: Azure OpenAI Responses API 기반 SQL 변경 리뷰
