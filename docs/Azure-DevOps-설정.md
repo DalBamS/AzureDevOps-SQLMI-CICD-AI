@@ -192,6 +192,11 @@ role membership을 배포 비교에서 제외합니다. 이 보안 오브젝트�
 네 필드가 모두 필요하고 만료된 항목은 자동 무효입니다. AI 검토는 이 게이트 이후의
 advisory 단계입니다.
 
+GO separator는 공용 lexer가 code context에서 물리 행 전체가 `GO` 또는 `GO <count>`인
+경우에만 인식합니다. 뒤에는 `--` line comment만 둘 수 있습니다. multiline string,
+nested block comment, bracket identifier, double-quoted identifier 안의 단독 `GO`와
+line comment 안의 `GO`는 separator가 아닙니다.
+
 `EXEC`/`EXECUTE`와 `sp_executesql`의 첫 SQL 표현식이 문자열 literal과 `+` 연결만으로
 구성되면 상수로 계산합니다. 문자열·주석·quoted identifier 밖의 token에 `CREATE`, `ALTER`,
 `DROP`, `TRUNCATE`가 하나라도 있으면 오브젝트 종류나 statement 순서와 무관하게 동적 DDL로
@@ -199,7 +204,8 @@ advisory 단계입니다.
 허용하지만 동적 DDL은 오류입니다. 변수, 함수, `FORMAT`, `REPLACE` 등 정적으로 결과를
 증명할 수 없는 동적 표현식은 fail closed 오류로 차단합니다. `EXEC dbo.StoredProcedure
 @p=...` 형태의 정적 stored procedure 호출은 허용합니다. batch 첫 호출에서 `EXEC`를 생략한
-`sp_executesql`, `sp_rename`, `sp_delete_job`도 같은 canonical procedure 검사에 포함합니다.
+`sp_executesql`, `sp_rename`, destructive system procedure도 같은 canonical procedure
+검사에 포함합니다.
 
 `sp_executesql`과 `sp_rename`은 bare, bracket, double-quote, 생략된 multipart component를
 포함한 최대 4-part qualified identifier를 같은 canonical procedure 이름으로 해석합니다.
@@ -230,10 +236,19 @@ sanitized SQL hash를 입력받아 실행 직전 재변환 hash와 일치하는�
 사용합니다. `-- Idempotency:` 설명과 별개로 실행 가능한 `IF EXISTS` 또는 `IF NOT EXISTS`
 guard가 있어야 하고 모든 `CREATE`/`ALTER`/DML/`EXEC` mutation token이 해당
 `BEGIN...END` 또는 연결된 `ELSE` block 범위 안에 있어야 합니다. 문법 경계의 모호성을 없애기 위해
-instance guard body와 `ELSE` body는 `BEGIN...END` block만 지원합니다. 관련 없는 guard와 주석·문자열 속
-guard는 인정하지 않습니다. 직접 `DROP`/`TRUNCATE`,
-`sp_delete_job`, `sp_rename`, constant dynamic DDL과 정적으로 증명할 수 없는 dynamic
-execution은 실행 전에 차단합니다.
+instance guard body와 `ELSE` body는 `BEGIN...END` block만 지원합니다. 범위만 감싸는
+`IF EXISTS (SELECT 1)`은 인정하지 않습니다. 지원 계약은 현재 예제에 필요한 shape로
+제한합니다. `CREATE LOGIN`은 `sys.server_principals`의 같은 login 이름, Agent job은
+`msdb.dbo.sysjobs`의 같은 `@JobName`, job step은 같은 `@JobId`와 `@StepName`, local
+job server assignment는 같은 `@JobId`와 `server_id=0` guard가 필요합니다. procedure
+parameter도 같은 변수를 사용해야 합니다. 이 allowlist 밖의 mutation/guard shape는
+fail closed입니다.
+
+직접 `DROP`/`TRUNCATE`, `SELECT ... INTO`, `GRANT`, `DENY`, `REVOKE`와 그 constant dynamic
+variant를 차단합니다. canonical final procedure 이름이 `sp_delete*`, `sp_drop*`,
+`sp_remove*`, `sp_revoke*` family이거나 detach/rename family인 호출도 bare `EXEC`,
+return assignment, bracket/double-quoted/qualified/omitted-component 표기와 무관하게
+실행 전에 차단합니다. 변수·함수 기반 dynamic execution도 계속 fail closed입니다.
 
 승인자는 대기 중인 `Deploy*` stage를 승인하기 전에 완료된 `Plan*` stage의 artifact를 검토합니다. 초기 도입 기간에는 Dev 자동 배포만 허용하고 Test/Prod에서 `deploy.sql`을 DBA가 승인하도록 운영합니다. `DropObjectsNotInSource=False`로 인해 제거가 자동 반영되지 않으므로, 승인된 제거는 별도 expand/contract 절차와 명시적 스크립트로 처리합니다.
 

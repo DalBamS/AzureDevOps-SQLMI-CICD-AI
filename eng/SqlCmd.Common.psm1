@@ -261,6 +261,33 @@ function ConvertTo-SqlToken {
             $index++
             continue
         }
+        if ($Text[$index] -eq "'") {
+            $start = $index
+            $index++
+            $literalValue = [Text.StringBuilder]::new()
+            while ($index -lt $Text.Length) {
+                if ($Text[$index] -ne "'") {
+                    [void]$literalValue.Append($Text[$index])
+                    $index++
+                    continue
+                }
+                if ($index + 1 -lt $Text.Length -and $Text[$index + 1] -eq "'") {
+                    [void]$literalValue.Append("'")
+                    $index += 2
+                    continue
+                }
+                $index++
+                break
+            }
+            $tokens.Add([pscustomobject]@{
+                Kind = 'String'
+                Value = '<STRING>'
+                LiteralValue = $literalValue.ToString()
+                Index = $start
+                Length = $index - $start
+            })
+            continue
+        }
         if ($Text[$index] -in '[', '"') {
             $start = $index
             $closing = if ($Text[$index] -eq '[') { ']' } else { '"' }
@@ -583,27 +610,104 @@ function Test-ConstantDynamicDdl {
     ).Count -gt 0
 }
 
+function Get-SqlCanonicalTokenText {
+    param(
+        [Parameter(Mandatory)][object[]]$Tokens,
+        [Parameter(Mandatory)][int]$StartIndex,
+        [Parameter(Mandatory)][int]$EndIndex
+    )
+
+    $values = for ($index = $StartIndex; $index -le $EndIndex; $index++) {
+        $token = $Tokens[$index]
+        if ($token.Kind -ne 'Identifier') {
+            $token.Value
+            continue
+        }
+        $value = [string]$token.Value
+        if ($value[0] -eq '[') {
+            $value = $value.Substring(1, $value.Length - 2).Replace(']]', ']')
+        }
+        else {
+            $value = $value.Substring(1, $value.Length - 2).Replace('""', '"')
+        }
+        if ($value -notmatch '^[A-Za-z_][A-Za-z0-9_@$#]*$') {
+            '<INVALID_IDENTIFIER>'
+        }
+        else {
+            $value.ToUpperInvariant()
+        }
+    }
+    return $values -join ' '
+}
+
+function Get-SqlCanonicalTokenValue {
+    param([Parameter(Mandatory)][object]$Token)
+
+    if ($Token.Kind -ne 'Identifier') {
+        return ([string]$Token.Value).ToUpperInvariant()
+    }
+    $value = [string]$Token.Value
+    if ($value[0] -eq '[') {
+        return $value.Substring(1, $value.Length - 2).Replace(']]', ']').ToUpperInvariant()
+    }
+    return $value.Substring(1, $value.Length - 2).Replace('""', '"').ToUpperInvariant()
+}
+
+function Test-SqlDestructiveProcedureName {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $canonicalName = $Name.ToLowerInvariant()
+    return (
+        $canonicalName -match '^sp_(?:delete|drop|remove|revoke)' -or
+        $canonicalName -match '^sp_(?:detach|rename)'
+    )
+}
+
+function Test-SqlUnsupportedInstanceMutation {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+    $tokens = @(ConvertTo-SqlToken -Text (ConvertTo-CodeOnly -Text $Text))
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        if (
+            $tokens[$index].Kind -eq 'Word' -and
+            $tokens[$index].Value -in @('GRANT', 'DENY', 'REVOKE')
+        ) {
+            return $true
+        }
+        if (
+            $tokens[$index].Kind -ne 'Word' -or
+            $tokens[$index].Value -ne 'SELECT'
+        ) {
+            continue
+        }
+        for ($cursor = $index + 1; $cursor -lt $tokens.Count; $cursor++) {
+            if (
+                $tokens[$cursor].Kind -eq 'Symbol' -and
+                $tokens[$cursor].Value -eq ';'
+            ) {
+                break
+            }
+            if (
+                $tokens[$cursor].Kind -eq 'Word' -and
+                $tokens[$cursor].Value -eq 'INTO'
+            ) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
 function Get-SqlBareProcedureInvocation {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
 
     $codeOnly = ConvertTo-CodeOnly -Text $Text
     $commentFree = ConvertTo-CommentFreeSql -Text $Text
-    $batchStarts = [System.Collections.Generic.List[int]]::new()
-    $batchEnds = [System.Collections.Generic.List[int]]::new()
-    $batchStarts.Add(0)
-    foreach ($goMatch in [regex]::Matches(
-        $codeOnly,
-        '(?im)^[\t ]*GO(?:[\t ]+\d+)?[\t ]*(?:\r?\n|$)'
-    )) {
-        $batchEnds.Add($goMatch.Index)
-        $batchStarts.Add($goMatch.Index + $goMatch.Length)
-    }
-    $batchEnds.Add($Text.Length)
 
     $invocations = [System.Collections.Generic.List[object]]::new()
-    for ($batchIndex = 0; $batchIndex -lt $batchStarts.Count; $batchIndex++) {
-        $cursor = $batchStarts[$batchIndex]
-        $batchEnd = $batchEnds[$batchIndex]
+    foreach ($batch in @(Get-SqlBatch -Text $Text)) {
+        $cursor = $batch.StartIndex
+        $batchEnd = $batch.EndIndex
         while (
             $cursor -lt $batchEnd -and
             (
@@ -665,6 +769,106 @@ function Get-SqlBareProcedureInvocation {
         })
     }
     return $invocations.ToArray()
+}
+
+function Get-SqlBatch {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+    $batches = [System.Collections.Generic.List[object]]::new()
+    $batchLines = [System.Collections.Generic.List[string]]::new()
+    $state = 'Code'
+    $blockDepth = 0
+    $batchStartIndex = 0
+    $batchStartLine = 1
+    $lineStartIndex = 0
+    $lineNumber = 1
+    $batchIndex = 0
+
+    while ($lineStartIndex -le $Text.Length) {
+        $lineEndIndex = $lineStartIndex
+        while (
+            $lineEndIndex -lt $Text.Length -and
+            $Text[$lineEndIndex] -notin "`r", "`n"
+        ) {
+            $lineEndIndex++
+        }
+        $line = $Text.Substring($lineStartIndex, $lineEndIndex - $lineStartIndex)
+        $newlineLength = 0
+        if ($lineEndIndex -lt $Text.Length) {
+            $newlineLength = 1
+            if (
+                $Text[$lineEndIndex] -eq "`r" -and
+                $lineEndIndex + 1 -lt $Text.Length -and
+                $Text[$lineEndIndex + 1] -eq "`n"
+            ) {
+                $newlineLength = 2
+            }
+        }
+        $goMatch = [regex]::Match(
+            $line,
+            '^[\t ]*GO(?:[\t ]+(?<Count>[1-9][0-9]*))?[\t ]*(?:--[^\r\n]*)?$',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        $isGoSeparator = $state -eq 'Code' -and $goMatch.Success
+        if ($isGoSeparator -and $goMatch.Groups['Count'].Success) {
+            $count = 0
+            $isGoSeparator = [int]::TryParse($goMatch.Groups['Count'].Value, [ref]$count)
+        }
+        if ($isGoSeparator) {
+            if (($batchLines -join "`n").Trim().Length -gt 0) {
+                $batches.Add([pscustomobject]@{
+                    BatchIndex = $batchIndex
+                    Text = $batchLines -join "`n"
+                    StartIndex = $batchStartIndex
+                    EndIndex = $lineStartIndex
+                    StartLine = $batchStartLine
+                })
+                $batchIndex++
+            }
+            $batchLines.Clear()
+            $batchStartIndex = $lineEndIndex + $newlineLength
+            $batchStartLine = $lineNumber + 1
+        }
+        else {
+            $batchLines.Add($line)
+            $lexicalState = Get-SqlLexicalState `
+                -Line $line `
+                -State $state `
+                -BlockDepth $blockDepth
+            $state = $lexicalState.State
+            $blockDepth = $lexicalState.BlockDepth
+        }
+        if ($newlineLength -eq 0) {
+            break
+        }
+        $lineStartIndex = $lineEndIndex + $newlineLength
+        $lineNumber++
+    }
+
+    if (($batchLines -join "`n").Trim().Length -gt 0) {
+        $batches.Add([pscustomobject]@{
+            BatchIndex = $batchIndex
+            Text = $batchLines -join "`n"
+            StartIndex = $batchStartIndex
+            EndIndex = $Text.Length
+            StartLine = $batchStartLine
+        })
+    }
+    return $batches.ToArray()
+}
+
+function Get-SqlBatchNumber {
+    param(
+        [Parameter(Mandatory)][object[]]$Batches,
+        [Parameter(Mandatory)][int]$TextIndex
+    )
+
+    foreach ($batch in $Batches) {
+        if ($TextIndex -ge $batch.StartIndex -and $TextIndex -lt $batch.EndIndex) {
+            return $batch.BatchIndex
+        }
+    }
+    return -1
 }
 
 function Test-SqlDynamicExecution {
@@ -735,7 +939,10 @@ function Test-SqlDynamicExecution {
         else {
             ''
         }
-        if ($procedureName -in @('sp_delete_job', 'sp_rename')) {
+        if (
+            $procedureName -and
+            (Test-SqlDestructiveProcedureName -Name $procedureName)
+        ) {
             return $false
         }
         $isSpExecuteSql = $procedureName -eq 'sp_executesql'
@@ -779,6 +986,9 @@ function Test-SqlDynamicExecution {
             return $false
         }
         if (Test-ConstantDynamicDdl -Text $expression.Value) {
+            return $false
+        }
+        if (Test-SqlUnsupportedInstanceMutation -Text $expression.Value) {
             return $false
         }
         if (-not (Test-SqlDynamicExecution -Text $expression.Value -Depth ($Depth + 1))) {
@@ -853,17 +1063,62 @@ function Get-SqlBlockEndIndex {
 function Test-SqlInstanceGuardCoverage {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
 
-    $codeOnly = ConvertTo-CodeOnly -Text $Text
-    $tokens = @(ConvertTo-SqlToken -Text $codeOnly)
-    $goBatches = @(
-        [regex]::Matches(
-            $codeOnly,
-            '(?im)^[\t ]*GO(?:[\t ]+\d+)?[\t ]*(?:\r?\n|$)'
-        )
-    )
+    $commentFree = ConvertTo-CommentFreeSql -Text $Text
+    $tokens = @(ConvertTo-SqlToken -Text $commentFree)
+    $sqlBatches = @(Get-SqlBatch -Text $Text)
     $bareMutationIndices = [System.Collections.Generic.HashSet[int]]::new()
     foreach ($bareInvocation in @(Get-SqlBareProcedureInvocation -Text $Text)) {
         [void]$bareMutationIndices.Add($bareInvocation.Index)
+    }
+    $procedureRanges = [System.Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        if (
+            $tokens[$index].Kind -ne 'Word' -or
+            $tokens[$index].Value -notin @('EXEC', 'EXECUTE')
+        ) {
+            continue
+        }
+        $procedure = Get-SqlProcedureInvocationDetail `
+            -Text $commentFree `
+            -ExecuteIndex $tokens[$index].Index
+        if ($procedure.Success -and -not $procedure.Dynamic) {
+            $procedureRanges.Add([pscustomobject]@{
+                Start = $procedure.ProcedureStartIndex
+                End = $procedure.ProcedureEndIndex
+                Name = $procedure.Name.ToUpperInvariant()
+            })
+        }
+    }
+    $supportedProcedures = @(
+        'SP_ADD_JOB',
+        'SP_UPDATE_JOB',
+        'SP_ADD_JOBSTEP',
+        'SP_UPDATE_JOBSTEP',
+        'SP_ADD_JOBSERVER'
+    )
+    foreach ($token in $tokens) {
+        if ($token.Kind -notin @('Word', 'Identifier')) {
+            continue
+        }
+        $name = Get-SqlCanonicalTokenValue -Token $token
+        if (
+            -not $name.StartsWith('SP_') -and
+            $name -notin $supportedProcedures -and
+            -not (Test-SqlDestructiveProcedureName -Name $name)
+        ) {
+            continue
+        }
+        $isExecutedProcedure = @(
+            $procedureRanges |
+                Where-Object {
+                    $_.Name -ceq $name -and
+                    $token.Index -ge $_.Start -and
+                    $token.Index -lt $_.End
+                }
+        ).Count -gt 0
+        if (-not $isExecutedProcedure) {
+            return $false
+        }
     }
     $guardRanges = [System.Collections.Generic.List[object]]::new()
     for ($index = 0; $index -lt $tokens.Count; $index++) {
@@ -871,11 +1126,13 @@ function Test-SqlInstanceGuardCoverage {
             continue
         }
         $cursor = $index + 1
+        $isNotExists = $false
         if (
             $cursor -lt $tokens.Count -and
             $tokens[$cursor].Kind -eq 'Word' -and
             $tokens[$cursor].Value -eq 'NOT'
         ) {
+            $isNotExists = $true
             $cursor++
         }
         if (
@@ -925,6 +1182,26 @@ function Test-SqlInstanceGuardCoverage {
             if ($rangeEnd -lt 0) {
                 continue
             }
+            $predicate = Get-SqlCanonicalTokenText `
+                -Tokens $tokens `
+                -StartIndex $index `
+                -EndIndex ($rangeStart - 1)
+            $predicateText = $commentFree.Substring(
+                $tokens[$index].Index,
+                $tokens[$rangeStart].Index - $tokens[$index].Index
+            )
+            $batch = Get-SqlBatchNumber `
+                -Batches $sqlBatches `
+                -TextIndex $tokens[$index].Index
+            $guardRanges.Add([pscustomobject]@{
+                Start = $rangeStart
+                End = $rangeEnd
+                Branch = 'If'
+                IsNotExists = $isNotExists
+                Predicate = $predicate
+                PredicateText = $predicateText
+                Batch = $batch
+            })
             $cursor = $rangeEnd + 1
             while (
                 $cursor -lt $tokens.Count -and
@@ -955,17 +1232,17 @@ function Test-SqlInstanceGuardCoverage {
                     if ($elseEnd -lt 0) {
                         continue
                     }
-                    $rangeEnd = $elseEnd
+                    $guardRanges.Add([pscustomobject]@{
+                        Start = $cursor
+                        End = $elseEnd
+                        Branch = 'Else'
+                        IsNotExists = $isNotExists
+                        Predicate = $predicate
+                        PredicateText = $predicateText
+                        Batch = $batch
+                    })
                 }
             }
-            $guardRanges.Add([pscustomobject]@{
-                Start = $rangeStart
-                End = $rangeEnd
-                Batch = @(
-                    $goBatches |
-                        Where-Object { $_.Index -lt $tokens[$index].Index }
-                ).Count
-            })
         }
     }
     if ($guardRanges.Count -eq 0) {
@@ -981,6 +1258,9 @@ function Test-SqlInstanceGuardCoverage {
         'UPDATE',
         'DELETE',
         'MERGE',
+        'GRANT',
+        'DENY',
+        'REVOKE',
         'EXEC',
         'EXECUTE'
     )
@@ -992,10 +1272,9 @@ function Test-SqlInstanceGuardCoverage {
         if (-not $isMutationVerb -and -not $bareMutationIndices.Contains($tokens[$index].Index)) {
             continue
         }
-        $mutationBatch = @(
-            $goBatches |
-                Where-Object { $_.Index -lt $tokens[$index].Index }
-        ).Count
+        $mutationBatch = Get-SqlBatchNumber `
+            -Batches $sqlBatches `
+            -TextIndex $tokens[$index].Index
         $isGuarded = @(
             $guardRanges |
                 Where-Object {
@@ -1007,14 +1286,572 @@ function Test-SqlInstanceGuardCoverage {
         if (-not $isGuarded) {
             return $false
         }
+        $guard = @(
+            $guardRanges |
+                Where-Object {
+                    $_.Batch -eq $mutationBatch -and
+                    $index -ge $_.Start -and
+                    $index -le $_.End
+                } |
+                Sort-Object Start -Descending
+        )[0]
+        if (
+            -not (
+                Test-SqlInstanceMutationCorrelation `
+                    -Text $commentFree `
+                    -Tokens $tokens `
+                    -MutationIndex $index `
+                    -Guard $guard
+            )
+        ) {
+            return $false
+        }
     }
     return $true
+}
+
+function Get-SqlProcedureInvocationDetail {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][int]$ExecuteIndex
+    )
+
+    $statement = Get-SqlStatement -Text $Text -StartIndex $ExecuteIndex
+    $execute = [regex]::Match($statement, '^(?is)EXEC(?:UTE)?\b')
+    if (-not $execute.Success) {
+        return [pscustomobject]@{ Success = $false; Dynamic = $false; Name = ''; Statement = $statement }
+    }
+    $cursor = $execute.Length
+    while ($cursor -lt $statement.Length -and [char]::IsWhiteSpace($statement[$cursor])) {
+        $cursor++
+    }
+    $assignment = [regex]::Match(
+        $statement.Substring($cursor),
+        '^(?is)@[A-Za-z_][A-Za-z0-9_]*\s*=\s*'
+    )
+    if ($assignment.Success) {
+        $cursor += $assignment.Length
+    }
+    $parenthesized = $cursor -lt $statement.Length -and $statement[$cursor] -eq '('
+    if ($parenthesized) {
+        $cursor++
+        while ($cursor -lt $statement.Length -and [char]::IsWhiteSpace($statement[$cursor])) {
+            $cursor++
+        }
+    }
+    $startsWithLiteral = (
+        $cursor -lt $statement.Length -and $statement[$cursor] -eq "'"
+    ) -or (
+        $cursor + 1 -lt $statement.Length -and
+        $statement[$cursor] -in 'N', 'n' -and
+        $statement[$cursor + 1] -eq "'"
+    )
+    $startsWithVariable = $cursor -lt $statement.Length -and $statement[$cursor] -eq '@'
+    if ($parenthesized -or $startsWithLiteral -or $startsWithVariable) {
+        $expression = ConvertFrom-ConstantSqlExpression -Text $statement -StartIndex $cursor
+        return [pscustomobject]@{
+            Success = $expression.Success
+            Dynamic = $true
+            Name = ''
+            Parts = @()
+            Statement = $statement
+            Arguments = $statement.Substring($cursor)
+            Expression = $expression.Value
+        }
+    }
+    $procedureStart = $cursor
+    $procedure = Read-SqlIdentifierPath -Text $statement -StartIndex $cursor
+    if (-not $procedure.Success) {
+        return [pscustomobject]@{ Success = $false; Dynamic = $false; Name = ''; Statement = $statement }
+    }
+    $name = $procedure.Parts[-1].ToLowerInvariant()
+    if ($name -eq 'sp_executesql') {
+        $cursor = $procedure.EndIndex
+        while ($cursor -lt $statement.Length -and [char]::IsWhiteSpace($statement[$cursor])) {
+            $cursor++
+        }
+        $namedStatement = [regex]::Match($statement.Substring($cursor), '^(?is)@stmt\s*=\s*')
+        if ($namedStatement.Success) {
+            $cursor += $namedStatement.Length
+        }
+        $expression = ConvertFrom-ConstantSqlExpression -Text $statement -StartIndex $cursor
+        return [pscustomobject]@{
+            Success = $expression.Success
+            Dynamic = $true
+            Name = $name
+            Parts = $procedure.Parts
+            Statement = $statement
+            Arguments = $statement.Substring($procedure.EndIndex)
+            Expression = $expression.Value
+            ProcedureStartIndex = $ExecuteIndex + $procedureStart
+            ProcedureEndIndex = $ExecuteIndex + $procedure.EndIndex
+        }
+    }
+    return [pscustomobject]@{
+        Success = $true
+        Dynamic = $false
+        Name = $name
+        Parts = $procedure.Parts
+        Statement = $statement
+        Arguments = $statement.Substring($procedure.EndIndex)
+        Expression = ''
+        ProcedureStartIndex = $ExecuteIndex + $procedureStart
+        ProcedureEndIndex = $ExecuteIndex + $procedure.EndIndex
+    }
+}
+
+function Test-SqlStableStringVariable {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$VariableName,
+        [string]$RequiredValue
+    )
+
+    $tokens = @(ConvertTo-SqlToken -Text (ConvertTo-CommentFreeSql -Text $Text))
+    $values = @(
+        for ($index = 0; $index -lt $tokens.Count; $index++) {
+            Get-SqlCanonicalTokenText -Tokens $tokens -StartIndex $index -EndIndex $index
+        }
+    )
+    $canonicalName = $VariableName.ToUpperInvariant()
+    $declarationCount = 0
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        if (
+            $values[$index] -eq 'DECLARE' -and
+            $index + 1 -lt $tokens.Count -and
+            $values[$index + 1] -eq $canonicalName
+        ) {
+            if (
+                $index + 6 -ge $tokens.Count -or
+                ($values[$index..($index + 6)] -join '|') -cne (
+                    "DECLARE|$canonicalName|SYSNAME|=|N|<STRING>|;"
+                )
+            ) {
+                return $false
+            }
+            $declarationCount++
+            if (
+                $PSBoundParameters.ContainsKey('RequiredValue') -and
+                $tokens[$index + 5].LiteralValue -cne $RequiredValue
+            ) {
+                return $false
+            }
+        }
+        if (
+            $values[$index] -eq 'SET' -and
+            $index + 1 -lt $tokens.Count -and
+            $values[$index + 1] -eq $canonicalName
+        ) {
+            return $false
+        }
+        if ($values[$index] -eq $canonicalName) {
+            $isAssignment = (
+                $index + 1 -lt $values.Count -and
+                $values[$index + 1] -eq '='
+            ) -or (
+                $index + 2 -lt $values.Count -and
+                $values[$index + 1] -in @('+', '-', '*', '/', '%', '&', '|', '^') -and
+                $values[$index + 2] -eq '='
+            )
+            if ($isAssignment) {
+                for ($cursor = $index - 1; $cursor -ge 0; $cursor--) {
+                    if ($values[$cursor] -eq ';') {
+                        break
+                    }
+                    if ($values[$cursor] -eq 'SELECT') {
+                        return $false
+                    }
+                }
+            }
+        }
+        if (
+            $values[$index] -eq $canonicalName -and
+            $index + 1 -lt $tokens.Count -and
+            $values[$index + 1] -eq 'OUTPUT'
+        ) {
+            return $false
+        }
+    }
+    return $declarationCount -eq 1
+}
+
+function Test-SqlIdentifierFlow {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$VariableName,
+        [Parameter(Mandatory)][string]$VariableType,
+        [Parameter(Mandatory)][string[]]$ExpectedAssignment
+    )
+
+    $tokens = @(ConvertTo-SqlToken -Text (ConvertTo-CommentFreeSql -Text $Text))
+    $values = @(
+        for ($index = 0; $index -lt $tokens.Count; $index++) {
+            Get-SqlCanonicalTokenText -Tokens $tokens -StartIndex $index -EndIndex $index
+        }
+    )
+    $canonicalName = $VariableName.ToUpperInvariant()
+    $declarationCount = 0
+    $assignmentCount = 0
+    $expected = $ExpectedAssignment -join '|'
+    for ($index = 0; $index -lt $values.Count; $index++) {
+        if (
+            $values[$index] -eq 'DECLARE' -and
+            $index + 1 -lt $values.Count -and
+            $values[$index + 1] -eq $canonicalName
+        ) {
+            if (
+                $index + 3 -ge $values.Count -or
+                ($values[$index..($index + 3)] -join '|') -cne (
+                    "DECLARE|$canonicalName|$VariableType|;"
+                )
+            ) {
+                return $false
+            }
+            $declarationCount++
+        }
+        if (
+            $values[$index] -eq 'SET' -and
+            $index + 1 -lt $values.Count -and
+            $values[$index + 1] -eq $canonicalName
+        ) {
+            return $false
+        }
+        if ($values[$index] -eq $canonicalName) {
+            $isAssignment = (
+                $index + 1 -lt $values.Count -and
+                $values[$index + 1] -eq '='
+            ) -or (
+                $index + 2 -lt $values.Count -and
+                $values[$index + 1] -in @('+', '-', '*', '/', '%', '&', '|', '^') -and
+                $values[$index + 2] -eq '='
+            )
+            if ($isAssignment) {
+                $selectIndex = -1
+                for ($cursor = $index - 1; $cursor -ge 0; $cursor--) {
+                    if ($values[$cursor] -eq ';') {
+                        break
+                    }
+                    if ($values[$cursor] -eq 'SELECT') {
+                        $selectIndex = $cursor
+                        break
+                    }
+                }
+                if ($selectIndex -ge 0) {
+                    $assignmentCount++
+                    if (
+                        $selectIndex + $ExpectedAssignment.Count -gt $values.Count -or
+                        (
+                            $values[
+                                $selectIndex..($selectIndex + $ExpectedAssignment.Count - 1)
+                            ] -join '|'
+                        ) -cne $expected
+                    ) {
+                        return $false
+                    }
+                }
+            }
+        }
+    }
+    return $declarationCount -eq 1 -and $assignmentCount -eq 1
+}
+
+function Test-SqlJobIdFlow {
+    param([Parameter(Mandatory)][string]$Text)
+
+    return Test-SqlIdentifierFlow `
+        -Text $Text `
+        -VariableName '@JobId' `
+        -VariableType 'UNIQUEIDENTIFIER' `
+        -ExpectedAssignment @(
+            'SELECT',
+            '@JOBID',
+            '=',
+            'JOB_ID',
+            'FROM',
+            'MSDB',
+            '.',
+            'DBO',
+            '.',
+            'SYSJOBS',
+            'WHERE',
+            'NAME',
+            '=',
+            '@JOBNAME',
+            ';'
+        )
+}
+
+function Test-SqlStepIdFlow {
+    param([Parameter(Mandatory)][string]$Text)
+
+    return Test-SqlIdentifierFlow `
+        -Text $Text `
+        -VariableName '@StepId' `
+        -VariableType 'INT' `
+        -ExpectedAssignment @(
+            'SELECT',
+            '@STEPID',
+            '=',
+            'STEP_ID',
+            'FROM',
+            'MSDB',
+            '.',
+            'DBO',
+            '.',
+            'SYSJOBSTEPS',
+            'WHERE',
+            'JOB_ID',
+            '=',
+            '@JOBID',
+            'AND',
+            'STEP_NAME',
+            '=',
+            '@STEPNAME',
+            ';'
+        )
+}
+
+function Test-SqlProcedureArgumentShape {
+    param(
+        [Parameter(Mandatory)][object]$Procedure,
+        [Parameter(Mandatory)][string]$ExpectedPath
+    )
+
+    if (($Procedure.Parts -join '.').ToLowerInvariant() -cne $ExpectedPath) {
+        return $false
+    }
+    if (-not $Procedure.Statement.TrimEnd().EndsWith(';')) {
+        return $false
+    }
+    $argumentTokens = @(
+        ConvertTo-SqlToken -Text (ConvertTo-CommentFreeSql -Text $Procedure.Arguments)
+    )
+    $unsupportedWords = @(
+        $argumentTokens |
+            Where-Object {
+                $_.Kind -eq 'Word' -and
+                -not $_.Value.StartsWith('@') -and
+                $_.Value -notin @('DEFAULT', 'N', 'NULL', 'OUTPUT')
+            }
+    )
+    if ($unsupportedWords.Count -gt 0) {
+        return $false
+    }
+    $outputCount = @(
+        $argumentTokens |
+            Where-Object { $_.Kind -eq 'Word' -and $_.Value -eq 'OUTPUT' }
+    ).Count
+    if ($Procedure.Name -eq 'sp_add_job') {
+        return (
+            $outputCount -le 1 -and
+            (
+                $outputCount -eq 0 -or
+                $Procedure.Arguments -match '(?is)@job_id\s*=\s*@JobId\s+OUTPUT\b'
+            )
+        )
+    }
+    return $outputCount -eq 0
+}
+
+function Test-SqlInstanceMutationCorrelation {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][object[]]$Tokens,
+        [Parameter(Mandatory)][int]$MutationIndex,
+        [Parameter(Mandatory)][object]$Guard
+    )
+
+    $token = $Tokens[$MutationIndex]
+    $predicate = $Guard.Predicate
+    $isMissingBranch = (
+        $Guard.Branch -eq 'If' -and $Guard.IsNotExists
+    ) -or (
+        $Guard.Branch -eq 'Else' -and -not $Guard.IsNotExists
+    )
+    $isExistingBranch = -not $isMissingBranch
+    if ($token.Value -eq 'CREATE') {
+        if (
+            $MutationIndex + 1 -ge $Tokens.Count -or
+            $Tokens[$MutationIndex + 1].Kind -ne 'Word' -or
+            $Tokens[$MutationIndex + 1].Value -ne 'LOGIN'
+        ) {
+            return $false
+        }
+        $login = [regex]::Match(
+            $Text.Substring($token.Index),
+            '^(?is)CREATE\s+LOGIN\s+\[(?<Name>[^\]]+)\]'
+        )
+        if (-not $login.Success -or $predicate -notmatch '\bSERVER_PRINCIPALS\b') {
+            return $false
+        }
+        $predicateName = [regex]::Match(
+            $Guard.PredicateText,
+            '^(?is)\s*IF\s+(?:NOT\s+)?EXISTS\s*\(\s*SELECT\s+1\s+' +
+                'FROM\s+\[?sys\]?\s*\.\s*\[?server_principals\]?\s+' +
+                'WHERE\s+\[?name\]?\s*=\s*N''(?<Name>[^'']+)''\s*\)\s*$'
+        )
+        return (
+            $isMissingBranch -and
+            $predicateName.Success -and
+            $predicateName.Groups['Name'].Value -ceq $login.Groups['Name'].Value
+        )
+    }
+    if ($token.Value -notin @('EXEC', 'EXECUTE')) {
+        return $false
+    }
+
+    $procedure = Get-SqlProcedureInvocationDetail -Text $Text -ExecuteIndex $token.Index
+    if (-not $procedure.Success) {
+        return $false
+    }
+    if ($procedure.Dynamic) {
+        $dynamicTokens = @(
+            ConvertTo-SqlToken -Text (ConvertTo-CodeOnly -Text $procedure.Expression)
+        )
+        return @(
+            $dynamicTokens |
+                Where-Object {
+                    (
+                        $_.Kind -eq 'Word' -and
+                        $_.Value -in @(
+                            'CREATE',
+                            'ALTER',
+                            'DROP',
+                            'TRUNCATE',
+                            'INSERT',
+                            'UPDATE',
+                            'DELETE',
+                            'MERGE',
+                            'GRANT',
+                            'DENY',
+                            'REVOKE',
+                            'EXEC',
+                            'EXECUTE'
+                        )
+                    ) -or (
+                        $_.Kind -in @('Word', 'Identifier') -and
+                        (Get-SqlCanonicalTokenValue -Token $_).StartsWith('SP_')
+                    )
+                }
+        ).Count -eq 0 -and
+            -not (Test-SqlUnsupportedInstanceMutation -Text $procedure.Expression)
+    }
+    if (Test-SqlDestructiveProcedureName -Name $procedure.Name) {
+        return $false
+    }
+    if (
+        -not (
+            Test-SqlProcedureArgumentShape `
+                -Procedure $procedure `
+                -ExpectedPath "msdb.dbo.$($procedure.Name)"
+        )
+    ) {
+        return $false
+    }
+
+    $statementTokens = @(
+        ConvertTo-SqlToken -Text (ConvertTo-CommentFreeSql -Text $procedure.Statement)
+    )
+    $statement = Get-SqlCanonicalTokenText `
+        -Tokens $statementTokens `
+        -StartIndex 0 `
+        -EndIndex ($statementTokens.Count - 1)
+    switch ($procedure.Name) {
+        'sp_add_job' {
+            return (
+                $isMissingBranch -and
+                $predicate -match (
+                    '^IF (?:NOT )?EXISTS \( SELECT 1 FROM MSDB \. DBO \. ' +
+                    'SYSJOBS WHERE NAME = @JOBNAME \)$'
+                ) -and
+                $statement -match '@JOB_NAME\s*=\s*@JOBNAME\b' -and
+                (Test-SqlStableStringVariable -Text $Text -VariableName '@JobName')
+            )
+        }
+        'sp_update_job' {
+            return (
+                $isExistingBranch -and
+                $predicate -match (
+                    '^IF (?:NOT )?EXISTS \( SELECT 1 FROM MSDB \. DBO \. ' +
+                    'SYSJOBS WHERE NAME = @JOBNAME \)$'
+                ) -and
+                $statement -match '@JOB_NAME\s*=\s*@JOBNAME\b' -and
+                (Test-SqlStableStringVariable -Text $Text -VariableName '@JobName')
+            )
+        }
+        'sp_add_jobstep' {
+            return (
+                $isMissingBranch -and
+                $predicate -match (
+                    '^IF (?:NOT )?EXISTS \( SELECT 1 FROM MSDB \. DBO \. ' +
+                    'SYSJOBSTEPS WHERE JOB_ID = @JOBID AND STEP_NAME = @STEPNAME \)$'
+                ) -and
+                $statement -match '@JOB_ID\s*=\s*@JOBID\b' -and
+                $statement -match '@STEP_NAME\s*=\s*@STEPNAME\b' -and
+                (Test-SqlStableStringVariable -Text $Text -VariableName '@JobName') -and
+                (Test-SqlStableStringVariable -Text $Text -VariableName '@StepName') -and
+                (Test-SqlJobIdFlow -Text $Text)
+            )
+        }
+        'sp_update_jobstep' {
+            return (
+                $isExistingBranch -and
+                $predicate -match (
+                    '^IF (?:NOT )?EXISTS \( SELECT 1 FROM MSDB \. DBO \. ' +
+                    'SYSJOBSTEPS WHERE JOB_ID = @JOBID AND STEP_NAME = @STEPNAME \)$'
+                ) -and
+                $statement -match '@JOB_ID\s*=\s*@JOBID\b' -and
+                $statement -match '@STEP_NAME\s*=\s*@STEPNAME\b' -and
+                $statement -match '@STEP_ID\s*=\s*@STEPID\b' -and
+                (Test-SqlStableStringVariable -Text $Text -VariableName '@JobName') -and
+                (Test-SqlStableStringVariable -Text $Text -VariableName '@StepName') -and
+                (Test-SqlJobIdFlow -Text $Text) -and
+                (Test-SqlStepIdFlow -Text $Text)
+            )
+        }
+        'sp_add_jobserver' {
+            return (
+                $isMissingBranch -and
+                $predicate -match (
+                    '^IF (?:NOT )?EXISTS \( SELECT 1 FROM MSDB \. DBO \. ' +
+                    'SYSJOBSERVERS WHERE JOB_ID = @JOBID AND SERVER_ID = 0 \)$'
+                ) -and
+                $statement -match '@JOB_ID\s*=\s*@JOBID\b' -and
+                $statement -match '@SERVER_NAME\s*=\s*@LOCALSERVERNAME\b' -and
+                (Test-SqlStableStringVariable -Text $Text -VariableName '@JobName') -and
+                (
+                    Test-SqlStableStringVariable `
+                        -Text $Text `
+                        -VariableName '@LocalServerName' `
+                        -RequiredValue '(LOCAL)'
+                ) -and
+                (Test-SqlJobIdFlow -Text $Text)
+            )
+        }
+        default {
+            return $false
+        }
+    }
 }
 
 function Test-SqlDestructiveInstanceStatement {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
 
     $tokens = @(ConvertTo-SqlToken -Text (ConvertTo-CodeOnly -Text $Text))
+    if (Test-SqlUnsupportedInstanceMutation -Text $Text) {
+        return $true
+    }
+    foreach ($token in $tokens) {
+        if (
+            $token.Kind -in @('Word', 'Identifier') -and
+            (
+                Test-SqlDestructiveProcedureName `
+                    -Name (Get-SqlCanonicalTokenValue -Token $token)
+            )
+        ) {
+            return $true
+        }
+    }
     return @(
         $tokens |
             Where-Object {
@@ -1296,6 +2133,7 @@ Export-ModuleMember -Function @(
     'ConvertTo-CodeOnly',
     'ConvertTo-CommentFreeSql',
     'ConvertTo-SqlToken',
+    'Get-SqlBatch',
     'Get-SqlBareProcedureInvocation',
     'Get-SqlCmdReferenceName',
     'Get-SqlStatement',

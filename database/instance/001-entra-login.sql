@@ -2,12 +2,10 @@
 USE [master];
 GO
 
-DECLARE @LoginName sysname = N'$(EntraLoginName)';
-
 IF NOT EXISTS (
     SELECT 1
     FROM sys.server_principals
-    WHERE [name] = @LoginName
+    WHERE [name] = N'$(EntraLoginName)'
 )
 BEGIN
     CREATE LOGIN [$(EntraLoginName)] FROM EXTERNAL PROVIDER;

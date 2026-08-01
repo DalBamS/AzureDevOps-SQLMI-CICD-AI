@@ -413,32 +413,7 @@ foreach ($entry in $allowlist) {
 }
 
 $sqlCmdResolution = Resolve-SqlCmdScript -Path $ScriptPath
-$scriptLines = @([regex]::Split($sqlCmdResolution.SanitizedText, '\r?\n'))
-$batches = [System.Collections.Generic.List[object]]::new()
-$batchLines = [System.Collections.Generic.List[string]]::new()
-$batchStartLine = 1
-
-for ($index = 0; $index -lt $scriptLines.Count; $index++) {
-    $line = $scriptLines[$index]
-    if ($line -match '^\s*GO(?:\s+\d+)?\s*(?:--.*)?$') {
-        if ($batchLines.Count -gt 0) {
-            $batches.Add([pscustomobject]@{
-                Text = $batchLines -join "`n"
-                StartLine = $batchStartLine
-            })
-            $batchLines.Clear()
-        }
-        $batchStartLine = $index + 2
-        continue
-    }
-    $batchLines.Add($line)
-}
-if ($batchLines.Count -gt 0) {
-    $batches.Add([pscustomobject]@{
-        Text = $batchLines -join "`n"
-        StartLine = $batchStartLine
-    })
-}
+$batches = @(SqlCmd.Common\Get-SqlBatch -Text $sqlCmdResolution.SanitizedText)
 
 $findings = [System.Collections.Generic.List[object]]::new()
 foreach ($batch in $batches) {

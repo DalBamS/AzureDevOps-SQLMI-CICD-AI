@@ -427,7 +427,7 @@ try {
         -ScriptPath $instanceFixturePath `
         -SqlcmdVariables @{} `
         -WhatIf
-    foreach ($case in @(
+    $instanceSafetyCases = @(
         @{
             Name = 'comment-only-guard'
             Sql = @'
@@ -567,8 +567,538 @@ END
 CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
 SELECT CASE WHEN 1 = 1 THEN 1 END;
 '@
+        },
+        @{
+            Name = 'always-true-guard'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
+END;
+'@
+        },
+        @{
+            Name = 'unrelated-login-catalog'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF NOT EXISTS (SELECT 1 FROM sys.credentials WHERE [name] = N'fixture_login')
+BEGIN
+    CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
+END;
+'@
+        },
+        @{
+            Name = 'mismatched-job-variable'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE [name] = @OtherJobName)
+BEGIN
+    EXEC msdb.dbo.sp_add_job @job_name = @JobName;
+END;
+'@
+        },
+        @{
+            Name = 'select-into'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1 FROM sys.server_principals WHERE [name] = N'fixture')
+BEGIN
+    SELECT /* gap */ 1 AS [Id] INTO [dbo].[Copy];
+END;
+'@
+        },
+        @{
+            Name = 'grant-permission'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1 FROM sys.server_principals WHERE [name] = N'fixture')
+BEGIN
+    GRANT CONTROL SERVER TO [fixture_login];
+END;
+'@
+        },
+        @{
+            Name = 'deny-permission'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1 FROM sys.server_principals WHERE [name] = N'fixture')
+BEGIN
+    DENY CONNECT SQL TO [fixture_login];
+END;
+'@
+        },
+        @{
+            Name = 'revoke-permission'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1 FROM sys.server_principals WHERE [name] = N'fixture')
+BEGIN
+    REVOKE CONNECT SQL TO [fixture_login];
+END;
+'@
+        },
+        @{
+            Name = 'dynamic-select-into'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC(N'SELECT 1 AS [Id] INTO [dbo].[Copy];');
+END;
+'@
+        },
+        @{
+            Name = 'dynamic-grant'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC sys.sp_executesql N'GRANT CONTROL SERVER TO [fixture_login];';
+END;
+'@
+        },
+        @{
+            Name = 'delete-jobstep-qualified'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC [msdb].[dbo].[sp_delete_jobstep] @job_name = N'fixture', @step_id = 1;
+END;
+'@
+        },
+        @{
+            Name = 'delete-jobserver-quoted'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC "msdb"."dbo"."sp_delete_jobserver" @job_name = N'fixture';
+END;
+'@
+        },
+        @{
+            Name = 'drop-login-omitted-schema'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC master..sp_droplogin N'fixture_login';
+END;
+'@
+        },
+        @{
+            Name = 'remove-procedure-return-assignment'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC @returnCode = msdb.dbo.sp_remove_job N'fixture';
+END;
+'@
+        },
+        @{
+            Name = 'detach-procedure'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC master.sys.sp_detach_db N'fixture';
+END;
+'@
+        },
+        @{
+            Name = 'rename-procedure'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC sys.sp_rename N'dbo.Old', N'New';
+END;
+'@
+        },
+        @{
+            Name = 'dynamic-delete-job'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC(N'EXEC msdb.dbo.sp_delete_job @job_name = N''fixture'';');
+END;
+'@
+        },
+        @{
+            Name = 'nested-unrelated-login-catalog'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.credentials
+    WHERE [name] = N'fixture_login'
+      AND EXISTS (SELECT 1 FROM sys.server_principals WHERE 1 = 0)
+)
+BEGIN
+    CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
+END;
+'@
+        },
+        @{
+            Name = 'attacker-qualified-update-job'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'fixture';
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE [name] = @JobName)
+BEGIN
+    EXEC EvilDb.attacker.sp_update_job @job_name = @JobName;
+END;
+'@
+        },
+        @{
+            Name = 'procedure-argument-crosses-statement'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'fixture';
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE [name] = @JobName)
+BEGIN
+    EXEC msdb.dbo.sp_update_job @job_name = @OtherJobName
+    SELECT @job_name = @JobName;
+END;
+'@
+        },
+        @{
+            Name = 'job-name-reassigned'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'approved';
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE [name] = @JobName)
+BEGIN
+    SET @JobName = N'victim';
+    EXEC msdb.dbo.sp_update_job @job_name = @JobName;
+END;
+'@
+        },
+        @{
+            Name = 'job-id-unrelated-derivation'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'approved';
+DECLARE @JobId uniqueidentifier;
+DECLARE @StepName sysname = N'Health check';
+SELECT @JobId = [job_id]
+FROM msdb.dbo.sysjobs
+WHERE [name] = N'victim';
+IF NOT EXISTS (
+    SELECT 1 FROM msdb.dbo.sysjobsteps
+    WHERE [job_id] = @JobId AND [step_name] = @StepName
+)
+BEGIN
+    EXEC msdb.dbo.sp_add_jobstep
+        @job_id = @JobId,
+        @step_name = @StepName;
+END;
+'@
+        },
+        @{
+            Name = 'local-server-name-reassigned'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'approved';
+DECLARE @JobId uniqueidentifier;
+DECLARE @LocalServerName sysname = N'(LOCAL)';
+SELECT @JobId = [job_id]
+FROM msdb.dbo.sysjobs
+WHERE [name] = @JobName;
+IF NOT EXISTS (
+    SELECT 1 FROM msdb.dbo.sysjobservers
+    WHERE [job_id] = @JobId AND [server_id] = 0
+)
+BEGIN
+    SET @LocalServerName = N'REMOTE';
+    EXEC msdb.dbo.sp_add_jobserver
+        @job_id = @JobId,
+        @server_name = @LocalServerName;
+END;
+'@
+        },
+        @{
+            Name = 'job-name-compound-assignment'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'approved';
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE [name] = @JobName)
+BEGIN
+    SET @JobName += N'-victim';
+    EXEC msdb.dbo.sp_update_job @job_name = @JobName;
+END;
+'@
+        },
+        @{
+            Name = 'job-id-reassigned'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'approved';
+DECLARE @JobId uniqueidentifier;
+DECLARE @StepName sysname = N'Health check';
+SELECT @JobId = [job_id]
+FROM msdb.dbo.sysjobs
+WHERE [name] = @JobName;
+IF NOT EXISTS (
+    SELECT 1 FROM msdb.dbo.sysjobsteps
+    WHERE [job_id] = @JobId AND [step_name] = @StepName
+)
+BEGIN
+    SET @JobId = NEWID();
+    EXEC msdb.dbo.sp_add_jobstep
+        @job_id = @JobId,
+        @step_name = @StepName;
+END;
+'@
+        },
+        @{
+            Name = 'step-id-reassigned'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'approved';
+DECLARE @JobId uniqueidentifier;
+DECLARE @StepId int;
+DECLARE @StepName sysname = N'Health check';
+SELECT @JobId = [job_id] FROM msdb.dbo.sysjobs WHERE [name] = @JobName;
+SELECT @StepId = [step_id]
+FROM msdb.dbo.sysjobsteps
+WHERE [job_id] = @JobId AND [step_name] = @StepName;
+IF EXISTS (
+    SELECT 1 FROM msdb.dbo.sysjobsteps
+    WHERE [job_id] = @JobId AND [step_name] = @StepName
+)
+BEGIN
+    SET @StepId += 1;
+    EXEC msdb.dbo.sp_update_jobstep
+        @job_id = @JobId,
+        @step_id = @StepId,
+        @step_name = @StepName;
+END;
+'@
+        },
+        @{
+            Name = 'create-login-reversed-polarity'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (
+    SELECT 1 FROM sys.server_principals WHERE [name] = N'fixture_login'
+)
+BEGIN
+    CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
+END;
+'@
+        },
+        @{
+            Name = 'add-job-reversed-polarity'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'fixture';
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE [name] = @JobName)
+BEGIN
+    EXEC msdb.dbo.sp_add_job @job_name = @JobName;
+END;
+'@
+        },
+        @{
+            Name = 'update-job-reversed-polarity'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'fixture';
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE [name] = @JobName)
+BEGIN
+    EXEC msdb.dbo.sp_update_job @job_name = @JobName;
+END;
+'@
+        },
+        @{
+            Name = 'quoted-identifier-fakes-id-flow'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'approved';
+DECLARE @StepName sysname = N'Health check';
+DECLARE @JobId AS uniqueidentifier = '11111111-1111-1111-1111-111111111111';
+SELECT 1 AS "DECLARE @JobId uniqueidentifier;";
+SELECT 1 AS "SELECT @JobId = job_id FROM msdb.dbo.sysjobs WHERE name = @JobName;";
+IF NOT EXISTS (
+    SELECT 1 FROM msdb.dbo.sysjobsteps
+    WHERE [job_id] = @JobId AND [step_name] = @StepName
+)
+BEGIN
+    EXEC msdb.dbo.sp_add_jobstep
+        @job_id = @JobId,
+        @step_name = @StepName;
+END;
+'@
+        },
+        @{
+            Name = 'select-top-reassigns-job-id'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'approved';
+DECLARE @StepName sysname = N'Health check';
+DECLARE @JobId uniqueidentifier;
+SELECT @JobId = [job_id]
+FROM msdb.dbo.sysjobs
+WHERE [name] = @JobName;
+IF NOT EXISTS (
+    SELECT 1 FROM msdb.dbo.sysjobsteps
+    WHERE [job_id] = @JobId AND [step_name] = @StepName
+)
+BEGIN
+    SELECT TOP (1) @JobId = [job_id]
+    FROM msdb.dbo.sysjobs
+    WHERE [name] = N'victim';
+    EXEC msdb.dbo.sp_add_jobstep
+        @job_id = @JobId,
+        @step_name = @StepName;
+END;
+'@
+        },
+        @{
+            Name = 'mismatched-login-name'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF NOT EXISTS (
+    SELECT 1 FROM sys.server_principals WHERE [name] = N'approved_login'
+)
+BEGIN
+    CREATE LOGIN [other_login] FROM EXTERNAL PROVIDER;
+END;
+'@
+        },
+        @{
+            Name = 'add-job-in-existing-branch'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'fixture';
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE [name] = @JobName)
+BEGIN
+    EXEC msdb.dbo.sp_add_job @job_name = @JobName;
+END;
+'@
+        },
+        @{
+            Name = 'update-job-in-missing-branch'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'fixture';
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE [name] = @JobName)
+BEGIN
+    EXEC msdb.dbo.sp_update_job @job_name = @JobName;
+END;
+'@
+        },
+        @{
+            Name = 'nested-inner-unrelated-guard'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF NOT EXISTS (
+    SELECT 1 FROM sys.server_principals WHERE [name] = N'fixture_login'
+)
+BEGIN
+    IF EXISTS (SELECT 1)
+    BEGIN
+        CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
+    END;
+END;
+'@
+        },
+        @{
+            Name = 'mismatched-step-name'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'fixture';
+DECLARE @JobId uniqueidentifier;
+DECLARE @StepName sysname = N'Health check';
+DECLARE @OtherStepName sysname = N'Other';
+SELECT @JobId = [job_id] FROM msdb.dbo.sysjobs WHERE [name] = @JobName;
+IF NOT EXISTS (
+    SELECT 1 FROM msdb.dbo.sysjobsteps
+    WHERE [job_id] = @JobId AND [step_name] = @StepName
+)
+BEGIN
+    EXEC msdb.dbo.sp_add_jobstep
+        @job_id = @JobId,
+        @step_name = @OtherStepName;
+END;
+'@
+        },
+        @{
+            Name = 'mismatched-jobserver-target'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'fixture';
+DECLARE @JobId uniqueidentifier;
+DECLARE @LocalServerName sysname = N'(LOCAL)';
+SELECT @JobId = [job_id] FROM msdb.dbo.sysjobs WHERE [name] = @JobName;
+IF NOT EXISTS (
+    SELECT 1 FROM msdb.dbo.sysjobservers
+    WHERE [job_id] = @JobId AND [server_id] = 1
+)
+BEGIN
+    EXEC msdb.dbo.sp_add_jobserver
+        @job_id = @JobId,
+        @server_name = @LocalServerName;
+END;
+'@
+        },
+        @{
+            Name = 'bare-add-job-inside-correlated-guard'
+            Sql = @'
+-- Idempotency: fixture precondition
+DECLARE @JobName sysname = N'fixture';
+IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE [name] = @JobName)
+BEGIN
+    msdb.dbo.sp_add_job @job_name = @JobName;
+END;
+'@
+        },
+        @{
+            Name = 'bare-destructive-procedure-inside-guard'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    msdb.dbo.sp_delete_jobstep @job_name = N'fixture', @step_id = 1;
+END;
+'@
+        },
+        @{
+            Name = 'revoke-family-procedure'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC [msdb].[dbo].[sp_revoke_proxy_from_subsystem] @proxy_name = N'fixture';
+END;
+'@
+        },
+        @{
+            Name = 'bare-unsupported-system-procedure'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    msdb.dbo.sp_start_job @job_name = N'fixture';
+END;
+'@
+        },
+        @{
+            Name = 'dynamic-bare-unsupported-system-procedure'
+            Sql = @'
+-- Idempotency: fixture precondition
+IF EXISTS (SELECT 1)
+BEGIN
+    EXEC(N'msdb.dbo.sp_start_job @job_name = N''fixture'';');
+END;
+'@
         }
-    )) {
+    )
+    foreach ($case in $instanceSafetyCases) {
         Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
         Set-Content `
             -Path (Join-Path $instanceFixturePath "001-$($case.Name).sql") `
@@ -583,6 +1113,50 @@ SELECT CASE WHEN 1 = 1 THEN 1 END;
                 -WhatIf
         } "Instance safety case '$($case.Name)' must fail closed."
     }
+    $blockedSqlCmdCallPath = Join-Path $temporaryPath 'blocked-instance-sqlcmd-calls.log'
+    $env:PHASE2_BLOCKED_SQLCMD_MOCK_PATH = $blockedSqlCmdCallPath
+    function global:Invoke-Sqlcmd {
+        [CmdletBinding()]
+        param(
+            [string]$ServerInstance,
+            [string]$Database,
+            [string]$AccessToken,
+            [string]$Query,
+            [switch]$DisableCommands,
+            [switch]$DisableVariables,
+            [switch]$AbortOnError,
+            [string]$Encrypt,
+            [switch]$TrustServerCertificate,
+            [int]$QueryTimeout,
+            [int]$ConnectionTimeout
+        )
+
+        Add-Content -Path $env:PHASE2_BLOCKED_SQLCMD_MOCK_PATH -Value $Query -Encoding utf8
+    }
+    try {
+        foreach ($case in $instanceSafetyCases) {
+            Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
+            Set-Content `
+                -Path (Join-Path $instanceFixturePath "001-$($case.Name).sql") `
+                -Value $case.Sql `
+                -Encoding utf8
+            Assert-Throws {
+                & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
+                    -ServerName 'sqlmi.example.test' `
+                    -AccessToken 'fixture-token' `
+                    -ScriptPath $instanceFixturePath `
+                    -SqlcmdVariables @{} `
+                    -Confirm:$false
+            } "Instance safety case '$($case.Name)' must fail before SQL execution."
+        }
+    }
+    finally {
+        Remove-Item Function:\global:Invoke-Sqlcmd -Force
+        Remove-Item Env:\PHASE2_BLOCKED_SQLCMD_MOCK_PATH -ErrorAction SilentlyContinue
+    }
+    Assert-True `
+        -Condition (-not (Test-Path $blockedSqlCmdCallPath)) `
+        -Message 'Rejected instance scripts must never reach Invoke-Sqlcmd.'
     Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
     @'
 -- Idempotency: comments do not replace the executable guard.
@@ -599,6 +1173,32 @@ BEGIN
 END;
 '@ | Set-Content `
         -Path (Join-Path $instanceFixturePath '001-valid-comments.sql') `
+        -Encoding utf8
+    & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
+        -ServerName 'sqlmi.example.test' `
+        -AccessToken 'fixture-token' `
+        -ScriptPath $instanceFixturePath `
+        -SqlcmdVariables @{} `
+        -WhatIf
+    Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
+    @'
+-- Idempotency: only the innermost correlated guard authorizes the supported mutation.
+DECLARE @JobName sysname = N'fixture';
+IF EXISTS (SELECT 1)
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM msdb.dbo.sysjobs
+        WHERE [name] = @JobName
+    )
+    BEGIN
+        EXEC msdb.dbo.sp_add_job @job_name = @JobName;
+    END;
+END;
+PRINT N'SELECT 1 INTO dbo.Copy; GRANT DENY REVOKE';
+SELECT 1 AS [INTO], 2 AS [GRANT], 3 AS "REVOKE";
+'@ | Set-Content `
+        -Path (Join-Path $instanceFixturePath '001-nested-correlated.sql') `
         -Encoding utf8
     & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
         -ServerName 'sqlmi.example.test' `
@@ -705,6 +1305,14 @@ PRINT N'`$(NotAVariable)';
         @{ Name = 'alter-keywords-in-identifier'; Sql = 'CREATE TABLE [ALTER TABLE DROP COLUMN] ([Id] int);' },
         @{ Name = 'alter-keywords-in-quoted-identifier'; Sql = 'CREATE TABLE "ALTER TABLE DROP COLUMN" ("Id" int);' },
         @{ Name = 'alter-keywords-in-comments'; Sql = '/* ALTER TABLE dbo.T /* nested */ DROP COLUMN C; */ SELECT 1;' }
+        @{ Name = 'go-inside-multiline-string'; Sql = "PRINT N'first`nGO`nDROP TABLE [dbo].[StringOnly]';`nSELECT 1;" }
+        @{ Name = 'go-inside-block-comment'; Sql = "/* first`nGO`nDROP TABLE [dbo].[CommentOnly];`n*/`nSELECT 1;" }
+        @{ Name = 'go-inside-nested-comment'; Sql = "/* outer /* nested`nGO`nDROP TABLE [dbo].[CommentOnly];`n*/ outer */`nSELECT 1;" }
+        @{ Name = 'go-inside-bracket-identifier'; Sql = "SELECT 1 AS [first`nGO`nDROP TABLE];" }
+        @{ Name = 'go-inside-quoted-identifier'; Sql = "SELECT 1 AS `"first`nGO`nDROP TABLE`";" }
+        @{ Name = 'go-after-line-comment-text'; Sql = "SELECT 1; -- GO`nSELECT 2;" }
+        @{ Name = 'line-comment-before-go-text'; Sql = "-- GO`nSELECT 1;" }
+        @{ Name = 'go-trailing-comment'; Sql = "SELECT 1;`nGO 1 -- supported trailing line comment`nSELECT 2;" }
     )) {
         $casePath = Join-Path $temporaryPath "$($case.Name).sql"
         Set-Content -Path $casePath -Value $case.Sql -Encoding utf8
@@ -712,6 +1320,52 @@ PRINT N'`$(NotAVariable)';
             -ScriptPath $casePath `
             -ReportPath (Join-Path $temporaryPath "$($case.Name).md")
     }
+    Assert-True `
+        -Condition (
+            (Get-Content -Path (Join-Path $temporaryPath 'go-trailing-comment.md') -Raw) -match
+                'GO-delimited batches: 2'
+        ) `
+        -Message 'A code-context GO count with a trailing line comment must split exactly two batches.'
+    $dacFxMultilinePath = Join-Path $temporaryPath 'dacfx-multiline.sql'
+    $dacFxMultilineReportPath = Join-Path $temporaryPath 'dacfx-multiline.md'
+    $dacFxMultilineScript = Get-TestDeploymentScript `
+        -DatabaseName 'DacFxFixture' `
+        -PostDeploymentSql @'
+PRINT N'DacFx can emit payload text across physical lines:
+GO
+DROP TABLE [dbo].[StringOnly];';
+SELECT 1 AS [StillCode];
+'@
+    Set-Content `
+        -Path $dacFxMultilinePath `
+        -Value ($dacFxMultilineScript.Replace("`n", "`r`n")) `
+        -Encoding utf8 `
+        -NoNewline
+    & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+        -ScriptPath $dacFxMultilinePath `
+        -ReportPath $dacFxMultilineReportPath
+    Assert-True `
+        -Condition (
+            (Get-Content -Path $dacFxMultilineReportPath -Raw) -match
+                '(?m)^- Errors: 0\r?$'
+        ) `
+        -Message 'A CRLF DacFx script must not split GO text inside a multiline string.'
+    $dacFxExecutableDropPath = Join-Path $temporaryPath 'dacfx-executable-drop.sql'
+    Set-Content `
+        -Path $dacFxExecutableDropPath `
+        -Value (
+            $dacFxMultilineScript.Replace(
+                "SELECT 1 AS [StillCode];",
+                "SELECT 1 AS [StillCode];`nGO`nDROP TABLE [dbo].[ExecutableDrop];"
+            ).Replace("`n", "`r`n")
+        ) `
+        -Encoding utf8 `
+        -NoNewline
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+            -ScriptPath $dacFxExecutableDropPath `
+            -ReportPath (Join-Path $temporaryPath 'dacfx-executable-drop.md')
+    } 'A real GO after a multiline DacFx payload must expose destructive SQL to policy checks.'
     $sqlCmdAndAlterPolicyCases = @(
         @{ Name = 'sqlcmd-direct-drop'; Sql = ":setvar ObjectType `"TABLE`"`nDROP `$(ObjectType) [dbo].[Danger];" },
         @{ Name = 'sqlcmd-dynamic-drop'; Sql = ":setvar Verb `"DROP`"`nEXEC(N'`$(Verb) TABLE [dbo].[Danger];');" },
