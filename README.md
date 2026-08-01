@@ -29,6 +29,7 @@ Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 
 - [프로젝트 계획 · 설계 초안](docs/프로젝트-계획-초안.md)
 - [개발 환경 구성 및 테스트](docs/환경-구성-및-테스트.md)
+- [Phase 4 의도적 실패 실습 랩](docs/실습-랩.md)
 - [Azure DevOps 설정](docs/Azure-DevOps-설정.md)
 - [SQL MI 배포 롤백 런북](docs/롤백-런북.md)
 
@@ -44,6 +45,7 @@ Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 - `database/App.Database`: Microsoft.Build.Sql 2.2 기반 Azure SQL 프로젝트
 - `database/instance`: DACPAC 밖에서 파일명 순서로 실행하는 멱등 SQL MI 인스턴스 오브젝트
 - `tests/integration`: 스키마·메타데이터·저장 프로시저 스모크 테스트
+- `labs`: Phase 4 의도적 실패 SQL, report, allowlist, AI 응답 fixture
 - `eng`: 빌드, 정책 검사, hosted container 테스트, SQL MI 검증, BACPAC 도구
 - `pipelines/profiles`: 연결 정보 없이 동일 안전 속성을 고정한 Dev/Test/Prod publish profile
 - `azure-pipelines.yml`: build-once/deploy-many Azure Pipelines
@@ -51,6 +53,7 @@ Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 - `eng/Invoke-AiDatabaseReview.ps1`: Azure OpenAI Responses API 기반 SQL 변경 리뷰
 - `eng/Test-AiDatabaseReview.ps1`: 네트워크 없는 AI 청크·병합·비밀 탐지 회귀
 - `eng/Test-DeploymentScript.ps1`: 생성된 배포 SQL의 파괴 DDL, 동적 DDL, rename 검사
+- `eng/Test-FailureLabs.ps1`: Lab B~D 오프라인 차단과 선택적 Lab A Docker 회귀
 - `eng/Deploy-Databases.ps1`: 카나리, 제한 병렬 fan-out, 실패 집계와 재시도 안전 배포
 - `eng/Deploy-InstanceObjects.ps1`: Entra token/SQLCMD 변수 기반 인스턴스 오브젝트 배포
 - `pipelines/drift-report.yml`: 매일 02:00 UTC 대표 DB에 읽기 전용 DeployReport 실행

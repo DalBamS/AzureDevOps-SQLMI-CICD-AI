@@ -1,0 +1,8 @@
+[
+  {
+    "rule": "DEPLOY001",
+    "pattern": "DROP\\s+TABLE\\s+\\[dbo\\]\\.\\[Phase4LabD\\]",
+    "ticket": "TRAINING-PHASE4-LABD-001",
+    "expiresOn": "2099-12-31"
+  }
+]
