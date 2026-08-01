@@ -76,7 +76,6 @@ $resolvedApprovedReportPath = (Resolve-Path $ApprovedReportPath).Path
 $approvedReviewPath = Split-Path -Parent $resolvedApprovedReportPath
 $approvedReportsDirectory = Join-Path $approvedReviewPath 'all-database-reports'
 $approvedScriptsDirectory = Join-Path $approvedReviewPath 'all-database-scripts'
-$approvedPolicyReportsDirectory = Join-Path $approvedReviewPath 'all-database-policy-reports'
 $metadataPath = Join-Path $approvedReviewPath 'target-databases.json'
 if (-not (Test-Path $metadataPath -PathType Leaf)) {
     throw "Approved deployment manifest is required: $metadataPath"

@@ -212,11 +212,12 @@ try {
     Assert-Equal $oldPathBoundaryReview.blockingFindings[0].file 'new.sql' 'Separator-like text in an old path must not capture the new path.'
     Assert-Equal $oldPathBoundaryReview.blockingFindings[0].line 32 'An unquoted old path must retain the new hunk line.'
 
+    $emojiPath = "docs/$([char]::ConvertFromUtf32(0x1F600)).md"
     $emojiDiff = Join-Path $temporaryPath 'emoji-path.diff'
     Set-Content -Path $emojiDiff -Encoding utf8 -Value @(
-        'diff --git "a/docs/old.md" "b/docs/😀.md"'
+        "diff --git `"a/docs/old.md`" `"b/$emojiPath`""
         '--- "a/docs/old.md"'
-        '+++ "b/docs/😀.md"'
+        "+++ `"b/$emojiPath`""
         '@@ -1 +22,1 @@'
         '+emoji'
     )
@@ -226,7 +227,7 @@ try {
         -ValidateOnlyResponsePath (Join-Path $fixtures 'ai-review-emoji-path.json') `
         -OutputPath $emojiOutput
     $emojiReview = Get-Content $emojiOutput -Raw | ConvertFrom-Json
-    Assert-Equal $emojiReview.blockingFindings[0].file 'docs/😀.md' 'A quoted non-BMP path must preserve its Unicode code point.'
+    Assert-Equal $emojiReview.blockingFindings[0].file $emojiPath 'A quoted non-BMP path must preserve its Unicode code point.'
     Assert-Equal $emojiReview.blockingFindings[0].line 22 'A quoted non-BMP path must retain its hunk line.'
     foreach ($invalidDiff in @(
         @{

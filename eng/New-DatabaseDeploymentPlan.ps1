@@ -96,7 +96,7 @@ function Invoke-SqlPackageAction {
     }
 }
 
-function New-ManifestArtifact {
+function ConvertTo-ManifestArtifact {
     param(
         [Parameter(Mandatory)][string]$Kind,
         [AllowEmptyString()][string]$Database,
@@ -223,20 +223,20 @@ if ($DatabasePlanDriftPolicy -eq 'Fail' -and $drifted.Count -gt 0) {
 }
 
 $manifestArtifacts = [System.Collections.Generic.List[object]]::new()
-$manifestArtifacts.Add((New-ManifestArtifact -Kind 'representativeReport' -Database $representative -Path $approvedReportPath))
-$manifestArtifacts.Add((New-ManifestArtifact -Kind 'representativeScript' -Database $representative -Path $scriptPath))
-$manifestArtifacts.Add((New-ManifestArtifact -Kind 'representativePolicy' -Database $representative -Path $policyReportPath))
+$manifestArtifacts.Add((ConvertTo-ManifestArtifact -Kind 'representativeReport' -Database $representative -Path $approvedReportPath))
+$manifestArtifacts.Add((ConvertTo-ManifestArtifact -Kind 'representativeScript' -Database $representative -Path $scriptPath))
+$manifestArtifacts.Add((ConvertTo-ManifestArtifact -Kind 'representativePolicy' -Database $representative -Path $policyReportPath))
 if ($ValidateAllDatabasePlans) {
     foreach ($database in $targets) {
-        $manifestArtifacts.Add((New-ManifestArtifact `
+        $manifestArtifacts.Add((ConvertTo-ManifestArtifact `
             -Kind 'databaseReport' `
             -Database $database `
             -Path (Join-Path $allReportsPath "$database.deploy-report.xml")))
-        $manifestArtifacts.Add((New-ManifestArtifact `
+        $manifestArtifacts.Add((ConvertTo-ManifestArtifact `
             -Kind 'databaseScript' `
             -Database $database `
             -Path (Join-Path $allScriptsPath "$database.deploy.sql")))
-        $manifestArtifacts.Add((New-ManifestArtifact `
+        $manifestArtifacts.Add((ConvertTo-ManifestArtifact `
             -Kind 'databasePolicy' `
             -Database $database `
             -Path (Join-Path $allPolicyReportsPath "$database.deployment-script-policy.md")))
