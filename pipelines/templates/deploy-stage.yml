@@ -1,0 +1,209 @@
+parameters:
+  - name: stageName
+    type: string
+  - name: displayName
+    type: string
+  - name: environmentName
+    type: string
+  - name: variableGroup
+    type: string
+  - name: agentPool
+    type: string
+  - name: azureServiceConnection
+    type: string
+  - name: enabled
+    type: boolean
+  - name: dependsOn
+    type: string
+
+stages:
+  - stage: Plan${{ parameters.stageName }}
+    displayName: Plan ${{ parameters.displayName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: |
+      and(
+        in(dependencies.${{ parameters.dependsOn }}.result, 'Succeeded', 'SucceededWithIssues'),
+        eq('${{ parameters.enabled }}', 'True')
+      )
+    variables:
+      - group: ${{ parameters.variableGroup }}
+    jobs:
+      - job: GeneratePlan
+        displayName: Generate deployment review artifacts
+        pool:
+          name: ${{ parameters.agentPool }}
+        steps:
+          - download: current
+            artifact: database
+
+          - task: UseDotNet@2
+            displayName: Use .NET 10 SDK
+            inputs:
+              packageType: sdk
+              version: 10.x
+
+          - pwsh: |
+              $toolPath = Join-Path "$(Agent.TempDirectory)" "sqlpackage"
+              dotnet tool install `
+                --tool-path $toolPath `
+                Microsoft.SqlPackage `
+                --version "$(sqlPackageVersion)" `
+                --allow-roll-forward
+              if ($LASTEXITCODE -ne 0) {
+                throw "SqlPackage installation failed."
+              }
+            displayName: Install pinned SqlPackage
+
+          - task: AzureCLI@2
+            displayName: Generate deployment script and report
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                $ErrorActionPreference = "Stop"
+                $sqlPackage = Join-Path "$(Agent.TempDirectory)" "sqlpackage/sqlpackage"
+                if ($IsWindows) {
+                  $sqlPackage += ".exe"
+                }
+
+                $token = (az account get-access-token `
+                  --resource "https://database.windows.net/" `
+                  --query accessToken `
+                  --output tsv).Trim()
+                if (-not $token) {
+                  throw "Unable to acquire an Azure SQL access token."
+                }
+
+                $reviewPath = Join-Path "$(Pipeline.Workspace)" "deployment-review/${{ parameters.environmentName }}"
+                New-Item -ItemType Directory -Force -Path $reviewPath | Out-Null
+                $dacpac = "$(Pipeline.Workspace)/database/App.Database.dacpac"
+                $connection = "Server=tcp:$(sqlServer),$(sqlPort);Initial Catalog=$(databaseName);Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+
+                & $sqlPackage `
+                  /Action:Script `
+                  "/SourceFile:$dacpac" `
+                  "/TargetConnectionString:$connection" `
+                  "/AccessToken:$token" `
+                  "/OutputPath:$reviewPath/deploy.sql" `
+                  /p:BlockOnPossibleDataLoss=True `
+                  /p:DropObjectsNotInSource=False `
+                  /p:ScriptDatabaseOptions=False
+                if ($LASTEXITCODE -ne 0) {
+                  throw "Deployment script generation failed."
+                }
+
+                & $sqlPackage `
+                  /Action:DeployReport `
+                  "/SourceFile:$dacpac" `
+                  "/TargetConnectionString:$connection" `
+                  "/AccessToken:$token" `
+                  "/OutputPath:$reviewPath/deploy-report.xml" `
+                  /p:BlockOnPossibleDataLoss=True `
+                  /p:DropObjectsNotInSource=False `
+                  /p:ScriptDatabaseOptions=False
+                if ($LASTEXITCODE -ne 0) {
+                  throw "Deployment report generation failed."
+                }
+
+          - publish: $(Pipeline.Workspace)/deployment-review/${{ parameters.environmentName }}
+            artifact: deployment-review-${{ parameters.environmentName }}
+            displayName: Publish deployment review artifacts
+
+  - stage: Deploy${{ parameters.stageName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: Plan${{ parameters.stageName }}
+    condition: succeeded()
+    lockBehavior: sequential
+    variables:
+      - group: ${{ parameters.variableGroup }}
+    jobs:
+      - deployment: DeployDacpac
+        displayName: Publish approved DACPAC
+        environment: ${{ parameters.environmentName }}
+        pool:
+          name: ${{ parameters.agentPool }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - download: current
+                  artifact: database
+
+                - download: current
+                  artifact: deployment-review-${{ parameters.environmentName }}
+
+                - task: UseDotNet@2
+                  displayName: Use .NET 10 SDK
+                  inputs:
+                    packageType: sdk
+                    version: 10.x
+
+                - pwsh: |
+                    $toolPath = Join-Path "$(Agent.TempDirectory)" "sqlpackage"
+                    dotnet tool install `
+                      --tool-path $toolPath `
+                      Microsoft.SqlPackage `
+                      --version "$(sqlPackageVersion)" `
+                      --allow-roll-forward
+                    if ($LASTEXITCODE -ne 0) {
+                      throw "SqlPackage installation failed."
+                    }
+                  displayName: Install pinned SqlPackage
+
+                - task: AzureCLI@2
+                  displayName: Deploy approved DACPAC
+                  inputs:
+                    azureSubscription: ${{ parameters.azureServiceConnection }}
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      $ErrorActionPreference = "Stop"
+                      $sqlPackage = Join-Path "$(Agent.TempDirectory)" "sqlpackage/sqlpackage"
+                      if ($IsWindows) {
+                        $sqlPackage += ".exe"
+                      }
+
+                      $token = (az account get-access-token `
+                        --resource "https://database.windows.net/" `
+                        --query accessToken `
+                        --output tsv).Trim()
+                      if (-not $token) {
+                        throw "Unable to acquire an Azure SQL access token."
+                      }
+
+                      $dacpac = "$(Pipeline.Workspace)/database/App.Database.dacpac"
+                      $connection = "Server=tcp:$(sqlServer),$(sqlPort);Initial Catalog=$(databaseName);Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+                      $approvedReport = "$(Pipeline.Workspace)/deployment-review-${{ parameters.environmentName }}/deploy-report.xml"
+                      $currentReport = "$(Agent.TempDirectory)/current-deploy-report.xml"
+
+                      & $sqlPackage `
+                        /Action:DeployReport `
+                        "/SourceFile:$dacpac" `
+                        "/TargetConnectionString:$connection" `
+                        "/AccessToken:$token" `
+                        "/OutputPath:$currentReport" `
+                        /p:BlockOnPossibleDataLoss=True `
+                        /p:DropObjectsNotInSource=False `
+                        /p:ScriptDatabaseOptions=False
+                      if ($LASTEXITCODE -ne 0) {
+                        throw "Current deployment report generation failed."
+                      }
+
+                      ./eng/Confirm-DeploymentPlan.ps1 `
+                        -ApprovedReportPath $approvedReport `
+                        -CurrentReportPath $currentReport
+
+                      & $sqlPackage `
+                        /Action:Publish `
+                        "/SourceFile:$dacpac" `
+                        "/TargetConnectionString:$connection" `
+                        "/AccessToken:$token" `
+                        /p:BlockOnPossibleDataLoss=True `
+                        /p:DropObjectsNotInSource=False `
+                        /p:ScriptDatabaseOptions=False
+                      if ($LASTEXITCODE -ne 0) {
+                        throw "DACPAC deployment failed."
+                      }
