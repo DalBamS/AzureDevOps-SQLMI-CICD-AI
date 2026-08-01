@@ -6,7 +6,6 @@ param(
     [ValidateRange(1, 65535)]
     [int]$Port = 1433,
     [Parameter(Mandatory)]
-    [ValidatePattern('^[A-Za-z0-9_]+$')]
     [string]$DatabaseName,
     [Parameter(Mandatory)]
     [string]$AccessToken,
@@ -25,6 +24,16 @@ if (-not (Test-Path $TestPath -PathType Container)) {
 }
 if (-not (Get-Command Invoke-Sqlcmd -ErrorAction SilentlyContinue)) {
     throw 'The pinned SqlServer PowerShell module is required to test the deployed database.'
+}
+
+if ($DatabaseName.StartsWith('[') -or $DatabaseName.EndsWith(']')) {
+    if ($DatabaseName -notmatch '^\[(?<name>(?:[A-Za-z0-9_-]|\]\])+)\]$') {
+        throw 'Bracketed DatabaseName must contain only letters, numbers, underscores, hyphens, or escaped closing brackets.'
+    }
+    $DatabaseName = $Matches.name.Replace(']]', ']')
+}
+elseif ($DatabaseName -notmatch '^[A-Za-z0-9_-]+$') {
+    throw 'DatabaseName must contain only letters, numbers, underscores, or hyphens.'
 }
 
 $tests = @(

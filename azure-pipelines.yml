@@ -33,6 +33,10 @@ parameters:
     displayName: SQL MI private agent pool
     type: string
     default: sqlmi-private-agents
+  - name: sqlCommandTimeout
+    displayName: SqlPackage command timeout in seconds
+    type: number
+    default: 3600
   - name: azureServiceConnection
     displayName: Azure workload identity service connection
     type: string
@@ -172,6 +176,8 @@ stages:
       variableGroup: sqlmi-dev
       agentPool: ${{ parameters.privateAgentPool }}
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      publishProfile: pipelines/profiles/sqlmi-dev.publish.xml
+      sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}
@@ -186,6 +192,8 @@ stages:
       variableGroup: sqlmi-test
       agentPool: ${{ parameters.privateAgentPool }}
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      publishProfile: pipelines/profiles/sqlmi-test.publish.xml
+      sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}
@@ -200,6 +208,8 @@ stages:
       variableGroup: sqlmi-prod
       agentPool: ${{ parameters.privateAgentPool }}
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      publishProfile: pipelines/profiles/sqlmi-prod.publish.xml
+      sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}

@@ -26,8 +26,9 @@ SQL MI 시스템 ID에는 Entra principal 조회를 위해 Microsoft Graph의 `U
 
 ## 1. 사전 준비
 
-1. SQL MI와 통신 가능한 서브넷에 self-hosted Azure Pipelines agent를 배치합니다.
-2. 에이전트에서 SQL MI의 FQDN과 포트로 DNS/네트워크 연결을 확인합니다.
+1. SQL MI와 통신 가능한 VNet에 self-hosted Azure Pipelines agent를 배치합니다.
+2. 같은 VNet에서는 SQL MI의 VNet-local endpoint, 다른 VNet에서는 private endpoint,
+   peering 또는 VPN 경로의 FQDN과 포트로 DNS/네트워크 연결을 확인합니다.
 3. Azure Resource Manager 서비스 연결을 Workload Identity Federation 방식으로 생성합니다.
 4. 서비스 연결의 Entra 주체를 각 대상 데이터베이스에 사용자로 생성하고 최소 권한을 부여합니다.
 
@@ -90,7 +91,7 @@ Library의 variable group은 다음 Demo 대상으로 구성합니다.
 5. Test 승인 후 Stg DB를 배포하고 동일 테스트를 실행합니다.
 6. Prod 승인 후 Live DB를 배포하고 동일 테스트를 실행합니다.
 
-각 환경은 동일한 `database` DACPAC artifact를 사용합니다. 이전 환경이 실패하거나 승인되지 않으면 후속 환경으로 진행하지 않습니다.
+각 환경은 동일한 `database` DACPAC artifact를 사용합니다. 이전 환경이 실패하거나 승인되지 않으면 후속 환경으로 진행하지 않습니다. 실행 시 `sqlCommandTimeout` parameter를 생략하면 명시된 3600초를 사용합니다. 서비스 기본값에는 의존하지 않습니다.
 
 Demo 데이터베이스 최초 구성:
 
@@ -131,14 +132,44 @@ Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제
 
 - `deploy.sql`: 실제 실행 예정 SQL
 - `deploy-report.xml`: DacFx 변경 계획
+- `deployment-script-policy.md`: 결정론적 위험 DDL 검사와 allowlist 결과
+
+각 환경은 `pipelines/profiles/sqlmi-<environment>.publish.xml`을 사용합니다. 세 profile의
+내용은 완전히 동일하며 연결 정보는 포함하지 않습니다. `Script`, `DeployReport`,
+승인 직전 재생성 `DeployReport`, `Publish`는 같은 환경 profile과 같은 timeout override를
+사용해야 하므로 계획과 실행의 옵션 차이를 허용하지 않습니다.
 
 공통 게시 옵션:
 
 ```text
 BlockOnPossibleDataLoss=True
+CommandTimeout=3600
 DropObjectsNotInSource=False
+ExcludeObjectTypes=Users;Logins;Permissions;RoleMembership;ServerRoleMembership
 ScriptDatabaseOptions=False
 ```
+
+SqlPackage의 `CommandTimeout` 기본값은 60초이므로 장기 실행 MI DDL에서 우발적인
+timeout이 발생할 수 있습니다. profile은 3600초를 고정하고 파이프라인 parameter
+`sqlCommandTimeout`을 `sqlCommandTimeout` 환경 변수로 전달해 네 작업에 동일하게
+override합니다. 연결 정보와 `Connection Timeout=30`은 계속 variable group/실행
+연결 문자열에서 관리합니다.
+
+공식 SqlPackage의 유효 오브젝트 명칭을 사용해 사용자, 로그인, 권한, database/server
+role membership을 배포 비교에서 제외합니다. 이 보안 오브젝트는 DACPAC이 아니라 별도
+승인된 보안 IaC 또는 DBA runbook으로 만들고 회수하며, 변경 티켓과 감사를 남깁니다.
+`AllowIncompatiblePlatform`은 설정하지 않습니다.
+
+- [SqlPackage Script properties](https://learn.microsoft.com/sql/tools/sqlpackage/sqlpackage-script)
+- [SqlPackage DeployReport properties](https://learn.microsoft.com/sql/tools/sqlpackage/sqlpackage-deploy-drift-report)
+- [SqlPackage Publish properties](https://learn.microsoft.com/sql/tools/sqlpackage/sqlpackage-publish)
+
+`eng/Test-DeploymentScript.ps1`은 `deploy.sql`을 GO batch로 나누고 파괴 DDL,
+축소 가능 `ALTER COLUMN`, `sp_rename`, `sp_executesql` 동적 DDL, `SET NOEXEC` 조작을
+결정론적으로 검사합니다. 오류는 Plan stage를 즉시 실패시키며 경고는 보고서에 남습니다.
+예외는 `eng/policy/deploy-allowlist.json`의 `rule`, `pattern`, `ticket`, `expiresOn`
+네 필드가 모두 필요하고 만료된 항목은 자동 무효입니다. AI 검토는 이 게이트 이후의
+advisory 단계입니다.
 
 승인자는 대기 중인 `Deploy*` stage를 승인하기 전에 완료된 `Plan*` stage의 artifact를 검토합니다. 초기 도입 기간에는 Dev 자동 배포만 허용하고 Test/Prod에서 `deploy.sql`을 DBA가 승인하도록 운영합니다. `DropObjectsNotInSource=False`로 인해 제거가 자동 반영되지 않으므로, 승인된 제거는 별도 expand/contract 절차와 명시적 스크립트로 처리합니다.
 
@@ -198,4 +229,9 @@ string을 포함하지 않으며, 승인된 Azure OpenAI 리소스만 사용합�
 - Azure DevOps artifact retention을 감사 기간에 맞게 설정합니다.
 - SQL MI의 감사 로그와 Azure DevOps deployment record를 동일 변경 티켓으로 연결합니다.
 - 운영 DB의 수동 DDL을 금지하고 정기적으로 DACPAC drift report를 생성합니다.
+- SQL MI update policy와 `.sqlproj`의 `Sql170` DSP가 SQL Server 2025 기준으로 일치하는지
+  확인합니다. SQL Server 2022 policy는 SQL Server 2022 mainstream support 종료일인
+  2028-01-11까지만 제공되므로 그 전에 전환 계획을 승인합니다.
+- 대상 database collation은 `ModelCollation`과 별개이며 profile의
+  `ScriptDatabaseOptions=False`로 변경되지 않으므로 환경 생성 및 배포 전 별도 검사합니다.
 - 실패 시 동일 DACPAC 재시도 또는 사전 승인된 롤백 스크립트를 사용합니다. BACPAC import를 일반적인 롤백 수단으로 사용하지 않습니다.

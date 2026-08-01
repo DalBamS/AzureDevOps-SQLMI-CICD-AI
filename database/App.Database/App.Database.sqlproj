@@ -7,7 +7,8 @@
     <DacApplicationName>App.Database</DacApplicationName>
     <DacDescription>Reference Azure SQL Managed Instance database project.</DacDescription>
     <DacVersion Condition="'$(DacVersion)' == ''">1.0.0.0</DacVersion>
-    <DSP>Microsoft.Data.Tools.Schema.Sql.Sql160DatabaseSchemaProvider</DSP>
+    <DSP>Microsoft.Data.Tools.Schema.Sql.Sql170DatabaseSchemaProvider</DSP>
+    <!-- ModelCollation controls model comparison only; verify the target database collation separately. -->
     <ModelCollation>1033, CI</ModelCollation>
     <DefaultSchema>dbo</DefaultSchema>
     <RunSqlCodeAnalysis>true</RunSqlCodeAnalysis>

@@ -11,6 +11,11 @@ parameters:
     type: string
   - name: azureServiceConnection
     type: string
+  - name: publishProfile
+    type: string
+  - name: sqlCommandTimeout
+    type: number
+    default: 3600
   - name: enableAiReview
     type: boolean
   - name: aiEndpoint
@@ -86,7 +91,15 @@ stages:
                 $reviewPath = Join-Path "$(Pipeline.Workspace)" "deployment-review/${{ parameters.environmentName }}"
                 New-Item -ItemType Directory -Force -Path $reviewPath | Out-Null
                 $dacpac = "$(Pipeline.Workspace)/database/App.Database.dacpac"
+                $publishProfile = Join-Path "$(Build.SourcesDirectory)" "${{ parameters.publishProfile }}"
                 $connection = "Server=tcp:$(sqlServer),$(sqlPort);Initial Catalog=$(databaseName);Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+                $commandTimeout = 0
+                if (-not [int]::TryParse($env:sqlCommandTimeout, [ref]$commandTimeout) -or $commandTimeout -lt 1) {
+                  throw "sqlCommandTimeout must be a positive integer."
+                }
+                if (-not (Test-Path $publishProfile -PathType Leaf)) {
+                  throw "Publish profile not found: $publishProfile"
+                }
 
                 & $sqlPackage `
                   /Action:Script `
@@ -94,12 +107,15 @@ stages:
                   "/TargetConnectionString:$connection" `
                   "/AccessToken:$token" `
                   "/OutputPath:$reviewPath/deploy.sql" `
-                  /p:BlockOnPossibleDataLoss=True `
-                  /p:DropObjectsNotInSource=False `
-                  /p:ScriptDatabaseOptions=False
+                  "/Profile:$publishProfile" `
+                  "/p:CommandTimeout=$commandTimeout"
                 if ($LASTEXITCODE -ne 0) {
                   throw "Deployment script generation failed."
                 }
+
+                ./eng/Test-DeploymentScript.ps1 `
+                  -ScriptPath "$reviewPath/deploy.sql" `
+                  -ReportPath "$reviewPath/deployment-script-policy.md"
 
                 & $sqlPackage `
                   /Action:DeployReport `
@@ -107,12 +123,13 @@ stages:
                   "/TargetConnectionString:$connection" `
                   "/AccessToken:$token" `
                   "/OutputPath:$reviewPath/deploy-report.xml" `
-                  /p:BlockOnPossibleDataLoss=True `
-                  /p:DropObjectsNotInSource=False `
-                  /p:ScriptDatabaseOptions=False
+                  "/Profile:$publishProfile" `
+                  "/p:CommandTimeout=$commandTimeout"
                 if ($LASTEXITCODE -ne 0) {
                   throw "Deployment report generation failed."
                 }
+            env:
+              sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
 
           - task: AzureCLI@2
             displayName: Run advisory AI review of deployment SQL
@@ -134,6 +151,7 @@ stages:
           - publish: $(Pipeline.Workspace)/deployment-review/${{ parameters.environmentName }}
             artifact: deployment-review-${{ parameters.environmentName }}
             displayName: Publish deployment review artifacts
+            condition: succeededOrFailed()
 
   - stage: Deploy${{ parameters.stageName }}
     displayName: ${{ parameters.displayName }}
@@ -216,9 +234,17 @@ stages:
                       }
 
                       $dacpac = "$(Pipeline.Workspace)/database/App.Database.dacpac"
+                      $publishProfile = Join-Path "$(Build.SourcesDirectory)" "${{ parameters.publishProfile }}"
                       $connection = "Server=tcp:$(sqlServer),$(sqlPort);Initial Catalog=$(databaseName);Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
                       $approvedReport = "$(Pipeline.Workspace)/deployment-review-${{ parameters.environmentName }}/deploy-report.xml"
                       $currentReport = "$(Agent.TempDirectory)/current-deploy-report.xml"
+                      $commandTimeout = 0
+                      if (-not [int]::TryParse($env:sqlCommandTimeout, [ref]$commandTimeout) -or $commandTimeout -lt 1) {
+                        throw "sqlCommandTimeout must be a positive integer."
+                      }
+                      if (-not (Test-Path $publishProfile -PathType Leaf)) {
+                        throw "Publish profile not found: $publishProfile"
+                      }
 
                       & $sqlPackage `
                         /Action:DeployReport `
@@ -226,9 +252,8 @@ stages:
                         "/TargetConnectionString:$connection" `
                         "/AccessToken:$token" `
                         "/OutputPath:$currentReport" `
-                        /p:BlockOnPossibleDataLoss=True `
-                        /p:DropObjectsNotInSource=False `
-                        /p:ScriptDatabaseOptions=False
+                        "/Profile:$publishProfile" `
+                        "/p:CommandTimeout=$commandTimeout"
                       if ($LASTEXITCODE -ne 0) {
                         throw "Current deployment report generation failed."
                       }
@@ -242,9 +267,8 @@ stages:
                         "/SourceFile:$dacpac" `
                         "/TargetConnectionString:$connection" `
                         "/AccessToken:$token" `
-                        /p:BlockOnPossibleDataLoss=True `
-                        /p:DropObjectsNotInSource=False `
-                        /p:ScriptDatabaseOptions=False
+                        "/Profile:$publishProfile" `
+                        "/p:CommandTimeout=$commandTimeout"
                       if ($LASTEXITCODE -ne 0) {
                         throw "DACPAC deployment failed."
                       }
@@ -254,3 +278,5 @@ stages:
                         -Port "$(sqlPort)" `
                         -DatabaseName "$(databaseName)" `
                         -AccessToken $token
+                  env:
+                    sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
