@@ -1,5 +1,22 @@
 # Azure DevOps 설정 가이드
 
+## 현재 데모 구성
+
+| 항목 | 구성 값 |
+|---|---|
+| Azure DevOps | `https://dev.azure.com/eusondevops/AzureSQLMI_CICD` |
+| GitHub | `DalBamS/AzureDevOps-SQLMI-CICD-AI` |
+| Pipeline | `Azure SQL MI CI-CD` |
+| Azure 연결 | `sc-sqlmi-wif` (Microsoft Entra issuer 기반 Workload Identity Federation) |
+| 관리 ID | `id-ado-sqlmi-cicd` |
+| Dev SQL MI | `mieuson20260630`, public endpoint `3342` |
+| Dev DB | `AppDb_CicdDemo` |
+| Agent pool | `sqlmi-private-agents` |
+
+Dev 환경은 실제 DACPAC 배포까지 검증했습니다. `sqlmi-test`와 `sqlmi-prod` variable group은 `CONFIGURE_BEFORE_USE` placeholder이므로 실제 대상이 확정되기 전에는 배포하지 않습니다.
+
+현재 self-hosted agent는 이 개발 PC에서 실행하는 데모용입니다. 운영 전에는 SQL MI VNet 내부의 전용 VM 또는 Managed DevOps Pool로 교체하십시오.
+
 ## 1. 사전 준비
 
 1. SQL MI와 통신 가능한 서브넷에 self-hosted Azure Pipelines agent를 배치합니다.
@@ -7,7 +24,7 @@
 3. Azure Resource Manager 서비스 연결을 Workload Identity Federation 방식으로 생성합니다.
 4. 서비스 연결의 Entra 주체를 각 대상 데이터베이스에 사용자로 생성하고 최소 권한을 부여합니다.
 
-예시 권한은 초기 구축용 기준입니다. 조직의 권한 분리 정책에 따라 사용자 지정 database role로 축소하십시오.
+예시 권한은 초기 구축용 기준입니다. 조직의 권한 분리 정책에 따라 사용자 지정 database role로 축소하십시오. 현재 Dev DB에서는 `id-ado-sqlmi-cicd` 관리 ID에 동일 역할을 부여했습니다.
 
 ```sql
 CREATE USER [ado-sqlmi-deployer] FROM EXTERNAL PROVIDER;
@@ -40,7 +57,7 @@ GRANT VIEW DEFINITION TO [ado-sqlmi-deployer];
 | `sqlmi-prod` | DBA + 서비스 책임자 승인, 업무 시간/변경 티켓 검사 |
 
 승인은 YAML에 두지 않고 Environment의 **Approvals and checks**에서 관리해야 파이프라인 변경으로 우회하기 어렵습니다.
-각 Environment에 **Exclusive lock** 검사도 추가합니다. YAML의 `lockBehavior: sequential`과 함께 동시 배포를 직렬화합니다.
+Test와 Prod에는 수동 Approval check가 구성되어 있습니다. 운영 전 각 Environment에 **Exclusive lock** 검사도 추가합니다. YAML의 `lockBehavior: sequential`과 함께 동시 배포를 직렬화합니다.
 
 ## 4. Variable group
 
@@ -66,7 +83,7 @@ Library에 `sqlmi-dev`, `sqlmi-test`, `sqlmi-prod` variable group을 생성합�
 
 각 환경은 동일한 `database` DACPAC artifact를 사용합니다. 이전 환경이 실패하거나 승인되지 않으면 후속 환경으로 진행하지 않습니다.
 
-Azure Repos의 PR 검증은 YAML의 `pr` 선언만으로 강제되지 않으므로, `main` 브랜치의 **Build validation** 정책에 이 파이프라인을 Required로 연결합니다.
+Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제되지 않으므로 `main` 브랜치의 **Build validation** 정책에 이 파이프라인을 Required로 연결합니다. 현재 구성은 GitHub 저장소를 사용하므로 GitHub branch protection에서 Azure Pipelines 상태 검사를 Required로 설정합니다.
 
 ## 6. 배포 안전장치
 
