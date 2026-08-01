@@ -116,6 +116,60 @@ try {
     }
 
     foreach ($case in @(
+        @{ Name = 'compact-comment'; Line = 'GO--comment'; ExpectedBatches = 2 },
+        @{ Name = 'compact-count-comment'; Line = 'GO 1--comment'; ExpectedBatches = 2 },
+        @{ Name = 'compact-leading-zero-comment'; Line = 'GO 01--comment'; ExpectedBatches = 2 },
+        @{ Name = 'whitespace-compact-comment'; Line = "`t gO`t1--comment"; ExpectedBatches = 2 },
+        @{ Name = 'attached-count'; Line = 'GO0'; ExpectedBatches = 1 },
+        @{ Name = 'attached-decimal'; Line = 'GO.1'; ExpectedBatches = 1 }
+    )) {
+        $batchParser = [Microsoft.SqlTools.ServiceLayer.BatchParser.BatchParserWrapper]::new()
+        try {
+            $conditions = [Microsoft.SqlTools.ServiceLayer.BatchParser.ExecutionEngineCode.ExecutionEngineConditions]::new()
+            $conditions.IsSqlCmd = $true
+            $conditions.BatchSeparator = 'GO'
+            $parsedBatches = @(
+                $batchParser.GetBatches(
+                    "SELECT 1;`n$($case.Line)`nSELECT 2;",
+                    $conditions
+                )
+            )
+            if ($parsedBatches.Count -ne $case.ExpectedBatches) {
+                throw "Managed parser returned unexpected metadata for GO grammar case '$($case.Name)'."
+            }
+        }
+        finally {
+            $batchParser.Dispose()
+        }
+    }
+    foreach ($case in @(
+        @{ Name = 'compact-block-comment'; Line = 'GO/**/' },
+        @{ Name = 'compact-count-block-comment'; Line = 'GO 1/**/' },
+        @{ Name = 'negative-count'; Line = 'GO-1' }
+    )) {
+        $batchParser = [Microsoft.SqlTools.ServiceLayer.BatchParser.BatchParserWrapper]::new()
+        $grammarRejected = $false
+        try {
+            $conditions = [Microsoft.SqlTools.ServiceLayer.BatchParser.ExecutionEngineCode.ExecutionEngineConditions]::new()
+            $conditions.IsSqlCmd = $true
+            $conditions.BatchSeparator = 'GO'
+            [void]$batchParser.GetBatches(
+                "SELECT 1;`n$($case.Line)`nSELECT 2;",
+                $conditions
+            )
+        }
+        catch {
+            $grammarRejected = $true
+        }
+        finally {
+            $batchParser.Dispose()
+        }
+        if (-not $grammarRejected) {
+            throw "Managed parser unexpectedly accepted GO grammar case '$($case.Name)'."
+        }
+    }
+
+    foreach ($case in @(
         @{ Count = '0'; ExpectedExecutionCount = 1 },
         @{ Count = '01'; ExpectedExecutionCount = 1 },
         @{ Count = '2147483647'; ExpectedExecutionCount = 2147483647 }
@@ -180,17 +234,17 @@ try {
     $goProbeRows = @(
         Invoke-Sqlcmd @goProbeArguments -Query @"
 CREATE TABLE [tempdb].[dbo].[$goProbeTable] ([Label] nvarchar(40) NOT NULL);
-GO
+GO-- compact trailing comment
 INSERT [tempdb].[dbo].[$goProbeTable] VALUES (N'before-zero');
-GO 0
+GO 0-- compact zero-count comment
 INSERT [tempdb].[dbo].[$goProbeTable] VALUES (N'after-zero');
 GO
 INSERT [tempdb].[dbo].[$goProbeTable] VALUES (N'before-double-zero');
-GO 00
+GO 00-- compact leading-zero comment
 INSERT [tempdb].[dbo].[$goProbeTable] VALUES (N'after-double-zero');
-`t gO`t01 `t-- managed parser trailing comment
+`t gO`t01-- compact mixed-whitespace comment
 INSERT [tempdb].[dbo].[$goProbeTable] VALUES (N'after-leading-zero');
-GO
+GO -- spaced trailing comment
 SELECT [Label] FROM [tempdb].[dbo].[$goProbeTable] ORDER BY [Label];
 "@
     )

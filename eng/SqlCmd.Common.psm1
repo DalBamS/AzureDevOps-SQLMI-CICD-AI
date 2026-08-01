@@ -813,7 +813,7 @@ function Get-SqlBatch {
             $state -eq 'Code' -and
             [regex]::IsMatch(
                 $line,
-                '^[\t ]*GO(?=$|[\t ])',
+                '^[\t ]*GO(?=$|[\t ]|--|/\*|[-+])',
                 [Text.RegularExpressions.RegexOptions]::IgnoreCase
             )
         )
@@ -829,7 +829,7 @@ function Get-SqlBatch {
                 )
             }
         }
-        $isGoSeparator = $isGoCandidate
+        $isGoSeparator = $state -eq 'Code' -and $goMatch.Success
         if ($isGoSeparator) {
             if (($batchLines -join "`n").Trim().Length -gt 0) {
                 $batches.Add([pscustomobject]@{
@@ -1176,7 +1176,8 @@ function Test-SqlInstanceStatementSequence {
         [Parameter(Mandatory)][string]$Text,
         [Parameter(Mandatory)][object[]]$Tokens,
         [Parameter(Mandatory)][ref]$Cursor,
-        [switch]$StopAtEnd
+        [switch]$StopAtEnd,
+        [switch]$GuardBody
     )
 
     $supportedProcedures = @(
@@ -1186,6 +1187,7 @@ function Test-SqlInstanceStatementSequence {
         'sp_update_jobstep',
         'sp_add_jobserver'
     )
+    $statementCount = 0
     while ($Cursor.Value -lt $Tokens.Count) {
         while (
             $Cursor.Value -lt $Tokens.Count -and
@@ -1204,9 +1206,12 @@ function Test-SqlInstanceStatementSequence {
                 return $false
             }
             $Cursor.Value++
-            return $true
+            return -not $GuardBody -or $statementCount -gt 0
         }
         if ($startValue -eq 'IF') {
+            if ($GuardBody) {
+                return $false
+            }
             $cursorIndex = $start + 1
             if (
                 $cursorIndex -lt $Tokens.Count -and
@@ -1267,7 +1272,8 @@ function Test-SqlInstanceStatementSequence {
                         -Text $Text `
                         -Tokens $Tokens `
                         -Cursor $Cursor `
-                        -StopAtEnd
+                        -StopAtEnd `
+                        -GuardBody
                 )
             ) {
                 return $false
@@ -1290,13 +1296,17 @@ function Test-SqlInstanceStatementSequence {
                             -Text $Text `
                             -Tokens $Tokens `
                             -Cursor $Cursor `
-                            -StopAtEnd
+                            -StopAtEnd `
+                            -GuardBody
                     )
                 ) {
                     return $false
                 }
             }
             continue
+        }
+        if ($GuardBody -and $startValue -notin @('CREATE', 'EXEC', 'EXECUTE')) {
+            return $false
         }
 
         $end = $start
@@ -1336,48 +1346,16 @@ function Test-SqlInstanceStatementSequence {
                         'DECLARE|@JOBNAME|SYSNAME|=|N|<STRING>|;',
                         'DECLARE|@OWNERLOGINNAME|SYSNAME|=|N|<STRING>|;',
                         'DECLARE|@STEPNAME|SYSNAME|=|N|<STRING>|;',
-                        'DECLARE|@LOCALSERVERNAME|SYSNAME|=|N|<STRING>|;',
-                        'DECLARE|@JOBID|UNIQUEIDENTIFIER|;',
-                        'DECLARE|@STEPID|INT|;'
+                        'DECLARE|@LOCALSERVERNAME|SYSNAME|=|N|<STRING>|;'
                     )
                 ) {
                     return $false
                 }
             }
-            'SELECT' {
-                $assignedVariables = @(
-                    for ($index = 1; $index + 1 -lt $statementTokens.Count; $index++) {
-                        if (
-                            $statementTokens[$index].Kind -eq 'Word' -and
-                            $statementTokens[$index].Value.StartsWith('@') -and
-                            $statementTokens[$index + 1].Kind -eq 'Symbol' -and
-                            $statementTokens[$index + 1].Value -eq '='
-                        ) {
-                            $statementTokens[$index].Value
-                        }
-                    }
-                )
-                if (
-                    @(
-                        $assignedVariables |
-                            Where-Object { $_ -notin @('@JOBID', '@STEPID') }
-                    ).Count -gt 0
-                ) {
-                    return $false
-                }
-                if (-not (Test-SqlReadOnlySelectTokenStream -Tokens $statementTokens)) {
-                    return $false
-                }
-            }
-            'PRINT' {
-                if (
-                    ($statementValues -join '|') -notmatch
-                        '^PRINT\|(?:N\|)?<STRING>\|;$'
-                ) {
-                    return $false
-                }
-            }
             'CREATE' {
+                if (-not $GuardBody) {
+                    return $false
+                }
                 if (
                     $statementValues.Count -ne 7 -or
                     $statementValues[1] -ne 'LOGIN' -or
@@ -1388,34 +1366,17 @@ function Test-SqlInstanceStatementSequence {
                 }
             }
             { $_ -in @('EXEC', 'EXECUTE') } {
+                if (-not $GuardBody) {
+                    return $false
+                }
                 $procedure = Get-SqlProcedureInvocationDetail `
                     -Text $Text `
                     -ExecuteIndex $Tokens[$start].Index
                 if (-not $procedure.Success) {
                     return $false
                 }
-                if ($procedure.Dynamic) {
-                    if (
-                        $procedure.Statement -notmatch
-                            "^(?is)EXEC(?:UTE)?\s*\(\s*N?'(?:''|[^'])*'\s*\)\s*;\s*$"
-                    ) {
-                        return $false
-                    }
-                    $dynamicTokens = @(
-                        ConvertTo-SqlToken `
-                            -Text (ConvertTo-CommentFreeSql -Text $procedure.Expression)
-                    )
-                    if (
-                        -not (
-                            Test-SqlReadOnlySelectTokenStream `
-                                -Tokens $dynamicTokens `
-                                -DisallowVariableAssignment
-                        )
-                    ) {
-                        return $false
-                    }
-                }
-                elseif (
+                if (
+                    $procedure.Dynamic -or
                     $procedure.Name -notin $supportedProcedures -or
                     ($procedure.Parts -join '.').ToLowerInvariant() -cne
                         "msdb.dbo.$($procedure.Name)"
@@ -1428,6 +1389,7 @@ function Test-SqlInstanceStatementSequence {
             }
         }
         $Cursor.Value = $end + 1
+        $statementCount++
     }
     return -not $StopAtEnd
 }
@@ -1871,142 +1833,6 @@ function Test-SqlStableStringVariable {
     return $declarationCount -eq 1
 }
 
-function Test-SqlIdentifierFlow {
-    param(
-        [Parameter(Mandatory)][string]$Text,
-        [Parameter(Mandatory)][string]$VariableName,
-        [Parameter(Mandatory)][string]$VariableType,
-        [Parameter(Mandatory)][string[]]$ExpectedAssignment
-    )
-
-    $tokens = @(ConvertTo-SqlToken -Text (ConvertTo-CommentFreeSql -Text $Text))
-    $values = @(
-        for ($index = 0; $index -lt $tokens.Count; $index++) {
-            Get-SqlCanonicalTokenText -Tokens $tokens -StartIndex $index -EndIndex $index
-        }
-    )
-    $canonicalName = $VariableName.ToUpperInvariant()
-    $declarationCount = 0
-    $assignmentCount = 0
-    $expected = $ExpectedAssignment -join '|'
-    for ($index = 0; $index -lt $values.Count; $index++) {
-        if (
-            $values[$index] -eq 'DECLARE' -and
-            $index + 1 -lt $values.Count -and
-            $values[$index + 1] -eq $canonicalName
-        ) {
-            if (
-                $index + 3 -ge $values.Count -or
-                ($values[$index..($index + 3)] -join '|') -cne (
-                    "DECLARE|$canonicalName|$VariableType|;"
-                )
-            ) {
-                return $false
-            }
-            $declarationCount++
-        }
-        if (
-            $values[$index] -eq 'SET' -and
-            $index + 1 -lt $values.Count -and
-            $values[$index + 1] -eq $canonicalName
-        ) {
-            return $false
-        }
-        if ($values[$index] -eq $canonicalName) {
-            $isAssignment = (
-                $index + 1 -lt $values.Count -and
-                $values[$index + 1] -eq '='
-            ) -or (
-                $index + 2 -lt $values.Count -and
-                $values[$index + 1] -in @('+', '-', '*', '/', '%', '&', '|', '^') -and
-                $values[$index + 2] -eq '='
-            )
-            if ($isAssignment) {
-                $selectIndex = -1
-                for ($cursor = $index - 1; $cursor -ge 0; $cursor--) {
-                    if ($values[$cursor] -eq ';') {
-                        break
-                    }
-                    if ($values[$cursor] -eq 'SELECT') {
-                        $selectIndex = $cursor
-                        break
-                    }
-                }
-                if ($selectIndex -ge 0) {
-                    $assignmentCount++
-                    if (
-                        $selectIndex + $ExpectedAssignment.Count -gt $values.Count -or
-                        (
-                            $values[
-                                $selectIndex..($selectIndex + $ExpectedAssignment.Count - 1)
-                            ] -join '|'
-                        ) -cne $expected
-                    ) {
-                        return $false
-                    }
-                }
-            }
-        }
-    }
-    return $declarationCount -eq 1 -and $assignmentCount -eq 1
-}
-
-function Test-SqlJobIdFlow {
-    param([Parameter(Mandatory)][string]$Text)
-
-    return Test-SqlIdentifierFlow `
-        -Text $Text `
-        -VariableName '@JobId' `
-        -VariableType 'UNIQUEIDENTIFIER' `
-        -ExpectedAssignment @(
-            'SELECT',
-            '@JOBID',
-            '=',
-            'JOB_ID',
-            'FROM',
-            'MSDB',
-            '.',
-            'DBO',
-            '.',
-            'SYSJOBS',
-            'WHERE',
-            'NAME',
-            '=',
-            '@JOBNAME',
-            ';'
-        )
-}
-
-function Test-SqlStepIdFlow {
-    param([Parameter(Mandatory)][string]$Text)
-
-    return Test-SqlIdentifierFlow `
-        -Text $Text `
-        -VariableName '@StepId' `
-        -VariableType 'INT' `
-        -ExpectedAssignment @(
-            'SELECT',
-            '@STEPID',
-            '=',
-            'STEP_ID',
-            'FROM',
-            'MSDB',
-            '.',
-            'DBO',
-            '.',
-            'SYSJOBSTEPS',
-            'WHERE',
-            'JOB_ID',
-            '=',
-            '@JOBID',
-            'AND',
-            'STEP_NAME',
-            '=',
-            '@STEPNAME',
-            ';'
-        )
-}
-
 function Test-SqlProcedureArgumentShape {
     param(
         [Parameter(Mandatory)][object]$Procedure,
@@ -2019,34 +1845,32 @@ function Test-SqlProcedureArgumentShape {
     if (-not $Procedure.Statement.TrimEnd().EndsWith(';')) {
         return $false
     }
-    $argumentTokens = @(
-        ConvertTo-SqlToken -Text (ConvertTo-CommentFreeSql -Text $Procedure.Arguments)
-    )
-    $unsupportedWords = @(
-        $argumentTokens |
-            Where-Object {
-                $_.Kind -eq 'Word' -and
-                -not $_.Value.StartsWith('@') -and
-                $_.Value -notin @('DEFAULT', 'N', 'NULL', 'OUTPUT')
-            }
-    )
-    if ($unsupportedWords.Count -gt 0) {
-        return $false
-    }
-    $outputCount = @(
-        $argumentTokens |
-            Where-Object { $_.Kind -eq 'Word' -and $_.Value -eq 'OUTPUT' }
-    ).Count
-    if ($Procedure.Name -eq 'sp_add_job') {
-        return (
-            $outputCount -le 1 -and
-            (
-                $outputCount -eq 0 -or
-                $Procedure.Arguments -match '(?is)@job_id\s*=\s*@JobId\s+OUTPUT\b'
+    $arguments = ConvertTo-CommentFreeSql -Text $Procedure.Arguments
+    switch ($Procedure.Name) {
+        { $_ -in @('sp_add_job', 'sp_update_job') } {
+            return $arguments -match (
+                "^(?is)\s*@job_name\s*=\s*@JobName\s*,\s*@enabled\s*=\s*1\s*,\s*" +
+                "@description\s*=\s*N'Idempotent CI/CD-managed SQL MI maintenance example\.'\s*,\s*" +
+                '@owner_login_name\s*=\s*@OwnerLoginName\s*;\s*$'
             )
-        )
+        }
+        { $_ -in @('sp_add_jobstep', 'sp_update_jobstep') } {
+            return $arguments -match (
+                "^(?is)\s*@job_name\s*=\s*@JobName\s*,\s*@step_id\s*=\s*1\s*,\s*" +
+                "@step_name\s*=\s*@StepName\s*,\s*@subsystem\s*=\s*N'TSQL'\s*,\s*" +
+                "@database_name\s*=\s*N'master'\s*,\s*@command\s*=\s*N'SELECT 1;'\s*;\s*$"
+            )
+        }
+        'sp_add_jobserver' {
+            return $arguments -match (
+                '^(?is)\s*@job_name\s*=\s*@JobName\s*,\s*' +
+                '@server_name\s*=\s*@LocalServerName\s*;\s*$'
+            )
+        }
+        default {
+            return $false
+        }
     }
-    return $outputCount -eq 0
 }
 
 function Test-SqlInstanceMutationCorrelation {
@@ -2101,36 +1925,7 @@ function Test-SqlInstanceMutationCorrelation {
         return $false
     }
     if ($procedure.Dynamic) {
-        $dynamicTokens = @(
-            ConvertTo-SqlToken -Text (ConvertTo-CodeOnly -Text $procedure.Expression)
-        )
-        return @(
-            $dynamicTokens |
-                Where-Object {
-                    (
-                        $_.Kind -eq 'Word' -and
-                        $_.Value -in @(
-                            'CREATE',
-                            'ALTER',
-                            'DROP',
-                            'TRUNCATE',
-                            'INSERT',
-                            'UPDATE',
-                            'DELETE',
-                            'MERGE',
-                            'GRANT',
-                            'DENY',
-                            'REVOKE',
-                            'EXEC',
-                            'EXECUTE'
-                        )
-                    ) -or (
-                        $_.Kind -in @('Word', 'Identifier') -and
-                        (Get-SqlCanonicalTokenValue -Token $_).StartsWith('SP_')
-                    )
-                }
-        ).Count -eq 0 -and
-            -not (Test-SqlUnsupportedInstanceMutation -Text $procedure.Expression)
+        return $false
     }
     if (Test-SqlDestructiveProcedureName -Name $procedure.Name) {
         return $false
@@ -2180,13 +1975,20 @@ function Test-SqlInstanceMutationCorrelation {
                 $isMissingBranch -and
                 $predicate -match (
                     '^IF (?:NOT )?EXISTS \( SELECT 1 FROM MSDB \. DBO \. ' +
-                    'SYSJOBSTEPS WHERE JOB_ID = @JOBID AND STEP_NAME = @STEPNAME \)$'
+                    'SYSJOBSTEPS AS JOBSTEP INNER JOIN MSDB \. DBO \. SYSJOBS AS JOB ' +
+                    'ON JOB \. JOB_ID = JOBSTEP \. JOB_ID WHERE JOB \. NAME = @JOBNAME ' +
+                    'AND JOBSTEP \. STEP_ID = 1 AND JOBSTEP \. STEP_NAME = @STEPNAME \)$'
                 ) -and
-                $statement -match '@JOB_ID\s*=\s*@JOBID\b' -and
+                $statement -match '@JOB_NAME\s*=\s*@JOBNAME\b' -and
+                $statement -match '@STEP_ID\s*=\s*1\b' -and
                 $statement -match '@STEP_NAME\s*=\s*@STEPNAME\b' -and
                 (Test-SqlStableStringVariable -Text $Text -VariableName '@JobName') -and
-                (Test-SqlStableStringVariable -Text $Text -VariableName '@StepName') -and
-                (Test-SqlJobIdFlow -Text $Text)
+                (
+                    Test-SqlStableStringVariable `
+                        -Text $Text `
+                        -VariableName '@StepName' `
+                        -RequiredValue 'Health check'
+                )
             )
         }
         'sp_update_jobstep' {
@@ -2194,15 +1996,20 @@ function Test-SqlInstanceMutationCorrelation {
                 $isExistingBranch -and
                 $predicate -match (
                     '^IF (?:NOT )?EXISTS \( SELECT 1 FROM MSDB \. DBO \. ' +
-                    'SYSJOBSTEPS WHERE JOB_ID = @JOBID AND STEP_NAME = @STEPNAME \)$'
+                    'SYSJOBSTEPS AS JOBSTEP INNER JOIN MSDB \. DBO \. SYSJOBS AS JOB ' +
+                    'ON JOB \. JOB_ID = JOBSTEP \. JOB_ID WHERE JOB \. NAME = @JOBNAME ' +
+                    'AND JOBSTEP \. STEP_ID = 1 AND JOBSTEP \. STEP_NAME = @STEPNAME \)$'
                 ) -and
-                $statement -match '@JOB_ID\s*=\s*@JOBID\b' -and
+                $statement -match '@JOB_NAME\s*=\s*@JOBNAME\b' -and
                 $statement -match '@STEP_NAME\s*=\s*@STEPNAME\b' -and
-                $statement -match '@STEP_ID\s*=\s*@STEPID\b' -and
+                $statement -match '@STEP_ID\s*=\s*1\b' -and
                 (Test-SqlStableStringVariable -Text $Text -VariableName '@JobName') -and
-                (Test-SqlStableStringVariable -Text $Text -VariableName '@StepName') -and
-                (Test-SqlJobIdFlow -Text $Text) -and
-                (Test-SqlStepIdFlow -Text $Text)
+                (
+                    Test-SqlStableStringVariable `
+                        -Text $Text `
+                        -VariableName '@StepName' `
+                        -RequiredValue 'Health check'
+                )
             )
         }
         'sp_add_jobserver' {
@@ -2210,9 +2017,11 @@ function Test-SqlInstanceMutationCorrelation {
                 $isMissingBranch -and
                 $predicate -match (
                     '^IF (?:NOT )?EXISTS \( SELECT 1 FROM MSDB \. DBO \. ' +
-                    'SYSJOBSERVERS WHERE JOB_ID = @JOBID AND SERVER_ID = 0 \)$'
+                    'SYSJOBSERVERS AS JOBSERVER INNER JOIN MSDB \. DBO \. SYSJOBS AS JOB ' +
+                    'ON JOB \. JOB_ID = JOBSERVER \. JOB_ID WHERE JOB \. NAME = @JOBNAME ' +
+                    'AND JOBSERVER \. SERVER_ID = 0 \)$'
                 ) -and
-                $statement -match '@JOB_ID\s*=\s*@JOBID\b' -and
+                $statement -match '@JOB_NAME\s*=\s*@JOBNAME\b' -and
                 $statement -match '@SERVER_NAME\s*=\s*@LOCALSERVERNAME\b' -and
                 (Test-SqlStableStringVariable -Text $Text -VariableName '@JobName') -and
                 (
@@ -2221,7 +2030,7 @@ function Test-SqlInstanceMutationCorrelation {
                         -VariableName '@LocalServerName' `
                         -RequiredValue '(LOCAL)'
                 ) -and
-                (Test-SqlJobIdFlow -Text $Text)
+                (Test-SqlStableStringVariable -Text $Text -VariableName '@JobName')
             )
         }
         default {

@@ -4,14 +4,8 @@ GO
 
 DECLARE @JobName sysname = N'$(AgentJobName)';
 DECLARE @OwnerLoginName sysname = N'$(AgentJobOwner)';
-DECLARE @JobId uniqueidentifier;
-DECLARE @StepId int;
 DECLARE @StepName sysname = N'Health check';
 DECLARE @LocalServerName sysname = N'(LOCAL)';
-
-SELECT @JobId = [job_id]
-FROM [msdb].[dbo].[sysjobs]
-WHERE [name] = @JobName;
 
 IF NOT EXISTS (
     SELECT 1
@@ -23,8 +17,7 @@ BEGIN
         @job_name = @JobName,
         @enabled = 1,
         @description = N'Idempotent CI/CD-managed SQL MI maintenance example.',
-        @owner_login_name = @OwnerLoginName,
-        @job_id = @JobId OUTPUT;
+        @owner_login_name = @OwnerLoginName;
 END
 ELSE
 BEGIN
@@ -35,21 +28,19 @@ BEGIN
         @owner_login_name = @OwnerLoginName;
 END;
 
-SELECT @StepId = [step_id]
-FROM [msdb].[dbo].[sysjobsteps]
-WHERE [job_id] = @JobId
-  AND [step_name] = @StepName;
-
 IF EXISTS (
     SELECT 1
-    FROM [msdb].[dbo].[sysjobsteps]
-    WHERE [job_id] = @JobId
-      AND [step_name] = @StepName
+    FROM [msdb].[dbo].[sysjobsteps] AS [jobstep]
+    INNER JOIN [msdb].[dbo].[sysjobs] AS [job]
+        ON [job].[job_id] = [jobstep].[job_id]
+    WHERE [job].[name] = @JobName
+      AND [jobstep].[step_id] = 1
+      AND [jobstep].[step_name] = @StepName
 )
 BEGIN
     EXEC [msdb].[dbo].[sp_update_jobstep]
-        @job_id = @JobId,
-        @step_id = @StepId,
+        @job_name = @JobName,
+        @step_id = 1,
         @step_name = @StepName,
         @subsystem = N'TSQL',
         @database_name = N'master',
@@ -58,7 +49,8 @@ END
 ELSE
 BEGIN
     EXEC [msdb].[dbo].[sp_add_jobstep]
-        @job_id = @JobId,
+        @job_name = @JobName,
+        @step_id = 1,
         @step_name = @StepName,
         @subsystem = N'TSQL',
         @database_name = N'master',
@@ -67,13 +59,15 @@ END;
 
 IF NOT EXISTS (
     SELECT 1
-    FROM [msdb].[dbo].[sysjobservers]
-    WHERE [job_id] = @JobId
-      AND [server_id] = 0
+    FROM [msdb].[dbo].[sysjobservers] AS [jobserver]
+    INNER JOIN [msdb].[dbo].[sysjobs] AS [job]
+        ON [job].[job_id] = [jobserver].[job_id]
+    WHERE [job].[name] = @JobName
+      AND [jobserver].[server_id] = 0
 )
 BEGIN
     EXEC [msdb].[dbo].[sp_add_jobserver]
-        @job_id = @JobId,
+        @job_name = @JobName,
         @server_name = @LocalServerName;
 END;
 GO

@@ -421,12 +421,14 @@ try {
     ) | Set-Content `
         -Path (Join-Path $instanceFixturePath '001-escaped-reference.sql') `
         -Encoding utf8
-    & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
-        -ServerName 'sqlmi.example.test' `
-        -AccessToken 'fixture-token' `
-        -ScriptPath $instanceFixturePath `
-        -SqlcmdVariables @{} `
-        -WhatIf
+    Assert-Throws {
+        & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
+            -ServerName 'sqlmi.example.test' `
+            -AccessToken 'fixture-token' `
+            -ScriptPath $instanceFixturePath `
+            -SqlcmdVariables @{} `
+            -WhatIf
+    } 'An escaped SQLCMD literal does not make an unsupported instance script shape executable.'
     $instanceSafetyCases = @(
         @{
             Name = 'comment-only-guard'
@@ -1282,6 +1284,115 @@ BEGIN
     EXEC(N'SELECT 1; SELECT NEXT VALUE FOR "dbo"."FixtureSequence";');
 END;
 '@
+        },
+        @{
+            Name = 'semicolonless-select-receive'
+            Sql = @'
+-- Idempotency: unsupported standalone statements must not be coalesced.
+SELECT 1
+RECEIVE TOP (1) * FROM [dbo].[FixtureQueue];
+'@
+        },
+        @{
+            Name = 'semicolonless-select-waitfor'
+            Sql = @'
+-- Idempotency: unsupported standalone statements must not be coalesced.
+SELECT 1
+WAITFOR DELAY '00:00:01';
+'@
+        },
+        @{
+            Name = 'semicolonless-select-send'
+            Sql = @'
+-- Idempotency: unsupported standalone statements must not be coalesced.
+SELECT 1
+SEND ON CONVERSATION @Handle MESSAGE TYPE [Fixture] (N'payload');
+'@
+        },
+        @{
+            Name = 'semicolonless-select-dbcc'
+            Sql = @'
+-- Idempotency: unsupported standalone statements must not be coalesced.
+SELECT 1
+DBCC CHECKIDENT (N'dbo.Fixture', RESEED, 0);
+'@
+        },
+        @{
+            Name = 'supported-block-with-trailing-backup'
+            Sql = @'
+-- Idempotency: only the exact guarded block is supported.
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.server_principals
+    WHERE [name] = N'fixture_login'
+)
+BEGIN
+    CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
+END
+BACKUP DATABASE [master] TO DISK = N'NUL';
+'@
+        },
+        @{
+            Name = 'supported-block-with-extra-body-statement'
+            Sql = @'
+-- Idempotency: a supported mutation cannot authorize an extra statement.
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.server_principals
+    WHERE [name] = N'fixture_login'
+)
+BEGIN
+    CREATE LOGIN [fixture_login] FROM EXTERNAL PROVIDER;
+    ENABLE TRIGGER ALL ON ALL SERVER;
+END;
+'@
+        },
+        @{
+            Name = 'correlated-job-with-unsupported-delete-level'
+            Sql = @'
+-- Idempotency: correlated Agent calls still require the approved argument shape.
+DECLARE @JobName sysname = N'fixture';
+DECLARE @OwnerLoginName sysname = N'owner';
+IF NOT EXISTS (
+    SELECT 1
+    FROM msdb.dbo.sysjobs
+    WHERE [name] = @JobName
+)
+BEGIN
+    EXEC msdb.dbo.sp_add_job
+        @job_name = @JobName,
+        @enabled = 1,
+        @description = N'Idempotent CI/CD-managed SQL MI maintenance example.',
+        @owner_login_name = @OwnerLoginName,
+        @delete_level = 3;
+END;
+'@
+        },
+        @{
+            Name = 'correlated-step-with-unsupported-command'
+            Sql = @'
+-- Idempotency: the approved job-step command cannot be replaced by destructive SQL.
+DECLARE @JobName sysname = N'fixture';
+DECLARE @StepName sysname = N'Health check';
+IF EXISTS (
+    SELECT 1
+    FROM msdb.dbo.sysjobsteps AS jobstep
+    INNER JOIN msdb.dbo.sysjobs AS job
+        ON job.job_id = jobstep.job_id
+    WHERE job.name = @JobName
+      AND jobstep.step_id = 1
+      AND jobstep.step_name = @StepName
+)
+BEGIN
+    EXEC msdb.dbo.sp_update_jobstep
+        @job_name = @JobName,
+        @step_id = 1,
+        @step_name = @StepName,
+        @subsystem = N'TSQL',
+        @database_name = N'master',
+        @command = N'DROP DATABASE [master];';
+END;
+'@
         }
     )
     foreach ($case in $instanceSafetyCases) {
@@ -1355,57 +1466,7 @@ END;
     Assert-True `
         -Condition (-not (Test-Path $blockedSqlCmdCallPath)) `
         -Message 'Rejected instance scripts must never reach Invoke-Sqlcmd.'
-    Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
-    @'
--- Idempotency: comments do not replace the executable guard.
-/* IF EXISTS (SELECT 1) DROP LOGIN [comment_only]; */
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.server_principals
-    WHERE [name] = N'fixture_login'
-)
-BEGIN
-    PRINT N'DROP LOGIN in a string is not executable.';
-    SELECT 1 AS [DROP], 2 AS "TRUNCATE";
-    EXEC(N'SELECT 1 AS [CREATE];');
-END;
-'@ | Set-Content `
-        -Path (Join-Path $instanceFixturePath '001-valid-comments.sql') `
-        -Encoding utf8
-    & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
-        -ServerName 'sqlmi.example.test' `
-        -AccessToken 'fixture-token' `
-        -ScriptPath $instanceFixturePath `
-        -SqlcmdVariables @{} `
-        -WhatIf
-    Get-ChildItem -Path $instanceFixturePath -File | Remove-Item -Force
-    @'
--- Idempotency: only the innermost correlated guard authorizes the supported mutation.
-DECLARE @JobName sysname = N'fixture';
-IF EXISTS (SELECT 1)
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM msdb.dbo.sysjobs
-        WHERE [name] = @JobName
-    )
-    BEGIN
-        EXEC msdb.dbo.sp_add_job @job_name = @JobName;
-    END;
-END;
-PRINT N'SELECT 1 INTO dbo.Copy; GRANT DENY REVOKE';
-SELECT 1 AS [INTO], 2 AS [GRANT], 3 AS "REVOKE", 4 AS [NEXT VALUE FOR];
-'@ | Set-Content `
-        -Path (Join-Path $instanceFixturePath '001-nested-correlated.sql') `
-        -Encoding utf8
-    & (Join-Path $PSScriptRoot 'Deploy-InstanceObjects.ps1') `
-        -ServerName 'sqlmi.example.test' `
-        -AccessToken 'fixture-token' `
-        -ScriptPath $instanceFixturePath `
-        -SqlcmdVariables @{} `
-        -WhatIf
-
-    & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
+   & (Join-Path $PSScriptRoot 'Test-DeploymentScript.ps1') `
         -ScriptPath (Join-Path $fixtures 'deployment-safe.sql') `
         -ReportPath (Join-Path $temporaryPath 'safe-report.md')
     Assert-Throws {
@@ -1529,7 +1590,11 @@ PRINT N'`$(NotAVariable)';
         @{ Name = 'go-double-zero'; Line = 'GO 00' },
         @{ Name = 'go-leading-zero'; Line = 'GO 01' },
         @{ Name = 'go-int32-max'; Line = 'GO 2147483647' },
-        @{ Name = 'go-mixed-case-whitespace'; Line = "`t gO`t00042 `t-- managed parser comment" }
+        @{ Name = 'go-mixed-case-whitespace'; Line = "`t gO`t00042 `t-- managed parser comment" },
+        @{ Name = 'go-compact-comment'; Line = 'GO-- managed parser compact comment' },
+        @{ Name = 'go-compact-count-comment'; Line = 'GO 1-- managed parser compact comment' },
+        @{ Name = 'go-compact-leading-zero-comment'; Line = 'gO 01-- managed parser compact comment' },
+        @{ Name = 'go-tab-compact-comment'; Line = "`tGO`t1-- managed parser compact comment" }
     )
     foreach ($case in $acceptedGoSeparators) {
         $safePath = Join-Path $temporaryPath "$($case.Name)-safe.sql"
@@ -1575,6 +1640,8 @@ PRINT N'`$(NotAVariable)';
         @{ Name = 'go-plus'; Line = 'GO +1' },
         @{ Name = 'go-decimal'; Line = 'GO 1.5' },
         @{ Name = 'go-alpha-suffix'; Line = 'GO 1x' },
+        @{ Name = 'go-compact-block-comment'; Line = 'GO/**/' },
+        @{ Name = 'go-compact-count-block-comment'; Line = 'GO 1/**/' },
         @{ Name = 'go-block-comment-suffix'; Line = 'GO 1 /* not a supported suffix */' },
         @{ Name = 'go-extra-token'; Line = 'GO 1 SELECT 2' }
     )) {

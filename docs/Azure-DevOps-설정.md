@@ -195,8 +195,9 @@ advisory 단계입니다.
 GO separator는 공용 lexer가 code context에서 물리 행 전체가 `GO` 또는 `GO <count>`인
 경우에만 인식합니다. `<count>`는 `0`, `00`, `01`을 포함한 nonnegative decimal digit
 sequence이면서 Int32 범위(`0..2147483647`)여야 하며 분석에서는 모두 한 batch boundary로
-취급합니다. overflow, sign, decimal, 다른 suffix는 실행 전에 실패합니다. 뒤에는 `--` line
-comment만 둘 수 있습니다. multiline string, nested block comment, bracket identifier,
+취급합니다. overflow, sign, decimal, 다른 suffix는 실행 전에 실패합니다. 뒤에는 `GO--comment`,
+`GO 1--comment`처럼 공백 없이 붙인 형태를 포함해 `--` line comment만 둘 수 있습니다.
+multiline string, nested block comment, bracket identifier,
 double-quoted identifier 안의 단독 `GO`와 line comment 안의 `GO`는 separator가 아닙니다.
 
 `EXEC`/`EXECUTE`와 `sp_executesql`의 첫 SQL 표현식이 문자열 literal과 `+` 연결만으로
@@ -241,17 +242,18 @@ guard가 있어야 하고 모든 `CREATE`/`ALTER`/DML/`EXEC` mutation token이 �
 instance guard body와 `ELSE` body는 `BEGIN...END` block만 지원합니다. 범위만 감싸는
 `IF EXISTS (SELECT 1)`은 인정하지 않습니다. 지원 계약은 현재 예제에 필요한 shape로
 제한합니다. `CREATE LOGIN`은 `sys.server_principals`의 같은 login 이름, Agent job은
-`msdb.dbo.sysjobs`의 같은 `@JobName`, job step은 같은 `@JobId`와 `@StepName`, local
-job server assignment는 같은 `@JobId`와 `server_id=0` guard가 필요합니다. procedure
-parameter도 같은 변수를 사용해야 합니다. 이 allowlist 밖의 mutation/guard shape는
-fail closed입니다.
+`msdb.dbo.sysjobs`의 같은 `@JobName`, job step은 `sysjobsteps`와 `sysjobs`를 join해 같은
+`@JobName`, 고정 `step_id=1`, 같은 `@StepName`, local job server assignment는 두 catalog를
+join해 같은 `@JobName`과 `server_id=0` guard가 필요합니다. procedure parameter도 같은
+이름과 고정 step을 사용해야 합니다. 이 allowlist 밖의 mutation/guard shape는 fail closed입니다.
 
-또한 instance SQL은 statement 시작 자체를 allowlist로 분류합니다. 현재 예제에 필요한
-`USE`, 제한된 `DECLARE`, read-only `SELECT`, `IF [NOT] EXISTS` block, `CREATE LOGIN`과
-상관된 Agent procedure만 허용합니다. `DISABLE/ENABLE TRIGGER`, `DBCC`, `BACKUP/RESTORE`,
-`KILL`/`SHUTDOWN`, `BULK INSERT` 등 미분류 administrative statement는 실행 전에
-차단합니다. constant dynamic SQL은 `INTO`와 sequence를 진행시키는 `NEXT VALUE FOR`가 없는
-명시적 read-only `SELECT`만 허용합니다.
+또한 instance SQL은 현재 두 예제의 완전한 statement shape만 허용합니다. root에는 `USE`,
+제한된 `DECLARE`, 검증된 `IF [NOT] EXISTS ... BEGIN...END`만 둘 수 있고 `SELECT`는 상관
+catalog predicate 내부에서만 허용합니다. Guard body에는 지원되는 `CREATE LOGIN` 또는 정적
+Agent procedure만 허용하며 nested guard, standalone `SELECT`/`PRINT`, dynamic SQL, block
+안팎의 추가 token은 실패합니다. 따라서 `DISABLE/ENABLE TRIGGER`, `DBCC`,
+`BACKUP/RESTORE`, `KILL`/`SHUTDOWN`, `BULK INSERT`, semicolon 없는 `RECEIVE`/`WAITFOR`/
+`SEND` 같은 미분류 statement도 실행 전에 차단합니다.
 
 직접 `DROP`/`TRUNCATE`, `SELECT ... INTO`, `GRANT`, `DENY`, `REVOKE`와 그 constant dynamic
 variant를 차단합니다. canonical final procedure 이름이 `sp_delete*`, `sp_drop*`,
