@@ -17,6 +17,8 @@ Dev 환경은 실제 DACPAC 배포까지 검증했습니다. `sqlmi-test`와 `sq
 
 현재 self-hosted agent는 이 개발 PC에서 실행하는 데모용입니다. 운영 전에는 SQL MI VNet 내부의 전용 VM 또는 Managed DevOps Pool로 교체하십시오.
 
+SQL MI 시스템 ID에는 Entra principal 조회를 위해 Microsoft Graph의 `User.Read.All`, `GroupMember.Read.All`, `Application.Read.All` application permission을 부여했습니다. 이는 광범위한 `Directory Readers` 역할 대신 Microsoft가 안내하는 lower-level permission 조합을 사용한 것입니다.
+
 ## 1. 사전 준비
 
 1. SQL MI와 통신 가능한 서브넷에 self-hosted Azure Pipelines agent를 배치합니다.
