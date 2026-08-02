@@ -61,3 +61,12 @@ Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 - `eng/Invoke-ValidatedDeploymentScript.ps1`: 검증한 sanitized SQL을 2차 SQLCMD 해석 없이 exact 실행
 - `eng/Deploy-InstanceObjects.ps1`: Entra token/SQLCMD 변수 기반 인스턴스 오브젝트 배포
 - `pipelines/drift-report.yml`: 매일 02:00 UTC 대표 DB에 읽기 전용 DeployReport 실행
+
+## 구현 트랙
+
+[`reference/hardened`](https://github.com/DalBamS/AzureDevOps-SQLMI-CICD-AI/tree/reference/hardened)는
+방어 로직과 경계 사례 검증을 최대한 심화한 참고 구현입니다.
+[`main`](https://github.com/DalBamS/AzureDevOps-SQLMI-CICD-AI/tree/main)과
+[`feat/education-slim`](https://github.com/DalBamS/AzureDevOps-SQLMI-CICD-AI/tree/feat/education-slim)은
+교육 과정에서 핵심 배포 흐름을 읽고 실습하기 위한 최소 구현입니다. 심화 방어가 필요한 운영
+환경에서는 교육용 구현을 그대로 확장하기보다 참고 구현과 조직의 보안 기준을 함께 검토하십시오.
