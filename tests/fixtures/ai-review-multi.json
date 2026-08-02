@@ -25,17 +25,17 @@
     "blockingFindings": [
       {
         "file": "chunked.sql",
-        "line": 4,
-        "reason": "Second chunk finding.",
-        "recommendation": "Review the table change."
+        "line": 2,
+        "reason": "First chunk finding.",
+        "recommendation": "This duplicate recommendation must be discarded."
       }
     ],
     "advisories": [
       {
         "file": "chunked.sql",
-        "line": 5,
-        "reason": "Second chunk advisory.",
-        "recommendation": "Confirm rollback behavior."
+        "line": 3,
+        "reason": "First chunk advisory.",
+        "recommendation": "This duplicate recommendation must be discarded."
       }
     ]
   },
@@ -45,16 +45,16 @@
     "blockingFindings": [
       {
         "file": "chunked.sql",
-        "line": 6,
-        "reason": "Third chunk finding.",
+        "line": 4,
+        "reason": "Second chunk finding.",
         "recommendation": "Validate concurrent inserts."
       }
     ],
     "advisories": [
       {
         "file": "chunked.sql",
-        "line": 7,
-        "reason": "Third chunk advisory.",
+        "line": 5,
+        "reason": "Second chunk advisory.",
         "recommendation": "Confirm the data type."
       }
     ]

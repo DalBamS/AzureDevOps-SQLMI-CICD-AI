@@ -19,7 +19,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 if (-not (Get-Command Invoke-Sqlcmd -ErrorAction SilentlyContinue)) {
-    throw 'The SqlServer PowerShell module is required. Install version 22.4.5.1 from PSGallery.'
+    throw 'The pipeline-pinned SqlServer PowerShell module is required. Install it from PSGallery.'
 }
 
 $serverInstance = "tcp:$ServerName,$Port"

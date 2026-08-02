@@ -86,7 +86,7 @@ foreach ($script in $scripts) {
     if (Test-SqlDestructiveInstanceStatement -Text $resolution.SanitizedText) {
         throw "Instance script '$($script.Name)' contains a prohibited destructive operation."
     }
-    if (-not (Test-SqlDynamicExecution -Text $resolution.SanitizedText)) {
+    if (-not (Test-SqlHasNoDynamicExecution -Text $resolution.SanitizedText)) {
         throw "Instance script '$($script.Name)' contains dynamic execution that cannot be reviewed safely."
     }
     $scriptResolutions[$script.FullName] = $resolution

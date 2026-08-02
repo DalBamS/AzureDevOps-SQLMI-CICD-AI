@@ -148,6 +148,10 @@ stages:
             env:
               SQLSERVER_MODULE_VERSION: $(sqlServerModuleVersion)
 
+          - pwsh: ./eng/Test-Repo-Constraints.ps1
+            displayName: Check optional education repository constraints
+            continueOnError: true
+
           - pwsh: ./eng/Test-FailureLabs.ps1
             displayName: Run offline failure-lab self-tests
             env:

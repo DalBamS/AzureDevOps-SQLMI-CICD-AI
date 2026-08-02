@@ -260,6 +260,9 @@ context로 전달하며 worker별 `az` 호출은 없습니다. Azure CLI의 토�
 이 교육 구현은 장기 실행 중 token을 갱신하지 않습니다. Azure SQL access token의 수명은
 대략 60~90분이므로, 대상 DB가 많고 DDL이 길면 롤아웃 후반에 인증 오류가 발생할 수
 있습니다. token 수명보다 긴 작업은 대상을 나누거나 새 pipeline run으로 재시도하십시오.
+`Deploy-Databases.ps1`은 fan-out 전에 JWT `exp`를 확인하고 기본 최소 잔여 수명 20분보다
+짧으면 SqlPackage를 호출하지 않고 중단합니다. `exp`를 해석할 수 없으면 경고와 배포 요약을
+남기고 진행하며, 실행 중 token을 자동 갱신하지 않습니다.
 
 ## 9. Publish profile
 

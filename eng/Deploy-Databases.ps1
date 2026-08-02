@@ -26,6 +26,8 @@ param(
     [string]$DeploymentMode = 'Publish',
     [ValidateRange(1, 2147483647)]
     [int]$CommandTimeout = 3600,
+    [ValidateRange(1, 1440)]
+    [int]$MinimumTokenLifetimeMinutes = 20,
     [ValidateRange(1, 64)]
     [int]$MaxParallel = 4,
     [switch]$ValidateAllDatabasePlans,
@@ -43,6 +45,43 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $modulePath = Join-Path $PSScriptRoot 'Phase2.Common.psm1'
 Import-Module $modulePath -Force
+
+function Get-AccessTokenRemainingMinutes {
+    param([Parameter(Mandatory)][string]$AccessToken)
+
+    $segments = $AccessToken.Split('.')
+    if ($segments.Count -lt 2) {
+        throw 'The access token is not a JWT with a payload segment.'
+    }
+    $payloadSegment = $segments[1].Replace('-', '+').Replace('_', '/')
+    switch ($payloadSegment.Length % 4) {
+        2 { $payloadSegment += '==' }
+        3 { $payloadSegment += '=' }
+    }
+    $payloadJson = [Text.Encoding]::UTF8.GetString(
+        [Convert]::FromBase64String($payloadSegment)
+    )
+    $payload = $payloadJson | ConvertFrom-Json
+    if (-not $payload.PSObject.Properties['exp']) {
+        throw "The access token payload does not contain an 'exp' claim."
+    }
+    $expiresAt = [DateTimeOffset]::FromUnixTimeSeconds([long]$payload.exp)
+    return ($expiresAt - [DateTimeOffset]::UtcNow).TotalMinutes
+}
+
+function Write-AccessTokenPreflightSummary {
+    param([Parameter(Mandatory)][string]$Message)
+
+    if (-not $SummaryPath) { return }
+    $directory = Split-Path -Parent $SummaryPath
+    if ($directory) { New-Item -ItemType Directory -Force $directory | Out-Null }
+    Add-Content -Path $SummaryPath -Encoding utf8 -Value @(
+        '## Azure SQL access token preflight',
+        '',
+        "- $Message",
+        ''
+    )
+}
 
 if (-not $TestPath) {
     $TestPath = Join-Path $repoRoot 'tests/integration'
@@ -79,6 +118,28 @@ if (
 ) {
     throw 'The access token provider did not return exactly one Azure SQL token.'
 }
+$accessToken = [string]$tokenOutput[0]
+$remainingTokenMinutes = $null
+try {
+    $remainingTokenMinutes = Get-AccessTokenRemainingMinutes -AccessToken $accessToken
+}
+catch {
+    $message = "Unable to read the Azure SQL access token expiration; deployment will continue: $($_.Exception.Message)"
+    Write-Warning $message
+    Write-AccessTokenPreflightSummary -Message $message
+}
+if ($null -ne $remainingTokenMinutes) {
+    $remainingText = $remainingTokenMinutes.ToString(
+        'F1',
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+    $message = "Remaining lifetime at rollout start: $remainingText minute(s); required minimum: $MinimumTokenLifetimeMinutes minute(s)."
+    Write-Host $message
+    Write-AccessTokenPreflightSummary -Message $message
+    if ($remainingTokenMinutes -lt $MinimumTokenLifetimeMinutes) {
+        throw "Azure SQL access token remaining lifetime is below the required minimum. SqlPackage was not invoked."
+    }
+}
 
 $approvedRoot = Split-Path -Parent (Resolve-Path $ApprovedReportPath).Path
 $context = [pscustomobject]@{
@@ -89,7 +150,7 @@ $context = [pscustomobject]@{
     SqlPackagePath = (Resolve-Path $SqlPackagePath).Path
     ApprovedReportPath = (Resolve-Path $ApprovedReportPath).Path
     ApprovedRoot = $approvedRoot
-    AccessToken = [string]$tokenOutput[0]
+    AccessToken = $accessToken
     DeploymentMode = $DeploymentMode
     CommandTimeout = $CommandTimeout
     ValidateAllDatabasePlans = [bool]$ValidateAllDatabasePlans

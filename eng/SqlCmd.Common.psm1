@@ -186,7 +186,7 @@ function Test-SqlDestructiveInstanceStatement {
     return $Text -match '(?is)\b(?:DROP|TRUNCATE|GRANT|DENY|REVOKE)\b'
 }
 
-function Test-SqlDynamicExecution {
+function Test-SqlHasNoDynamicExecution {
     param([AllowEmptyString()][string]$Text)
     return $Text -notmatch '(?is)\bEXEC(?:UTE)?\s*(?:\(|@)|\bsp_executesql\s+@'
 }
@@ -197,6 +197,6 @@ Export-ModuleMember -Function @(
     'Resolve-SqlCmdScript',
     'Test-SqlCmdValue',
     'Test-SqlDestructiveInstanceStatement',
-    'Test-SqlDynamicExecution',
+    'Test-SqlHasNoDynamicExecution',
     'Test-SqlInstanceGuardCoverage'
 )
