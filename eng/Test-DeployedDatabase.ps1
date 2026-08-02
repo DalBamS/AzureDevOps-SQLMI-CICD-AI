@@ -6,7 +6,6 @@ param(
     [ValidateRange(1, 65535)]
     [int]$Port = 1433,
     [Parameter(Mandatory)]
-    [ValidatePattern('^[A-Za-z0-9_]+$')]
     [string]$DatabaseName,
     [Parameter(Mandatory)]
     [string]$AccessToken,
@@ -27,6 +26,16 @@ if (-not (Get-Command Invoke-Sqlcmd -ErrorAction SilentlyContinue)) {
     throw 'The pinned SqlServer PowerShell module is required to test the deployed database.'
 }
 
+if ($DatabaseName.StartsWith('[') -or $DatabaseName.EndsWith(']')) {
+    if ($DatabaseName -notmatch '^\[(?<name>(?:[A-Za-z0-9_-]|\]\])+)\]$') {
+        throw 'Bracketed DatabaseName must contain only letters, numbers, underscores, hyphens, or escaped closing brackets.'
+    }
+    $DatabaseName = $Matches.name.Replace(']]', ']')
+}
+elseif ($DatabaseName -notmatch '^[A-Za-z0-9_-]+$') {
+    throw 'DatabaseName must contain only letters, numbers, underscores, or hyphens.'
+}
+
 $tests = @(
     Get-ChildItem -Path $TestPath -File -Filter '*.sql' |
         Sort-Object Name
@@ -35,7 +44,6 @@ if ($tests.Count -eq 0) {
     throw "No SQL integration tests found in: $TestPath"
 }
 
-$secureToken = ConvertTo-SecureString $AccessToken -AsPlainText -Force
 $serverInstance = "tcp:$ServerName,$Port"
 
 foreach ($test in $tests) {
@@ -43,7 +51,7 @@ foreach ($test in $tests) {
     Invoke-Sqlcmd `
         -ServerInstance $serverInstance `
         -Database $DatabaseName `
-        -AccessToken $secureToken `
+        -AccessToken $AccessToken `
         -InputFile $test.FullName `
         -AbortOnError `
         -Encrypt Mandatory `

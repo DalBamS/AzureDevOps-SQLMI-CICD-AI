@@ -1,0 +1,14 @@
+[
+  {
+    "risk": "low",
+    "summary": "First fallback window.",
+    "blockingFindings": [],
+    "advisories": []
+  },
+  {
+    "risk": "medium",
+    "summary": "Second fallback window.",
+    "blockingFindings": [],
+    "advisories": []
+  }
+]

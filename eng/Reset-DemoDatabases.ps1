@@ -24,7 +24,7 @@ if (-not $ConfirmReset) {
     throw 'Pass -ConfirmReset to acknowledge permanent deletion of all data in the Demo databases.'
 }
 if (-not (Get-Command Invoke-Sqlcmd -ErrorAction SilentlyContinue)) {
-    throw 'The SqlServer PowerShell module is required. Install version 22.4.5.1 from PSGallery.'
+    throw 'The pipeline-pinned SqlServer PowerShell module is required. Install it from PSGallery.'
 }
 
 foreach ($name in $DatabaseName) {
@@ -41,7 +41,6 @@ if (-not $PSCmdlet.ShouldProcess(
     return
 }
 
-$secureToken = ConvertTo-SecureString $AccessToken -AsPlainText -Force
 $serverInstance = "tcp:$ServerName,$Port"
 $initializer = Join-Path $PSScriptRoot 'Initialize-DemoDatabases.ps1'
 
@@ -56,7 +55,7 @@ END;
     Invoke-Sqlcmd `
         -ServerInstance $serverInstance `
         -Database master `
-        -AccessToken $secureToken `
+        -AccessToken $AccessToken `
         -Query $dropDatabase `
         -AbortOnError `
         -Encrypt Mandatory `

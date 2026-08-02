@@ -33,6 +33,43 @@ parameters:
     displayName: SQL MI private agent pool
     type: string
     default: sqlmi-private-agents
+  - name: sqlCommandTimeout
+    displayName: SqlPackage command timeout in seconds
+    type: number
+    default: 3600
+  - name: maxParallel
+    displayName: Maximum parallel database deployments after canary
+    type: number
+    default: 4
+  - name: validateAllDatabasePlans
+    displayName: Generate and compare a DeployReport for every target database
+    type: boolean
+    default: false
+  - name: databasePlanDriftPolicy
+    displayName: Policy when a target plan differs from the representative plan
+    type: string
+    default: Warn
+    values:
+      - Warn
+      - Fail
+  - name: deployInstanceObjects
+    displayName: Deploy idempotent SQL MI instance objects after database rollout
+    type: boolean
+    default: false
+  - name: deploymentMode
+    displayName: Database deployment mode
+    type: string
+    default: Publish
+    values:
+      - Publish
+      - ValidatedScript
+  - name: buildStrictness
+    displayName: SQL project build strictness
+    type: string
+    default: Strict
+    values:
+      - Lenient
+      - Strict
   - name: azureServiceConnection
     displayName: Azure workload identity service connection
     type: string
@@ -81,11 +118,44 @@ stages:
               packageType: sdk
               version: 10.x
 
-          - pwsh: ./eng/Build.ps1 -DacVersion "1.0.$(Build.BuildId).0"
+          - pwsh: |
+              ./eng/Build.ps1 `
+                -DacVersion "1.0.$(Build.BuildId).0" `
+                -Strictness "${{ parameters.buildStrictness }}"
             displayName: Build SQL project
+
+          - pwsh: |
+              $requiredVersion = [version]'$(sqlServerModuleVersion)'
+              $installed = Get-Module -ListAvailable -Name SqlServer |
+                Where-Object Version -eq $requiredVersion |
+                Select-Object -First 1
+              if (-not $installed) {
+                Install-Module `
+                  -Name SqlServer `
+                  -RequiredVersion $requiredVersion `
+                  -Scope CurrentUser `
+                  -Repository PSGallery `
+                  -Force `
+                  -AllowClobber
+              }
+            displayName: Install pinned SQL batch parser
 
           - pwsh: ./eng/Test-SqlPolicy.ps1
             displayName: Run deterministic SQL policy
+
+          - pwsh: ./eng/Test-Phase2.ps1
+            displayName: Run education-slim self-tests
+            env:
+              SQLSERVER_MODULE_VERSION: $(sqlServerModuleVersion)
+
+          - pwsh: ./eng/Test-Repo-Constraints.ps1
+            displayName: Check optional education repository constraints
+            continueOnError: true
+
+          - pwsh: ./eng/Test-FailureLabs.ps1
+            displayName: Run offline failure-lab self-tests
+            env:
+              SQLSERVER_MODULE_VERSION: $(sqlServerModuleVersion)
 
           - task: AzureCLI@2
             displayName: Run advisory AI review of PR SQL changes
@@ -172,6 +242,13 @@ stages:
       variableGroup: sqlmi-dev
       agentPool: ${{ parameters.privateAgentPool }}
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      publishProfile: pipelines/profiles/sqlmi-dev.publish.xml
+      sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
+      maxParallel: ${{ parameters.maxParallel }}
+      validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
+      databasePlanDriftPolicy: ${{ parameters.databasePlanDriftPolicy }}
+      deployInstanceObjects: ${{ parameters.deployInstanceObjects }}
+      deploymentMode: ${{ parameters.deploymentMode }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}
@@ -186,6 +263,13 @@ stages:
       variableGroup: sqlmi-test
       agentPool: ${{ parameters.privateAgentPool }}
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      publishProfile: pipelines/profiles/sqlmi-test.publish.xml
+      sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
+      maxParallel: ${{ parameters.maxParallel }}
+      validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
+      databasePlanDriftPolicy: ${{ parameters.databasePlanDriftPolicy }}
+      deployInstanceObjects: ${{ parameters.deployInstanceObjects }}
+      deploymentMode: ${{ parameters.deploymentMode }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}
@@ -200,6 +284,13 @@ stages:
       variableGroup: sqlmi-prod
       agentPool: ${{ parameters.privateAgentPool }}
       azureServiceConnection: ${{ parameters.azureServiceConnection }}
+      publishProfile: pipelines/profiles/sqlmi-prod.publish.xml
+      sqlCommandTimeout: ${{ parameters.sqlCommandTimeout }}
+      maxParallel: ${{ parameters.maxParallel }}
+      validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
+      databasePlanDriftPolicy: ${{ parameters.databasePlanDriftPolicy }}
+      deployInstanceObjects: ${{ parameters.deployInstanceObjects }}
+      deploymentMode: ${{ parameters.deploymentMode }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}

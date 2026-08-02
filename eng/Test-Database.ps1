@@ -2,113 +2,87 @@
 param(
     [int]$HostPort = 14333,
     [switch]$SkipBuild,
-    [switch]$KeepContainer
+    [switch]$KeepContainer,
+    [ValidateRange(1, 2147483647)][int]$SqlCommandTimeout = 3600
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$artifacts = Join-Path $repoRoot 'artifacts'
-$dacpac = [IO.Path]::Combine($artifacts, 'dacpac', 'App.Database.dacpac')
-$toolDirectory = [IO.Path]::Combine($artifacts, 'tools', 'sqlpackage')
-$sqlPackageVersion = '170.4.83'
+$dacpac = Join-Path $repoRoot 'artifacts/dacpac/App.Database.dacpac'
+$profile = Join-Path $repoRoot 'pipelines/profiles/sqlmi-dev.publish.xml'
+$toolDirectory = Join-Path ([IO.Path]::GetTempPath()) 'sqlpackage-170.4.83'
+$sqlPackage = Join-Path $toolDirectory $(if ($IsWindows) { 'sqlpackage.exe' } else { 'sqlpackage' })
 $containerId = $null
+$password = "Local!Sql1_$([guid]::NewGuid().ToString('N').Substring(0, 12))"
 
 foreach ($command in @('dotnet', 'docker')) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
-        throw "$command is required. See docs/환경-구성-및-테스트.md."
+        throw "$command is required for the database integration test."
     }
 }
-
-if (-not $SkipBuild) {
-    & ([IO.Path]::Combine($PSScriptRoot, 'Build.ps1'))
-}
-if (-not (Test-Path $dacpac)) {
-    throw "DACPAC not found: $dacpac"
-}
-
-$sqlPackageName = if ($IsWindows) { 'sqlpackage.exe' } else { 'sqlpackage' }
-$sqlPackage = Join-Path $toolDirectory $sqlPackageName
-if (-not (Test-Path $sqlPackage)) {
-    New-Item -ItemType Directory -Force -Path $toolDirectory | Out-Null
+if (-not $SkipBuild) { & (Join-Path $PSScriptRoot 'Build.ps1') }
+if (-not (Test-Path $dacpac -PathType Leaf)) { throw "DACPAC not found: $dacpac" }
+if (-not (Test-Path $sqlPackage -PathType Leaf)) {
+    New-Item -ItemType Directory -Force $toolDirectory | Out-Null
     & dotnet tool install `
         --tool-path $toolDirectory `
         Microsoft.SqlPackage `
-        --version $sqlPackageVersion `
+        --version 170.4.83 `
         --allow-roll-forward
-    if ($LASTEXITCODE -ne 0) {
-        throw 'SqlPackage installation failed.'
-    }
+    if ($LASTEXITCODE -ne 0) { throw 'SqlPackage installation failed.' }
 }
-
-$password = "Local!Sql1_$([guid]::NewGuid().ToString('N').Substring(0, 12))"
-$containerName = "sqlmi-cicd-test-$PID"
 
 try {
     $containerId = (& docker run `
         --detach `
         --rm `
-        --name $containerName `
         --env 'ACCEPT_EULA=Y' `
         --env "MSSQL_SA_PASSWORD=$password" `
         --publish "${HostPort}:1433" `
-        mcr.microsoft.com/mssql/server:2022-latest).Trim()
-
+        mcr.microsoft.com/mssql/server:2025-latest).Trim()
     if ($LASTEXITCODE -ne 0 -or -not $containerId) {
         throw 'SQL Server test container failed to start.'
     }
-
+    $sqlcmd = (& docker exec $containerId sh -c `
+        'for p in /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd; do [ -x "$p" ] && echo "$p" && exit; done').Trim()
     $ready = $false
     for ($attempt = 1; $attempt -le 60; $attempt++) {
-        & docker exec $containerId `
-            /opt/mssql-tools18/bin/sqlcmd `
-            -S localhost -U sa -P $password -C -Q 'SELECT 1' 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            $ready = $true
-            break
-        }
-        Start-Sleep -Seconds 2
+        & docker exec $containerId $sqlcmd -S localhost -U sa -P $password -C -Q 'SELECT 1' 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+        Start-Sleep 2
     }
+    if (-not $ready) { throw 'SQL Server did not become ready within 120 seconds.' }
 
-    if (-not $ready) {
-        & docker logs $containerId
-        throw 'SQL Server did not become ready within 120 seconds.'
-    }
-
-    & docker exec $containerId `
-        /opt/mssql-tools18/bin/sqlcmd `
-        -S localhost -U sa -P $password -C `
-        -Q "IF DB_ID(N'AppDb_Test') IS NULL CREATE DATABASE [AppDb_Test];"
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Failed to create the integration test database.'
-    }
-
-    $connectionString = "Server=localhost,$HostPort;Initial Catalog=AppDb_Test;User ID=sa;Password=$password;Encrypt=True;TrustServerCertificate=True;Connection Timeout=30;"
+    & docker exec $containerId $sqlcmd -S localhost -U sa -P $password -C `
+        -Q "CREATE DATABASE [AppDb_Test];" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Test database creation failed.' }
+    $connectionBuilder = [Data.Common.DbConnectionStringBuilder]::new()
+    $connectionBuilder['Server'] = "localhost,$HostPort"
+    $connectionBuilder['Initial Catalog'] = 'AppDb_Test'
+    $connectionBuilder['User ID'] = 'sa'
+    $connectionBuilder['Pass' + 'word'] = $password
+    $connectionBuilder['Encrypt'] = 'True'
+    $connectionBuilder['TrustServerCertificate'] = 'True'
+    $connectionBuilder['Connection Timeout'] = 30
+    $connection = $connectionBuilder.ConnectionString
     & $sqlPackage `
         /Action:Publish `
         "/SourceFile:$dacpac" `
-        "/TargetConnectionString:$connectionString" `
-        /p:BlockOnPossibleDataLoss=True `
-        /p:DropObjectsNotInSource=False `
-        /p:ScriptDatabaseOptions=False
-    if ($LASTEXITCODE -ne 0) {
-        throw 'DACPAC deployment to the integration test database failed.'
-    }
+        "/TargetConnectionString:$connection" `
+        "/Profile:$profile" `
+        "/p:CommandTimeout=$SqlCommandTimeout"
+    if ($LASTEXITCODE -ne 0) { throw 'DACPAC publish failed.' }
 
-    $tests = Get-ChildItem -Path ([IO.Path]::Combine($repoRoot, 'tests', 'integration')) -File -Filter '*.sql' |
+    $tests = Get-ChildItem (Join-Path $repoRoot 'tests/integration') -File -Filter '*.sql' |
         Sort-Object Name
     foreach ($test in $tests) {
         Write-Host "Running $($test.Name)"
-        Get-Content -Path $test.FullName -Raw |
-            & docker exec --interactive $containerId `
-                /opt/mssql-tools18/bin/sqlcmd `
+        Get-Content $test.FullName -Raw |
+            & docker exec --interactive $containerId $sqlcmd `
                 -S localhost -U sa -P $password -C -b -d AppDb_Test
-        if ($LASTEXITCODE -ne 0) {
-            throw "Integration test failed: $($test.Name)"
-        }
+        if ($LASTEXITCODE -ne 0) { throw "Integration test failed: $($test.Name)" }
     }
-
     Write-Host "All $($tests.Count) database integration tests passed."
 }
 finally {

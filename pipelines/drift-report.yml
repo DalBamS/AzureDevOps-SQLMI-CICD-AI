@@ -1,0 +1,137 @@
+trigger: none
+pr: none
+
+schedules:
+  - cron: '0 2 * * *'
+    displayName: Daily 02:00 UTC read-only drift report
+    branches:
+      include:
+        - main
+    always: true
+
+parameters:
+  - name: privateAgentPool
+    displayName: SQL MI private agent pool
+    type: string
+    default: sqlmi-private-agents
+  - name: azureServiceConnection
+    displayName: Azure workload identity service connection
+    type: string
+    default: sc-sqlmi-wif
+  - name: sqlCommandTimeout
+    displayName: SqlPackage command timeout in seconds
+    type: number
+    default: 3600
+  - name: environments
+    type: object
+    default:
+      - stageName: Dev
+        displayName: Development
+        environmentName: sqlmi-dev
+        variableGroup: sqlmi-dev
+        publishProfile: pipelines/profiles/sqlmi-dev.publish.xml
+      - stageName: Test
+        displayName: Test
+        environmentName: sqlmi-test
+        variableGroup: sqlmi-test
+        publishProfile: pipelines/profiles/sqlmi-test.publish.xml
+      - stageName: Prod
+        displayName: Production
+        environmentName: sqlmi-prod
+        variableGroup: sqlmi-prod
+        publishProfile: pipelines/profiles/sqlmi-prod.publish.xml
+
+variables:
+  artifactName: database
+  sqlPackageVersion: 170.4.83
+
+stages:
+  - stage: Build
+    displayName: Build immutable drift baseline
+    jobs:
+      - job: BuildDacpac
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: UseDotNet@2
+            displayName: Use .NET 10 SDK
+            inputs:
+              packageType: sdk
+              version: 10.x
+          - pwsh: ./eng/Build.ps1
+            displayName: Build SQL project
+          - publish: artifacts/dacpac
+            artifact: $(artifactName)
+            displayName: Publish immutable DACPAC
+
+  - ${{ each environment in parameters.environments }}:
+      - stage: Drift${{ environment.stageName }}
+        displayName: Drift report - ${{ environment.displayName }}
+        dependsOn: Build
+        variables:
+          - group: ${{ environment.variableGroup }}
+        jobs:
+          - job: GenerateDriftReport
+            pool:
+              name: ${{ parameters.privateAgentPool }}
+            steps:
+              - checkout: self
+              - download: current
+                artifact: $(artifactName)
+              - task: UseDotNet@2
+                displayName: Use .NET 10 SDK
+                inputs:
+                  packageType: sdk
+                  version: 10.x
+              - pwsh: |
+                  $toolPath = Join-Path "$(Agent.TempDirectory)" "sqlpackage"
+                  dotnet tool install `
+                    --tool-path $toolPath `
+                    Microsoft.SqlPackage `
+                    --version "$(sqlPackageVersion)" `
+                    --allow-roll-forward
+                  if ($LASTEXITCODE -ne 0) {
+                    throw "SqlPackage installation failed."
+                  }
+                displayName: Install pinned SqlPackage
+              - task: AzureCLI@2
+                displayName: Generate read-only representative DeployReport
+                inputs:
+                  azureSubscription: ${{ parameters.azureServiceConnection }}
+                  scriptType: pscore
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    $ErrorActionPreference = "Stop"
+                    $sqlPackage = Join-Path "$(Agent.TempDirectory)" "sqlpackage/sqlpackage"
+                    if ($IsWindows) {
+                      $sqlPackage += ".exe"
+                    }
+                    $token = (az account get-access-token `
+                      --resource "https://database.windows.net/" `
+                      --query accessToken `
+                      --output tsv).Trim()
+                    if (-not $token) {
+                      throw "Unable to acquire an Azure SQL access token."
+                    }
+                    $reportRoot = Join-Path "$(Pipeline.Workspace)" "drift-report/${{ environment.environmentName }}"
+                    ./eng/New-DatabaseDriftReport.ps1 `
+                      -ServerName "$(sqlServer)" `
+                      -Port "$(sqlPort)" `
+                      -DatabaseName $env:databaseName `
+                      -DatabaseNames $env:databaseNames `
+                      -DacpacPath "$(Pipeline.Workspace)/database/App.Database.dacpac" `
+                      -PublishProfilePath "${{ environment.publishProfile }}" `
+                      -SqlPackagePath $sqlPackage `
+                      -AccessToken $token `
+                      -ReportPath "$reportRoot/deploy-report.xml" `
+                      -SummaryPath "$reportRoot/summary.md" `
+                      -CommandTimeout ${{ parameters.sqlCommandTimeout }} `
+                      -EnvironmentName "${{ environment.environmentName }}"
+                env:
+                  databaseName: $(databaseName)
+                  databaseNames: $(databaseNames)
+              - publish: $(Pipeline.Workspace)/drift-report/${{ environment.environmentName }}
+                artifact: drift-report-${{ environment.environmentName }}
+                displayName: Publish detected drift report
+                condition: and(succeeded(), eq(variables['driftDetected'], 'true'))

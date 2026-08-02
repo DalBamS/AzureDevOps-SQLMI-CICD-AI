@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<DeploymentReport TargetDatabase="Shard02" generatedAt="2026-08-01T00:10:00Z">
+  <Operations>
+    <Operation Name="Alter">
+      <Item Type="Table" Value="[app].[FeatureFlag]" />
+    </Operation>
+    <Operation Name="Drop">
+      <Item Type="Column" Value="[app].[FeatureFlag].[LabDriftMarker]" />
+    </Operation>
+  </Operations>
+</DeploymentReport>

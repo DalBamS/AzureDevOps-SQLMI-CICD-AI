@@ -1,0 +1,62 @@
+[
+  {
+    "risk": "low",
+    "summary": "First batch is low risk.",
+    "blockingFindings": [
+      {
+        "file": "chunked.sql",
+        "line": 2,
+        "reason": "First chunk finding.",
+        "recommendation": "Review the table change."
+      }
+    ],
+    "advisories": [
+      {
+        "file": "chunked.sql",
+        "line": 3,
+        "reason": "First chunk advisory.",
+        "recommendation": "Confirm the data type."
+      }
+    ]
+  },
+  {
+    "risk": "high",
+    "summary": "Second batch has the maximum risk.",
+    "blockingFindings": [
+      {
+        "file": "chunked.sql",
+        "line": 2,
+        "reason": "First chunk finding.",
+        "recommendation": "This duplicate recommendation must be discarded."
+      }
+    ],
+    "advisories": [
+      {
+        "file": "chunked.sql",
+        "line": 3,
+        "reason": "First chunk advisory.",
+        "recommendation": "This duplicate recommendation must be discarded."
+      }
+    ]
+  },
+  {
+    "risk": "medium",
+    "summary": "Third batch is medium risk.",
+    "blockingFindings": [
+      {
+        "file": "chunked.sql",
+        "line": 4,
+        "reason": "Second chunk finding.",
+        "recommendation": "Validate concurrent inserts."
+      }
+    ],
+    "advisories": [
+      {
+        "file": "chunked.sql",
+        "line": 5,
+        "reason": "Second chunk advisory.",
+        "recommendation": "Confirm the data type."
+      }
+    ]
+  }
+]

@@ -15,27 +15,29 @@ if (-not $ReportPath) {
     $ReportPath = [IO.Path]::Combine($repoRoot, 'artifacts', 'sql-policy-report.md')
 }
 
+# Source lint owns destructive DML and deployment-script idempotency.
+# Generated destructive DDL is enforced by Test-DeploymentScript.ps1.
 $rules = @(
     @{
-        Id = 'DB001'
+        Id = 'SQL001'
         Severity = 'error'
-        Pattern = '(?im)^\s*DROP\s+(TABLE|COLUMN|DATABASE)\b'
-        Message = 'Destructive DROP statements require an approved expand/contract migration.'
+        Pattern = '(?im)^\s*DELETE\s+(?:FROM\s+)?'
+        Message = 'DELETE in project source or deployment scripts requires an explicit, reviewed migration.'
     },
     @{
-        Id = 'DB002'
+        Id = 'SQL002'
         Severity = 'error'
         Pattern = '(?im)^\s*TRUNCATE\s+TABLE\b'
-        Message = 'TRUNCATE TABLE is not allowed in the state-based database project.'
+        Message = 'TRUNCATE TABLE is not allowed in project source or deployment scripts.'
     },
     @{
-        Id = 'DB003'
+        Id = 'SQL004'
         Severity = 'warning'
         Pattern = '(?im)\bSELECT\s+\*'
         Message = 'Avoid SELECT * in persisted database objects.'
     },
     @{
-        Id = 'DB004'
+        Id = 'SQL005'
         Severity = 'warning'
         Pattern = '(?im)\bNOLOCK\b'
         Message = 'NOLOCK can return inconsistent results and requires explicit review.'
@@ -43,8 +45,7 @@ $rules = @(
 )
 
 $findings = [System.Collections.Generic.List[object]]::new()
-$files = Get-ChildItem -Path $SourcePath -Recurse -File -Filter '*.sql' |
-    Where-Object { $_.FullName -notmatch '[\\/]Scripts[\\/]Seed[\\/]' }
+$files = @(Get-ChildItem -Path $SourcePath -Recurse -File -Filter '*.sql')
 
 foreach ($file in $files) {
     $content = Get-Content -Path $file.FullName -Raw
@@ -60,6 +61,20 @@ foreach ($file in $files) {
             })
         }
     }
+
+    $isDeploymentScript = $file.FullName -match '[\\/]Scripts[\\/]'
+    $hasInsert = $content -match '(?im)^\s*INSERT(?:\s+INTO)?\b'
+    $hasIdempotentGuard = $content -match '(?is)\b(?:IF\s+NOT\s+EXISTS|WHERE\s+NOT\s+EXISTS|MERGE)\b'
+    if ($isDeploymentScript -and $hasInsert -and -not $hasIdempotentGuard) {
+        $insertMatch = [regex]::Match($content, '(?im)^\s*INSERT(?:\s+INTO)?\b')
+        $findings.Add([pscustomobject]@{
+            Rule = 'SQL003'
+            Severity = 'error'
+            File = [IO.Path]::GetRelativePath($repoRoot, $file.FullName)
+            Line = ($content.Substring(0, $insertMatch.Index) -split "`n").Count
+            Message = 'Deployment-script INSERT must be guarded by IF NOT EXISTS, WHERE NOT EXISTS, or MERGE.'
+        })
+    }
 }
 
 $reportDirectory = Split-Path -Parent $ReportPath
@@ -69,6 +84,7 @@ $lines = @(
     '# SQL policy report',
     '',
     "Scanned $($files.Count) SQL files.",
+    'This source lint checks destructive DML and deployment-script idempotency. Generated destructive DDL is enforced by eng/Test-DeploymentScript.ps1.',
     ''
 )
 

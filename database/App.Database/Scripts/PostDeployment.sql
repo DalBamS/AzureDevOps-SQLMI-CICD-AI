@@ -1,1 +1,3 @@
+-- SQLMI-CICD POSTDEPLOY START v1
 :r .\Seed\FeatureFlag.seed.sql
+-- SQLMI-CICD POSTDEPLOY END v1

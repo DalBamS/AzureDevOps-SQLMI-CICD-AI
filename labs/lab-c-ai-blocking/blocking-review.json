@@ -1,0 +1,13 @@
+{
+  "risk": "high",
+  "summary": "대형 테이블의 즉시 NOT NULL 백필과 인덱스 생성은 장시간 잠금 및 로그 증가 위험이 있습니다.",
+  "blockingFindings": [
+    {
+      "file": "labs/lab-c-ai-blocking/risky-change.sql",
+      "line": 1,
+      "reason": "기존 전체 행을 한 트랜잭션에서 갱신하고 후속 인덱스 생성까지 수행할 수 있습니다.",
+      "recommendation": "nullable expand, 배치 backfill, 제약 검증, 온라인 인덱스 가능 여부 확인 단계로 분리하십시오."
+    }
+  ],
+  "advisories": []
+}

@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory)]
     [string]$ApprovedReportPath,
     [Parameter(Mandatory)]
-    [string]$CurrentReportPath
+    [string]$CurrentReportPath,
+    [switch]$CompareOperationsOnly
 )
 
 Set-StrictMode -Version Latest
@@ -53,17 +54,27 @@ function ConvertTo-StableXml {
 }
 
 function Get-ReportHash {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [switch]$OperationsOnly
+    )
 
     [xml]$document = Get-Content -Path $Path -Raw
-    $stableXml = ConvertTo-StableXml -Node $document.DocumentElement
+    $root = $document.DocumentElement
+    if ($OperationsOnly) {
+        $root = $document.SelectSingleNode("//*[local-name()='Operations']")
+        if (-not $root) {
+            throw "Deployment report does not contain an Operations element: $Path"
+        }
+    }
+    $stableXml = ConvertTo-StableXml -Node $root
     $bytes = [Text.Encoding]::UTF8.GetBytes($stableXml)
     $hash = [Security.Cryptography.SHA256]::HashData($bytes)
     return [Convert]::ToHexString($hash)
 }
 
-$approvedHash = Get-ReportHash -Path $ApprovedReportPath
-$currentHash = Get-ReportHash -Path $CurrentReportPath
+$approvedHash = Get-ReportHash -Path $ApprovedReportPath -OperationsOnly:$CompareOperationsOnly
+$currentHash = Get-ReportHash -Path $CurrentReportPath -OperationsOnly:$CompareOperationsOnly
 
 if ($approvedHash -ne $currentHash) {
     throw 'The target database changed after approval. Generate and approve a new deployment plan.'

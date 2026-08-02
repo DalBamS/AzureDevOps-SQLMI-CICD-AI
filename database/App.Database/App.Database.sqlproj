@@ -7,18 +7,25 @@
     <DacApplicationName>App.Database</DacApplicationName>
     <DacDescription>Reference Azure SQL Managed Instance database project.</DacDescription>
     <DacVersion Condition="'$(DacVersion)' == ''">1.0.0.0</DacVersion>
-    <DSP>Microsoft.Data.Tools.Schema.Sql.Sql160DatabaseSchemaProvider</DSP>
+    <DSP>Microsoft.Data.Tools.Schema.Sql.Sql170DatabaseSchemaProvider</DSP>
+    <!-- ModelCollation controls model comparison only; verify the target database collation separately. -->
     <ModelCollation>1033, CI</ModelCollation>
     <DefaultSchema>dbo</DefaultSchema>
+    <BuildStrictness Condition="'$(BuildStrictness)' == ''">Strict</BuildStrictness>
     <RunSqlCodeAnalysis>true</RunSqlCodeAnalysis>
-  </PropertyGroup>
-
-  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
-    <TreatTSqlWarningsAsErrors>true</TreatTSqlWarningsAsErrors>
+    <TreatTSqlWarningsAsErrors Condition="'$(BuildStrictness)' == 'Lenient'">false</TreatTSqlWarningsAsErrors>
+    <TreatTSqlWarningsAsErrors Condition="'$(BuildStrictness)' == 'Strict'">true</TreatTSqlWarningsAsErrors>
+    <SuppressTSqlWarnings></SuppressTSqlWarnings>
   </PropertyGroup>
 
   <ItemGroup>
     <Build Remove="Scripts\**\*.sql" />
     <PostDeploy Include="Scripts\PostDeployment.sql" />
   </ItemGroup>
+
+  <Target Name="ValidateBuildStrictness" BeforeTargets="Build">
+    <Error
+      Condition="'$(BuildStrictness)' != 'Lenient' and '$(BuildStrictness)' != 'Strict'"
+      Text="BuildStrictness must be Lenient or Strict." />
+  </Target>
 </Project>
