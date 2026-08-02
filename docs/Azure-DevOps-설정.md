@@ -159,10 +159,17 @@ Azure Repos를 사용하는 경우 YAML의 `pr` 선언만으로 검증이 강제
 - `all-database-policy-reports`: 전수 검사 시 DB별 결정론적 정책 결과
 
 각 환경은 `pipelines/profiles/sqlmi-<environment>.publish.xml`을 사용합니다. 세 profile의
-내용은 완전히 동일하며 연결 정보는 포함하지 않습니다. Plan과 승인 후 재검증의 `Script`,
-`DeployReport`는 같은 환경 profile과 같은 timeout override를 사용합니다. 실제 실행은
-SqlPackage가 계획을 다시 계산하는 `Publish`가 아니라 검증을 마친 현재 Script를 deterministic
-sanitized SQL로 변환해 `Invoke-Sqlcmd -Query`에 메모리 문자열로 전달합니다.
+내용은 완전히 동일하며 연결 정보는 포함하지 않습니다. Plan과 승인 후 재검증 및 실행은
+같은 profile과 timeout override를 사용합니다.
+
+| 모드 | 승인본 일치 | 실행 로그 | 지원 경계 | 추가 의존성 |
+|---|---|---|---|---|
+| `Publish` (기본) | 실행 직전 DeployReport 비교 | SqlPackage 원 로그 | DacFx의 지원 경로; 실행 시 계획 재계산 | SqlPackage |
+| `ValidatedScript` (명시적 opt-in) | DeployReport와 script 원문 exact 비교 | `Invoke-Sqlcmd -Verbose`의 PRINT 포함 | 다중 DB는 전수 script 승인 필요 | SqlPackage, pinned SqlServer module |
+
+기본값은 `Publish`입니다. `ValidatedScript`는 승인한 SQL 원문 실행이 필요한 교육 비교에만
+명시적으로 선택합니다. 대표 보고서만 만든 다중 DB rollout에서는 DB 이름 차이 때문에
+exact script 비교를 보장할 수 없으므로 `validateAllDatabasePlans=true`가 필요합니다.
 
 공통 게시 옵션:
 

@@ -31,6 +31,9 @@ parameters:
   - name: deployInstanceObjects
     type: boolean
     default: false
+  - name: deploymentMode
+    type: string
+    default: Publish
   - name: enableAiReview
     type: boolean
   - name: aiEndpoint
@@ -271,6 +274,7 @@ stages:
                           -SqlPackagePath $sqlPackage `
                           -ApprovedReportPath "$(Pipeline.Workspace)/deployment-review-${{ parameters.environmentName }}/deploy-report.xml" `
                           -AccessTokenProviderPath "./eng/Get-AzureSqlAccessToken.ps1" `
+                          -DeploymentMode "${{ parameters.deploymentMode }}" `
                           -CommandTimeout ${{ parameters.sqlCommandTimeout }} `
                           -MaxParallel ${{ parameters.maxParallel }} `
                           -ValidateAllDatabasePlans:([bool]::Parse($env:validateAllDatabasePlans)) `

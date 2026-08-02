@@ -60,6 +60,7 @@ $invokeArguments = @{
     TrustServerCertificate = $false
     ConnectionTimeout = 30
     QueryTimeout = $CommandTimeout
+    Verbose = $true
     ErrorAction = 'Stop'
 }
 Invoke-Sqlcmd @invokeArguments

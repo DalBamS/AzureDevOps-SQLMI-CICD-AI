@@ -56,6 +56,13 @@ parameters:
     displayName: Deploy idempotent SQL MI instance objects after database rollout
     type: boolean
     default: false
+  - name: deploymentMode
+    displayName: Database deployment mode
+    type: string
+    default: Publish
+    values:
+      - Publish
+      - ValidatedScript
   - name: buildStrictness
     displayName: SQL project build strictness
     type: string
@@ -243,6 +250,7 @@ stages:
       validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
       databasePlanDriftPolicy: ${{ parameters.databasePlanDriftPolicy }}
       deployInstanceObjects: ${{ parameters.deployInstanceObjects }}
+      deploymentMode: ${{ parameters.deploymentMode }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}
@@ -263,6 +271,7 @@ stages:
       validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
       databasePlanDriftPolicy: ${{ parameters.databasePlanDriftPolicy }}
       deployInstanceObjects: ${{ parameters.deployInstanceObjects }}
+      deploymentMode: ${{ parameters.deploymentMode }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}
@@ -283,6 +292,7 @@ stages:
       validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
       databasePlanDriftPolicy: ${{ parameters.databasePlanDriftPolicy }}
       deployInstanceObjects: ${{ parameters.deployInstanceObjects }}
+      deploymentMode: ${{ parameters.deploymentMode }}
       enableAiReview: ${{ parameters.enableAiReview }}
       aiEndpoint: ${{ parameters.aiEndpoint }}
       aiDeploymentName: ${{ parameters.aiDeploymentName }}

@@ -53,6 +53,10 @@ try {
     $deploy = Get-Content (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') -Raw
     Assert-True (@([regex]::Matches($deploy, '& \$AccessTokenProviderPath')).Count -eq 1) 'Database rollout must acquire one token before fan-out.'
     Assert-True ($deploy -notmatch '& \$WorkerContext\.AccessTokenProviderPath') 'Workers must not invoke the token provider.'
+    Assert-True ($deploy -match "\[string\]\`$DeploymentMode = 'Publish'") 'Publish must be the script default.'
+    Assert-True ($deploy -match "ValidateSet\('Publish', 'ValidatedScript'\)") 'ValidatedScript must remain an explicit mode.'
+    Assert-True ($pipeline -match 'name:\s*deploymentMode[\s\S]*?default:\s*Publish') 'Pipeline deploymentMode must default to Publish.'
+    Assert-True ($deployTemplate -match '-DeploymentMode\s+"\$\{\{\s*parameters\.deploymentMode\s*\}\}"') 'Deploy stage must pass deploymentMode.'
 
     Write-Host 'All education-slim Phase 2 self-tests passed.'
 }
