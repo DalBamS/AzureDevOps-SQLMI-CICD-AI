@@ -14,10 +14,8 @@
     <BuildStrictness Condition="'$(BuildStrictness)' == ''">Strict</BuildStrictness>
     <RunSqlCodeAnalysis>true</RunSqlCodeAnalysis>
     <TreatTSqlWarningsAsErrors Condition="'$(BuildStrictness)' == 'Lenient'">false</TreatTSqlWarningsAsErrors>
-    <TreatTSqlWarningsAsErrors Condition="'$(BuildStrictness)' == 'Balanced'">true</TreatTSqlWarningsAsErrors>
     <TreatTSqlWarningsAsErrors Condition="'$(BuildStrictness)' == 'Strict'">true</TreatTSqlWarningsAsErrors>
-    <SuppressTSqlWarnings Condition="'$(BuildStrictness)' == 'Balanced'">$(ValidatedSuppressTSqlWarnings)</SuppressTSqlWarnings>
-    <SuppressTSqlWarnings Condition="'$(BuildStrictness)' != 'Balanced'"></SuppressTSqlWarnings>
+    <SuppressTSqlWarnings></SuppressTSqlWarnings>
   </PropertyGroup>
 
   <ItemGroup>
@@ -27,7 +25,7 @@
 
   <Target Name="ValidateBuildStrictness" BeforeTargets="Build">
     <Error
-      Condition="'$(BuildStrictness)' != 'Lenient' and '$(BuildStrictness)' != 'Balanced' and '$(BuildStrictness)' != 'Strict'"
-      Text="BuildStrictness must be Lenient, Balanced, or Strict." />
+      Condition="'$(BuildStrictness)' != 'Lenient' and '$(BuildStrictness)' != 'Strict'"
+      Text="BuildStrictness must be Lenient or Strict." />
   </Target>
 </Project>

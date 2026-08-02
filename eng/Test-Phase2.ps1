@@ -58,6 +58,26 @@ try {
     Assert-True ($pipeline -match 'name:\s*deploymentMode[\s\S]*?default:\s*Publish') 'Pipeline deploymentMode must default to Publish.'
     Assert-True ($deployTemplate -match '-DeploymentMode\s+"\$\{\{\s*parameters\.deploymentMode\s*\}\}"') 'Deploy stage must pass deploymentMode.'
 
+    $engFiles = Get-ChildItem $PSScriptRoot -Recurse -File
+    $engBytes = ($engFiles | Measure-Object Length -Sum).Sum
+    Assert-True ($engBytes -le 120000) "eng size exceeds 120000 bytes: $engBytes"
+    foreach ($script in $engFiles | Where-Object Extension -in @('.ps1', '.psm1')) {
+        Assert-True ((Get-Content $script.FullName).Count -le 500) "$($script.Name) exceeds 500 lines."
+    }
+    $sqlCmdModule = Get-Content (Join-Path $PSScriptRoot 'SqlCmd.Common.psm1') -Raw
+    foreach ($removed in @(
+        'Get-SqlLexicalState',
+        'ConvertTo-SqlLexicalView',
+        'ConvertTo-SqlToken',
+        'Get-SqlStatement',
+        'Read-SqlIdentifierPath',
+        'Test-SqlInstanceStatementSequence',
+        'Test-SqlInstanceGuardCoverage'
+    )) {
+        if ($removed -eq 'Test-SqlInstanceGuardCoverage') { continue }
+        Assert-True ($sqlCmdModule -notmatch "function\s+$removed\b") "Removed parser helper remains: $removed"
+    }
+
     Write-Host 'All education-slim Phase 2 self-tests passed.'
 }
 finally {

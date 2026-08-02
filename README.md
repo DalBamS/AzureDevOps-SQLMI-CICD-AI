@@ -53,11 +53,10 @@ Test와 Prod는 Azure DevOps Environment 승인을 통과해야 합니다.
 - `azure-pipelines.yml`: build-once/deploy-many Azure Pipelines
 - `ai/database-change-review.md`: AI 리뷰 가드레일과 JSON 출력 계약
 - `eng/Invoke-AiDatabaseReview.ps1`: Azure OpenAI Responses API 기반 SQL 변경 리뷰
-- `eng/Test-AiDatabaseReview.ps1`: 네트워크 없는 AI 청크·병합·비밀 탐지 회귀
-- `eng/Test-DeploymentScript.ps1`: 생성된 배포 SQL의 파괴 DDL, 동적 DDL, rename 검사
-- `eng/SqlCmd.Common.psm1`: SQLCMD 변환, pinned managed GO 분리, SQL token·instance guard 공용 parser
+- `eng/Test-DeploymentScript.ps1`: 생성된 배포 SQL의 정규식 기반 위험 DDL 검사
+- `eng/SqlCmd.Common.psm1`: 최소 SQLCMD 변환과 Microsoft managed GO 분리 adapter
 - `eng/Test-FailureLabs.ps1`: Lab B~D 오프라인 차단과 선택적 Lab A Docker 회귀
-- `eng/Deploy-Databases.ps1`: 카나리, 제한 병렬 fan-out, 실패 집계와 재시도 안전 배포
+- `eng/Deploy-Databases.ps1`: Publish 기본 카나리, 제한 병렬 fan-out과 실패 집계
 - `eng/Invoke-ValidatedDeploymentScript.ps1`: 검증한 sanitized SQL을 2차 SQLCMD 해석 없이 exact 실행
 - `eng/Deploy-InstanceObjects.ps1`: Entra token/SQLCMD 변수 기반 인스턴스 오브젝트 배포
 - `pipelines/drift-report.yml`: 매일 02:00 UTC 대표 DB에 읽기 전용 DeployReport 실행

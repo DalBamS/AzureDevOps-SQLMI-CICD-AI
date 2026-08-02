@@ -69,12 +69,7 @@ parameters:
     default: Strict
     values:
       - Lenient
-      - Balanced
       - Strict
-  - name: validatedSuppressTSqlWarnings
-    displayName: Validated T-SQL warning baseline for Balanced mode
-    type: string
-    default: ''
   - name: azureServiceConnection
     displayName: Azure workload identity service connection
     type: string
@@ -126,11 +121,8 @@ stages:
           - pwsh: |
               ./eng/Build.ps1 `
                 -DacVersion "1.0.$(Build.BuildId).0" `
-                -Strictness "${{ parameters.buildStrictness }}" `
-                -ValidatedSuppressTSqlWarnings $env:VALIDATED_SUPPRESS_TSQL_WARNINGS
+                -Strictness "${{ parameters.buildStrictness }}"
             displayName: Build SQL project
-            env:
-              VALIDATED_SUPPRESS_TSQL_WARNINGS: ${{ parameters.validatedSuppressTSqlWarnings }}
 
           - pwsh: |
               $requiredVersion = [version]'$(sqlServerModuleVersion)'
@@ -156,8 +148,10 @@ stages:
             env:
               SQLSERVER_MODULE_VERSION: $(sqlServerModuleVersion)
 
-          - pwsh: ./eng/Test-Phase3.ps1
-            displayName: Run drift safety self-test
+          - pwsh: ./eng/Test-FailureLabs.ps1
+            displayName: Run offline failure-lab self-tests
+            env:
+              SQLSERVER_MODULE_VERSION: $(sqlServerModuleVersion)
 
           - task: AzureCLI@2
             displayName: Run advisory AI review of PR SQL changes
