@@ -34,4 +34,7 @@ IF NOT EXISTS
 )
     THROW 51006, 'Expected reference data was not seeded.', 1;
 
+IF COL_LENGTH(N'app.FeatureFlag', N'Owner') IS NULL
+    THROW 51008, 'Expected column Owner was not deployed.', 1;
+
 PRINT 'Schema and metadata smoke test passed.';

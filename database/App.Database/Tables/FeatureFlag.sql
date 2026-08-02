@@ -4,6 +4,7 @@ CREATE TABLE [app].[FeatureFlag]
     [IsEnabled] bit NOT NULL
         CONSTRAINT [DF_FeatureFlag_IsEnabled] DEFAULT (0),
     [Description] nvarchar(512) NULL,
+    [Owner] nvarchar(128) NULL,
     [UpdatedAtUtc] datetime2(3) NOT NULL
         CONSTRAINT [DF_FeatureFlag_UpdatedAtUtc] DEFAULT (sysutcdatetime()),
     [Version] rowversion NOT NULL,
