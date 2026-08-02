@@ -49,6 +49,17 @@ try {
     Assert-True ($pipeline -match 'sqlServerModuleVersion:\s*22\.4\.5\.1') 'Pipeline must own the SqlServer module version.'
     Assert-True ($deployTemplate -match 'SQLSERVER_MODULE_VERSION') 'Deploy jobs must receive the SqlServer module version through the environment.'
     Assert-True ($deployTemplate -match 'deployment-review-\$\{\{\s*parameters\.environmentName\s*\}\}-pitr-marker-\$\(System\.JobAttempt\)') 'PITR artifact must include System.JobAttempt.'
+    $deployJob = [regex]::Match(
+        $deployTemplate,
+        '(?s)- deployment: DeployDacpac\b.*?(?=\r?\n\s*- job: DeployInstanceObjects\b)'
+    ).Value
+    $moduleStep = $deployJob.IndexOf('displayName: Prepare pinned SQL smoke module')
+    $rolloutStep = $deployJob.IndexOf('displayName: Deploy canary, test, then fan out')
+    Assert-True (-not [string]::IsNullOrWhiteSpace($deployJob)) 'DeployDacpac job was not found.'
+    Assert-True ($deployJob -notmatch '\$\{\{\s*if\s+eq\(parameters\.deploymentMode') 'DeployDacpac module preparation must not depend on deploymentMode.'
+    Assert-True ($moduleStep -ge 0) 'DeployDacpac must prepare the pinned SqlServer module for smoke tests.'
+    Assert-True ($rolloutStep -gt $moduleStep) 'Pinned SqlServer module preparation must run before rollout and smoke tests.'
+    Assert-True ($deployJob -match 'Import-Module SqlServer -RequiredVersion \$requiredVersion -Force') 'DeployDacpac must import the pinned SqlServer module.'
 
     $deploy = Get-Content (Join-Path $PSScriptRoot 'Deploy-Databases.ps1') -Raw
     Assert-True (@([regex]::Matches($deploy, '& \$AccessTokenProviderPath')).Count -eq 1) 'Database rollout must acquire one token before fan-out.'
@@ -57,6 +68,7 @@ try {
     Assert-True ($deploy -match "ValidateSet\('Publish', 'ValidatedScript'\)") 'ValidatedScript must remain an explicit mode.'
     Assert-True ($pipeline -match 'name:\s*deploymentMode[\s\S]*?default:\s*Publish') 'Pipeline deploymentMode must default to Publish.'
     Assert-True ($deployTemplate -match '-DeploymentMode\s+"\$\{\{\s*parameters\.deploymentMode\s*\}\}"') 'Deploy stage must pass deploymentMode.'
+    Assert-True ($deploy -match "Test-DeployedDatabase\.ps1") 'Database rollout must retain the Invoke-Sqlcmd smoke test.'
 
     $engFiles = Get-ChildItem $PSScriptRoot -Recurse -File
     $engBytes = ($engFiles | Measure-Object Length -Sum).Sum
