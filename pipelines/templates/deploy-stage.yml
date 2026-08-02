@@ -139,6 +139,7 @@ stages:
               databaseName: $(databaseName)
               databaseNames: $(databaseNames)
               validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
+              SQLSERVER_MODULE_VERSION: $(sqlServerModuleVersion)
 
           - task: AzureCLI@2
             displayName: Run advisory AI review of deployment SQL
@@ -286,13 +287,14 @@ stages:
                     databaseName: $(databaseName)
                     databaseNames: $(databaseNames)
                     validateAllDatabasePlans: ${{ parameters.validateAllDatabasePlans }}
+                    SQLSERVER_MODULE_VERSION: $(sqlServerModuleVersion)
 
                 - task: PublishPipelineArtifact@1
                   displayName: Publish PITR marker
                   condition: and(always(), eq(variables['pitrMarkerCreated'], 'true'))
                   inputs:
                     targetPath: $(Pipeline.Workspace)/deployment-review-pitr/${{ parameters.environmentName }}
-                    artifactName: deployment-review-${{ parameters.environmentName }}-pitr-marker
+                    artifactName: deployment-review-${{ parameters.environmentName }}-pitr-marker-$(System.JobAttempt)
 
       - job: DeployInstanceObjects
         displayName: Deploy SQL MI instance objects
@@ -349,3 +351,4 @@ stages:
               instanceEntraLoginName: $(instanceEntraLoginName)
               instanceAgentJobName: $(instanceAgentJobName)
               instanceAgentJobOwner: $(instanceAgentJobOwner)
+              SQLSERVER_MODULE_VERSION: $(sqlServerModuleVersion)

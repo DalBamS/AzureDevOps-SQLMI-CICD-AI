@@ -80,6 +80,16 @@ $rollout = Get-DatabaseRollout -DatabaseNames $targets
 Write-Host "Canary database: $($rollout.Canary)"
 Write-Host "Remaining databases: $($rollout.Remaining.Count); maxParallel: $MaxParallel"
 
+$accessTokenOutput = @(& $AccessTokenProviderPath -DatabaseName $rollout.Canary)
+if (
+    $accessTokenOutput.Count -ne 1 -or
+    $accessTokenOutput[0] -isnot [string] -or
+    [string]::IsNullOrWhiteSpace([string]$accessTokenOutput[0])
+) {
+    throw 'The access token provider did not return exactly one Azure SQL token.'
+}
+$accessToken = [string]$accessTokenOutput[0]
+
 $resolvedApprovedReportPath = (Resolve-Path $ApprovedReportPath).Path
 $approvedReviewPath = Split-Path -Parent $resolvedApprovedReportPath
 $approvedReportsDirectory = Join-Path $approvedReviewPath 'all-database-reports'
@@ -275,7 +285,7 @@ $context = [pscustomobject]@{
     ApprovedReportsDirectory = $approvedReportsDirectory
     ApprovedScriptsDirectory = $approvedScriptsDirectory
     UsePerDatabaseApprovedReports = $usePerDatabaseApprovedReports
-    AccessTokenProviderPath = (Resolve-Path $AccessTokenProviderPath).Path
+    AccessToken = $accessToken
     CommandTimeout = $CommandTimeout
     TestPath = (Resolve-Path $TestPath).Path
     ReportDirectory = (Resolve-Path $ReportDirectory).Path
@@ -298,19 +308,7 @@ $worker = {
     $ErrorActionPreference = 'Stop'
     Import-Module $WorkerContext.ModulePath -Force
 
-    function Get-WorkerAccessToken {
-        $providerOutput = @(
-            & $WorkerContext.AccessTokenProviderPath -DatabaseName $Database
-        )
-        if (
-            $providerOutput.Count -ne 1 -or
-            $providerOutput[0] -isnot [string] -or
-            [string]::IsNullOrWhiteSpace([string]$providerOutput[0])
-        ) {
-            throw "The access token provider did not return exactly one token for '$Database'."
-        }
-        return [string]$providerOutput[0]
-    }
+    function Get-WorkerAccessToken { return $WorkerContext.AccessToken }
 
     function Get-ComparableDeploymentScript {
         param(

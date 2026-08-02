@@ -1,6 +1,11 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:SqlServerModuleVersion = [version]'22.4.5.1'
+$script:SqlServerModuleVersion = if ($env:SQLSERVER_MODULE_VERSION) {
+    [version]$env:SQLSERVER_MODULE_VERSION
+}
+else {
+    @(Get-Module -ListAvailable -Name SqlServer | Sort-Object Version -Descending)[0].Version
+}
 $script:ManagedBatchParserTypes = $null
 
 function Get-TextSha256 {

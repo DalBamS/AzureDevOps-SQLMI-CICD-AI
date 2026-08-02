@@ -53,7 +53,7 @@ GRANT VIEW DEFINITION TO [<deployer-principal-name>];
 - PowerShell 7
 - Azure CLI
 - .NET 10 설치 가능 또는 사전 설치
-- SqlServer PowerShell module 22.4.5.1 설치 가능
+- 파이프라인 변수 `sqlServerModuleVersion`이 지정한 SqlServer PowerShell module 설치 가능
 - NuGet 및 Microsoft artifact endpoint에 대한 outbound HTTPS
 - 대상 SQL MI endpoint/FQDN 접근
 
@@ -94,6 +94,11 @@ Library의 variable group은 다음 Demo 대상으로 구성합니다.
 서비스 연결 이름은 variable group이 아니라 파이프라인의 compile-time `azureServiceConnection` parameter로 전달합니다. Azure Pipelines가 실행 전에 서비스 연결 권한을 검증하기 때문입니다.
 
 암호는 필요하지 않습니다. `AzureCLI@2`가 서비스 연결으로 로그인하고 Azure SQL access token을 발급합니다. SQL 인증이 불가피한 레거시 환경은 Key Vault-linked variable group을 별도로 사용하십시오.
+
+데이터베이스 rollout은 fan-out 직전에 Azure SQL token을 한 번만 발급해 모든 worker에
+전달합니다. worker마다 Azure CLI를 호출하지 않습니다. 다만 token 수명보다 오래 걸리는
+배포는 자동 갱신하지 않는 교육용 한계가 있으므로 작업을 분할하거나 새 pipeline run으로
+재시도하십시오.
 
 ## 5. Pipeline 생성
 

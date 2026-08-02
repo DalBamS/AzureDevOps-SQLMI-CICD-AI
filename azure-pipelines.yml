@@ -144,6 +144,14 @@ stages:
           - pwsh: ./eng/Test-SqlPolicy.ps1
             displayName: Run deterministic SQL policy
 
+          - pwsh: ./eng/Test-Phase2.ps1
+            displayName: Run education-slim self-tests
+            env:
+              SQLSERVER_MODULE_VERSION: $(sqlServerModuleVersion)
+
+          - pwsh: ./eng/Test-Phase3.ps1
+            displayName: Run drift safety self-test
+
           - task: AzureCLI@2
             displayName: Run advisory AI review of PR SQL changes
             condition: |

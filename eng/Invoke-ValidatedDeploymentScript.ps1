@@ -34,7 +34,10 @@ if (
     throw 'The sanitized deployment script changed after the policy gate.'
 }
 
-$requiredVersion = '22.4.5.1'
+$requiredVersion = $env:SQLSERVER_MODULE_VERSION
+if ([string]::IsNullOrWhiteSpace($requiredVersion)) {
+    throw 'SQLSERVER_MODULE_VERSION must identify the pipeline-pinned SqlServer module.'
+}
 $installedModule = Get-Module -ListAvailable -Name SqlServer |
     Where-Object Version -eq $requiredVersion |
     Select-Object -First 1
