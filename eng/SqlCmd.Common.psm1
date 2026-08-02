@@ -110,6 +110,31 @@ function Resolve-SqlCmdScript {
     }
 }
 
+function Import-SqlManagedBatchParserAssembly {
+    param([Parameter(Mandatory)][string]$ModuleManifestPath)
+
+    # Import-Module does not eagerly load the batch parser assembly on every
+    # platform. On Linux agents it stays absent from the AppDomain until a
+    # cmdlet touches it, so load it directly from the module directory.
+    $moduleRoot = Split-Path -Parent $ModuleManifestPath
+    $candidates = @()
+    if ($PSEdition -eq 'Core') {
+        $candidates += Join-Path $moduleRoot 'coreclr/Microsoft.SqlTools.ManagedBatchParser.dll'
+    }
+    $candidates += Join-Path $moduleRoot 'Microsoft.SqlTools.ManagedBatchParser.dll'
+
+    foreach ($candidate in $candidates) {
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        try {
+            return [System.Reflection.Assembly]::LoadFrom($candidate)
+        } catch {
+            Write-Verbose "Failed to load batch parser from '$candidate': $_"
+        }
+    }
+
+    return $null
+}
+
 function Get-SqlManagedBatchParserTypes {
     if ($script:ManagedBatchParserTypes) { return $script:ManagedBatchParserTypes }
     $requiredVersion = if ($env:SQLSERVER_MODULE_VERSION) {
@@ -129,6 +154,9 @@ function Get-SqlManagedBatchParserTypes {
     $assembly = [AppDomain]::CurrentDomain.GetAssemblies() |
         Where-Object { $_.GetName().Name -eq 'Microsoft.SqlTools.ManagedBatchParser' } |
         Select-Object -First 1
+    if (-not $assembly) {
+        $assembly = Import-SqlManagedBatchParserAssembly -ModuleManifestPath $module.Path
+    }
     if (-not $assembly) {
         throw 'SqlServer module did not load Microsoft.SqlTools.ManagedBatchParser.'
     }
