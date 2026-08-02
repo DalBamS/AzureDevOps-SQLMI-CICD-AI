@@ -273,6 +273,11 @@ try {
     }
 
     Write-Host 'All requested Phase 4 failure lab tests passed.'
+
+    # Negative test cases leave a non-zero $LASTEXITCODE behind. The Azure
+    # Pipelines PowerShell task dot-sources this script, so that stale value
+    # would otherwise be reported as the task result.
+    exit 0
 }
 finally {
     if (Test-Path $temporaryPath) {
