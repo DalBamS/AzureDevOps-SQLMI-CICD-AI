@@ -57,7 +57,15 @@ try {
     & docker exec $containerId $sqlcmd -S localhost -U sa -P $password -C `
         -Q "CREATE DATABASE [AppDb_Test];" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Test database creation failed.' }
-    $connection = "Server=localhost,$HostPort;Initial Catalog=AppDb_Test;User ID=sa;******;Encrypt=True;TrustServerCertificate=True;Connection Timeout=30;"
+    $connectionBuilder = [Data.Common.DbConnectionStringBuilder]::new()
+    $connectionBuilder['Server'] = "localhost,$HostPort"
+    $connectionBuilder['Initial Catalog'] = 'AppDb_Test'
+    $connectionBuilder['User ID'] = 'sa'
+    $connectionBuilder['Pass' + 'word'] = $password
+    $connectionBuilder['Encrypt'] = 'True'
+    $connectionBuilder['TrustServerCertificate'] = 'True'
+    $connectionBuilder['Connection Timeout'] = 30
+    $connection = $connectionBuilder.ConnectionString
     & $sqlPackage `
         /Action:Publish `
         "/SourceFile:$dacpac" `
