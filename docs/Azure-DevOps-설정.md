@@ -95,8 +95,31 @@ CREATE USER [<deployer-principal-name>] FROM EXTERNAL PROVIDER;
 ALTER ROLE [db_ddladmin] ADD MEMBER [<deployer-principal-name>];
 ALTER ROLE [db_datareader] ADD MEMBER [<deployer-principal-name>];
 ALTER ROLE [db_datawriter] ADD MEMBER [<deployer-principal-name>];
+ALTER ROLE [db_owner] ADD MEMBER [<deployer-principal-name>];
 GRANT VIEW DEFINITION TO [<deployer-principal-name>];
 ```
+
+**`db_owner`가 왜 필요한가.** `db_ddladmin`만으로는 스키마를 만들 수는 있어도 그 스키마의
+**소유자를 다른 주체(`dbo`)로 지정할 수 없습니다.** 이 프로젝트의 DACPAC은
+`CREATE SCHEMA [app] AUTHORIZATION [dbo];`를 생성하므로, 비어 있는 데이터베이스에 처음
+배포할 때 아래 오류로 실패합니다.
+
+```text
+Error SQL72014: .Net SqlClient Data Provider: 메시지 37547, 수준 16, 상태 1, 줄 1
+The user attempting to perform this operation does not have permission as it is currently
+logged in as a member of an Azure Active Directory (AAD) group but does not have an
+associated database user account.
+Error SQL72045: CREATE SCHEMA [app] AUTHORIZATION [dbo];
+```
+
+> ⚠️ 오류 문구가 "AAD 그룹"을 가리키기 때문에 §2.3의 디렉터리 권한 문제로 오진하기 쉽습니다.
+> **데이터베이스 사용자가 이미 존재하고 SID가 애플리케이션 ID와 정확히 일치해도 발생합니다.**
+> 구분법: `sys.database_principals`에 배포 주체가 조회되면 §2.3이 아니라 이 절의 문제입니다.
+> 또한 스키마가 이미 존재하는 데이터베이스에서는 재현되지 않으므로, **빈 데이터베이스에
+> 처음 배포하는 경로를 반드시 한 번 검증**하십시오.
+
+권한을 더 좁히려면 `db_owner` 대신 스키마 소유권 지정에 필요한 권한만 부여하거나, DACPAC의
+스키마 정의에서 `AUTHORIZATION` 절을 제거하는 방법을 검토하십시오.
 
 `eng/Initialize-DemoDatabases.ps1`이 데모 DB 세 개에 대해 이 작업을 대신 수행합니다.
 사용법은 §6을 참고하십시오.
