@@ -15,6 +15,9 @@ IF OBJECT_ID(N'app.usp_SetFeatureFlag', N'P') IS NULL
 IF OBJECT_ID(N'app.usp_SeedFeatureFlags', N'P') IS NULL
     THROW 51007, 'Expected procedure app.usp_SeedFeatureFlags was not deployed.', 1;
 
+IF COL_LENGTH(N'app.FeatureFlag', N'UpdatedBy') IS NULL
+    THROW 51008, 'Expected column app.FeatureFlag.UpdatedBy was not deployed.', 1;
+
 IF NOT EXISTS
 (
     SELECT 1
