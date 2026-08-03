@@ -4,10 +4,10 @@ CREATE TABLE [app].[FeatureFlag]
     [IsEnabled] bit NOT NULL
         CONSTRAINT [DF_FeatureFlag_IsEnabled] DEFAULT (0),
     [Description] nvarchar(512) NULL,
-    [UpdatedBy] nvarchar(128) NULL,
     [UpdatedAtUtc] datetime2(3) NOT NULL
         CONSTRAINT [DF_FeatureFlag_UpdatedAtUtc] DEFAULT (sysutcdatetime()),
     [Version] rowversion NOT NULL,
+    [UpdatedBy] nvarchar(128) NULL,
     CONSTRAINT [PK_FeatureFlag] PRIMARY KEY CLUSTERED ([FlagName])
 );
 GO
