@@ -8,6 +8,7 @@ CREATE TABLE [app].[FeatureFlag]
         CONSTRAINT [DF_FeatureFlag_UpdatedAtUtc] DEFAULT (sysutcdatetime()),
     [Version] rowversion NOT NULL,
     [UpdatedBy] nvarchar(128) NULL,
+    [Owner] nvarchar(128) NULL,
     CONSTRAINT [PK_FeatureFlag] PRIMARY KEY CLUSTERED ([FlagName])
 );
 GO
