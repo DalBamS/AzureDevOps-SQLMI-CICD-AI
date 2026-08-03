@@ -18,6 +18,9 @@ IF OBJECT_ID(N'app.usp_SeedFeatureFlags', N'P') IS NULL
 IF COL_LENGTH(N'app.FeatureFlag', N'UpdatedBy') IS NULL
     THROW 51008, 'Expected column app.FeatureFlag.UpdatedBy was not deployed.', 1;
 
+IF COL_LENGTH(N'app.FeatureFlag', N'Owner') IS NULL
+    THROW 51008, 'Expected column Owner was not deployed.', 1;
+
 IF NOT EXISTS
 (
     SELECT 1
